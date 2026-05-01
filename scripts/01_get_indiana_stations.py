@@ -1,13 +1,12 @@
 """01_get_indiana_stations.py
 
-Fetch the complete inventory of USGS streamflow gauges in Indiana with
-instantaneous/unit-value discharge data, and write a single Parquet
-table (and matching GeoJSON) to S3.
+Fetch the inventory of USGS streamflow stations in Indiana from the USGS
+Water Data API and write a single Parquet table (and matching GeoJSON) to S3.
 
-Uses Water Data API endpoints:
-  1. `waterdata.get_time_series_metadata()` for streamflow series coverage
-  2. `waterdata.get_monitoring_locations()` for stream-site filtering and
-     extra location metadata
+This follows the same approach as the prior local station-listing script:
+query `waterdata.get_time_series_metadata(state_name="Indiana",
+parameter_code="00060")`, then reduce the returned metadata to one row per
+monitoring location.
 
 Output schema (one row per gauge):
     site_no, station_nm, dec_lat_va, dec_long_va, drain_area_va,
@@ -38,133 +37,8 @@ def first_present(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
-def normalize_monitoring_location_ids(df: pd.DataFrame) -> pd.Series:
-    """Return Water Data monitoring location IDs like USGS-03339000."""
-    if "monitoring_location_id" in df.columns:
-        ids = df["monitoring_location_id"].astype(str)
-        ids = ids.where(ids.str.strip().ne(""), pd.NA)
-        if ids.notna().any():
-            return ids
-
-    agency_col = first_present(df, ["agency_code", "agency_cd"])
-    number_col = first_present(
-        df,
-        ["monitoring_location_number", "site_no", "site_number"],
-    )
-    if agency_col is not None and number_col is not None:
-        return (
-            df[agency_col].astype(str).str.strip()
-            + "-"
-            + df[number_col].astype(str).str.strip()
-        )
-    if number_col is not None:
-        return "USGS-" + df[number_col].astype(str).str.strip()
-    return pd.Series(pd.NA, index=df.index, dtype="object")
-
-
-def fetch_monitoring_locations(state_code: str) -> pd.DataFrame:
-    """Fetch Indiana stream monitoring locations from the Water Data API."""
-    log.info("Querying Water Data monitoring locations for state=%s", state_code)
-    df, _ = waterdata.get_monitoring_locations(
-        agency_code=["USGS"],
-        state_code=[state_code],
-        site_type_code=["ST"],
-    )
-    df = df.reset_index(drop=True)
-    df["monitoring_location_id"] = normalize_monitoring_location_ids(df)
-    return df
-
-
-def fetch_streamflow_series_metadata(state_name: str, parameter_code: str) -> pd.DataFrame:
-    """Fetch streamflow time-series metadata for Indiana and reduce to one row per site."""
-    log.info("Querying Water Data time-series metadata for streamflow in %s", state_name)
-    df, _ = waterdata.get_time_series_metadata(
-        state_name=state_name,
-        parameter_code=parameter_code,
-    )
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["site_no", "begin_date", "end_date", "count_nu"])
-
-    loc_col = first_present(df, ["monitoring_location_id"])
-    begin_col = first_present(df, ["begin", "begin_utc"])
-    end_col = first_present(df, ["end", "end_utc"])
-    primary_col = first_present(df, ["primary"])
-    period_col = first_present(df, ["computation_period_identifier", "computation_period"])
-    statistic_col = first_present(df, ["statistic_id"])
-
-    if loc_col is None:
-        raise ValueError("Water Data time-series metadata did not include monitoring_location_id")
-
-    series = df.copy()
-    series = series[series[loc_col].astype(str).str.startswith("USGS-")].copy()
-    is_continuous = pd.Series(False, index=series.index)
-    if period_col is not None:
-        period_vals = series[period_col].astype(str).str.lower()
-        is_continuous = is_continuous | period_vals.str.contains(
-            "instant|continuous|unit|iv",
-            regex=True,
-            na=False,
-        )
-    if statistic_col is not None:
-        is_continuous = is_continuous | series[statistic_col].astype(str).eq("00011")
-    if is_continuous.any():
-        series = series[is_continuous].copy()
-    else:
-        log.warning(
-            "Could not identify continuous-only rows from metadata labels; keeping all %s streamflow series",
-            parameter_code,
-        )
-
-    if primary_col is not None:
-        primary_vals = series[primary_col].astype(str).str.lower()
-        series = series[primary_vals.isin(["true", "t", "1", "yes"])].copy()
-
-    series["site_no"] = series[loc_col].astype(str).str.replace("USGS-", "", regex=False)
-    series["begin_date"] = pd.to_datetime(series[begin_col], errors="coerce").dt.date if begin_col else pd.NaT
-    series["end_date"] = pd.to_datetime(series[end_col], errors="coerce").dt.date if end_col else pd.NaT
-    series["count_nu"] = pd.NA
-    series = series.sort_values(["site_no", "begin_date", "end_date"]).drop_duplicates("site_no", keep="first")
-    keep = ["site_no", "begin_date", "end_date", "count_nu"]
-    log.info("Time-series metadata yielded %d streamflow sites", len(series))
-    return series[keep].reset_index(drop=True)
-
-
-def standardize_locations(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["monitoring_location_id"] = normalize_monitoring_location_ids(df)
-    site_id_col = first_present(df, ["monitoring_location_id", "site_no"])
-    name_col = first_present(df, ["monitoring_location_name", "station_nm"])
-    lat_col = first_present(df, ["latitude", "dec_lat_va"])
-    lon_col = first_present(df, ["longitude", "dec_long_va"])
-    drainage_col = first_present(df, ["drainage_area", "drain_area_va"])
-    huc_col = first_present(df, ["hydrologic_unit_code", "huc_cd"])
-
-    if site_id_col is None:
-        raise ValueError("Monitoring locations response did not include a site identifier")
-
-    out = pd.DataFrame()
-    raw_site = df[site_id_col].astype(str)
-    out["site_no"] = raw_site.str.replace("USGS-", "", regex=False)
-    out["station_nm"] = df[name_col] if name_col else None
-
-    if lat_col and lon_col:
-        out["dec_lat_va"] = pd.to_numeric(df[lat_col], errors="coerce")
-        out["dec_long_va"] = pd.to_numeric(df[lon_col], errors="coerce")
-    elif "geometry" in df.columns:
-        coords = df["geometry"].apply(_extract_point_coords)
-        out["dec_long_va"] = pd.to_numeric(coords.str[0], errors="coerce")
-        out["dec_lat_va"] = pd.to_numeric(coords.str[1], errors="coerce")
-    else:
-        out["dec_lat_va"] = pd.NA
-        out["dec_long_va"] = pd.NA
-
-    out["drain_area_va"] = pd.to_numeric(df[drainage_col], errors="coerce") if drainage_col else pd.NA
-    out["huc_cd"] = df[huc_col] if huc_col else None
-    return out
-
-
 def _extract_point_coords(value) -> tuple[object, object]:
-    """Return (lon, lat) from a geometry-like object when explicit columns are absent."""
+    """Return (lon, lat) from a geometry-like object."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return (pd.NA, pd.NA)
     if hasattr(value, "x") and hasattr(value, "y"):
@@ -175,7 +49,7 @@ def _extract_point_coords(value) -> tuple[object, object]:
             return (coords[0], coords[1])
     if isinstance(value, str):
         stripped = value.strip()
-        if stripped.startswith("POINT"):
+        if stripped.upper().startswith("POINT"):
             inner = stripped[stripped.find("(") + 1:stripped.rfind(")")]
             parts = inner.replace(",", " ").split()
             if len(parts) >= 2:
@@ -183,21 +57,72 @@ def _extract_point_coords(value) -> tuple[object, object]:
     return (pd.NA, pd.NA)
 
 
-def fetch_indiana_streamflow_sites(state_code: str, parameter_code: str) -> pd.DataFrame:
-    raw_locations = fetch_monitoring_locations(state_code)
-    locations = standardize_locations(raw_locations)
-    series = fetch_streamflow_series_metadata("Indiana", parameter_code)
-    sites = locations.merge(series, on="site_no", how="inner")
-    sites = sites.drop_duplicates("site_no").reset_index(drop=True)
-    log.info("Merged inventory contains %d instantaneous discharge sites", len(sites))
-    return sites
+def _site_number(monitoring_location_id: object) -> str:
+    value = str(monitoring_location_id).strip()
+    return value.replace("USGS-", "", 1) if value.startswith("USGS-") else value
+
+
+def fetch_indiana_streamflow_sites(state_name: str, parameter_code: str) -> pd.DataFrame:
+    """Query Water Data metadata and reduce it to station-level rows."""
+    log.info(
+        "Querying Water Data time-series metadata for state=%s parameter_code=%s",
+        state_name,
+        parameter_code,
+    )
+    df, _ = waterdata.get_time_series_metadata(
+        state_name=state_name,
+        parameter_code=parameter_code,
+    )
+    if df is None or df.empty:
+        log.warning("Water Data returned no streamflow time-series metadata")
+        return pd.DataFrame(columns=[
+            "site_no", "station_nm", "dec_lat_va", "dec_long_va",
+            "drain_area_va", "huc_cd", "begin_date", "end_date", "count_nu",
+        ])
+
+    log.info("Water Data returned %d streamflow metadata rows", len(df))
+    loc_col = first_present(df, ["monitoring_location_id"])
+    if loc_col is None:
+        raise ValueError("Water Data metadata did not include monitoring_location_id")
+
+    name_col = first_present(df, ["monitoring_location_name", "station_nm"])
+    begin_col = first_present(df, ["begin", "begin_utc"])
+    end_col = first_present(df, ["end", "end_utc"])
+    huc_col = first_present(df, ["hydrologic_unit_code", "huc_cd"])
+    drainage_col = first_present(df, ["drainage_area", "drain_area_va"])
+    period_col = first_present(df, ["computation_period_identifier", "computation_period"])
+    geom_col = first_present(df, ["geometry"])
+
+    records: list[dict] = []
+    for station_id, station_data in df.groupby(loc_col, dropna=True):
+        row = station_data.iloc[0]
+        lon, lat = _extract_point_coords(row[geom_col]) if geom_col else (pd.NA, pd.NA)
+
+        records.append({
+            "site_no": _site_number(station_id),
+            "station_nm": row[name_col] if name_col else None,
+            "dec_lat_va": lat,
+            "dec_long_va": lon,
+            "drain_area_va": row[drainage_col] if drainage_col else pd.NA,
+            "huc_cd": row[huc_col] if huc_col else None,
+            "begin_date": station_data[begin_col].min() if begin_col else pd.NaT,
+            "end_date": station_data[end_col].max() if end_col else pd.NaT,
+            "count_nu": pd.NA,
+            "monitoring_location_id": station_id,
+            "computation_period_identifier": row[period_col] if period_col else None,
+        })
+
+    out = pd.DataFrame.from_records(records)
+    out["dec_lat_va"] = pd.to_numeric(out["dec_lat_va"], errors="coerce")
+    out["dec_long_va"] = pd.to_numeric(out["dec_long_va"], errors="coerce")
+    out["drain_area_va"] = pd.to_numeric(out["drain_area_va"], errors="coerce")
+    out = out.dropna(subset=["dec_lat_va", "dec_long_va"]).sort_values("site_no")
+    log.info("Extracted %d unique Indiana streamflow stations", len(out))
+    return out.reset_index(drop=True)
 
 
 def to_geodataframe(df: pd.DataFrame) -> gpd.GeoDataFrame:
     df = df.copy()
-    df["dec_lat_va"] = pd.to_numeric(df["dec_lat_va"], errors="coerce")
-    df["dec_long_va"] = pd.to_numeric(df["dec_long_va"], errors="coerce")
-    df = df.dropna(subset=["dec_lat_va", "dec_long_va"])
     geom = [Point(xy) for xy in zip(df["dec_long_va"], df["dec_lat_va"])]
     return gpd.GeoDataFrame(df, geometry=geom, crs="EPSG:4326")
 
@@ -205,11 +130,13 @@ def to_geodataframe(df: pd.DataFrame) -> gpd.GeoDataFrame:
 def main() -> None:
     cfg = load_config()
     sites = fetch_indiana_streamflow_sites(
-        cfg["usgs"]["state_code"], cfg["usgs"]["parameter_code"]
+        state_name="Indiana",
+        parameter_code=cfg["usgs"]["parameter_code"],
     )
     keep_cols = [
         "site_no", "station_nm", "dec_lat_va", "dec_long_va",
         "drain_area_va", "huc_cd", "begin_date", "end_date", "count_nu",
+        "monitoring_location_id", "computation_period_identifier",
     ]
     keep_cols = [c for c in keep_cols if c in sites.columns]
     sites = sites[keep_cols].reset_index(drop=True)
