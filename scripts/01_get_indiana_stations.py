@@ -105,8 +105,9 @@ def standardize_locations(df: pd.DataFrame) -> pd.DataFrame:
         out["dec_lat_va"] = pd.to_numeric(df[lat_col], errors="coerce")
         out["dec_long_va"] = pd.to_numeric(df[lon_col], errors="coerce")
     elif "geometry" in df.columns:
-        out["dec_lat_va"] = df.geometry.y
-        out["dec_long_va"] = df.geometry.x
+        coords = df["geometry"].apply(_extract_point_coords)
+        out["dec_long_va"] = pd.to_numeric(coords.str[0], errors="coerce")
+        out["dec_lat_va"] = pd.to_numeric(coords.str[1], errors="coerce")
     else:
         out["dec_lat_va"] = pd.NA
         out["dec_long_va"] = pd.NA
@@ -114,6 +115,26 @@ def standardize_locations(df: pd.DataFrame) -> pd.DataFrame:
     out["drain_area_va"] = pd.to_numeric(df[drainage_col], errors="coerce") if drainage_col else pd.NA
     out["huc_cd"] = df[huc_col] if huc_col else None
     return out
+
+
+def _extract_point_coords(value) -> tuple[object, object]:
+    """Return (lon, lat) from a geometry-like object when explicit columns are absent."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return (pd.NA, pd.NA)
+    if hasattr(value, "x") and hasattr(value, "y"):
+        return (value.x, value.y)
+    if isinstance(value, dict):
+        coords = value.get("coordinates")
+        if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+            return (coords[0], coords[1])
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("POINT"):
+            inner = stripped[stripped.find("(") + 1:stripped.rfind(")")]
+            parts = inner.replace(",", " ").split()
+            if len(parts) >= 2:
+                return (parts[0], parts[1])
+    return (pd.NA, pd.NA)
 
 
 def fetch_indiana_streamflow_sites(state_code: str, parameter_code: str) -> pd.DataFrame:
