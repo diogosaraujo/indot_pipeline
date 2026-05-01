@@ -16,7 +16,7 @@ from __future__ import annotations
 import io
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from datetime import date, timedelta
 from typing import Optional
 
@@ -36,6 +36,7 @@ from utils import (
 
 log = logging.getLogger("02_streamflow")
 WATERDATA_MAX_YEARS = 3
+REQUEST_PAUSE_SEC = 0.5
 
 
 def read_station_inventory(bucket: str, prefix: str) -> pd.DataFrame:
@@ -69,9 +70,17 @@ def fetch_one(site_no: str, start: str, end: Optional[str]) -> pd.DataFrame:
     """Instantaneous/unit-value discharge for one site, full record."""
     monitoring_location_id = site_no if site_no.startswith("USGS-") else f"USGS-{site_no}"
     frames: list[pd.DataFrame] = []
+    windows = _iter_time_windows(start, end)
 
-    for window_start, window_end in _iter_time_windows(start, end):
+    for i, (window_start, window_end) in enumerate(windows, 1):
         time_string = f"{window_start}/{window_end}"
+        log.info(
+            "Site %s window %d/%d: %s",
+            site_no,
+            i,
+            len(windows),
+            time_string,
+        )
 
         def _call():
             df, _ = waterdata.get_continuous(
@@ -84,6 +93,7 @@ def fetch_one(site_no: str, start: str, end: Optional[str]) -> pd.DataFrame:
         df = with_retries(_call, RetryPolicy(max_attempts=4, base_delay=3.0))
         if df is not None and not df.empty:
             frames.append(df)
+        time.sleep(REQUEST_PAUSE_SEC)
 
     if not frames:
         return pd.DataFrame(columns=["datetime", "site_no", "value_cfs", "qualifier"])
@@ -133,22 +143,20 @@ def main() -> None:
     inv = read_station_inventory(bucket, prefix)
     site_list = inv["site_no"].astype(str).unique().tolist()
     log.info("Downloading streamflow for %d sites", len(site_list))
+    log.info(
+        "Processing streamflow serially, one station at a time, in <=%d-year windows",
+        WATERDATA_MAX_YEARS,
+    )
 
-    max_workers = min(cfg["execution"]["max_workers_io"], 16)
-    completed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(process_site, s, cfg): s for s in site_list}
-        for fut in as_completed(futures):
-            site = futures[fut]
-            try:
-                _, n = fut.result()
-                completed += 1
-                if n == -1:
-                    log.info("[%d/%d] %s skipped (already in S3)", completed, len(site_list), site)
-                else:
-                    log.info("[%d/%d] %s -> %d rows", completed, len(site_list), site, n)
-            except Exception as e:
-                log.error("Site %s failed: %s", site, e)
+    for i, site in enumerate(site_list, 1):
+        try:
+            _, n = process_site(site, cfg)
+            if n == -1:
+                log.info("[%d/%d] %s skipped (already in S3)", i, len(site_list), site)
+            else:
+                log.info("[%d/%d] %s -> %d rows", i, len(site_list), site, n)
+        except Exception as e:
+            log.error("Site %s failed: %s", site, e)
 
     # Build the combined long-format file by concatenating all per-gauge Parquets.
     log.info("Building combined long-format Parquet...")
