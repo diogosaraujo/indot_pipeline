@@ -64,7 +64,7 @@ The MRMS public dataset lives at `s3://noaa-mrms-pds`, hosted in **us-east-1**. 
 | Storage | S3 | Outputs and intermediate artifacts |
 | Identity | IAM role attached to EC2 | S3 access without long-lived keys |
 | Python env | Miniforge / mamba | Manage native deps (eccodes, GDAL) |
-| USGS API | `dataretrieval` | NWIS streamflow + site lookup |
+| USGS API | `dataretrieval` | Water Data API streamflow + site metadata |
 | StreamStats | `requests` + retries | Watershed + flow stats REST calls |
 | Geospatial | `geopandas`, `shapely`, `rasterio`, `rioxarray` | Watershed handling, masking |
 | MRMS read | `s3fs`, `xarray`, `cfgrib` (eccodes) | Stream GRIB2 directly from S3 |
@@ -170,7 +170,7 @@ Stopping preserves the EBS volume (cheap, ~$16/month for 200 GB). **Terminating*
 
 3. **The legacy StreamStats API is in sunset.** USGS announced deprecation for January 30, 2026. The current scripts still isolate the legacy `streamstatsservices` calls to one function per step, so migrating to the new `ss-delineate` / `ss-hydro` endpoints should be a focused follow-up.
 
-4. **`dataretrieval` is also in transition.** As of its January 2026 release, the package's new `waterdata` module replaces the legacy `nwis` module by wrapping USGS's modernized Water Data APIs. This pipeline uses `nwis.what_sites` and `nwis.get_iv`, both of which still function. When you next refresh dependencies, plan to migrate scripts 01 and 02 to `waterdata` equivalents.
+4. **`dataretrieval` is also in transition.** As of its January 2026 release, the package's `waterdata` module wraps USGS's modernized Water Data APIs and is now used by this pipeline for station inventory and instantaneous streamflow retrieval. Legacy `nwis` still exists in the package, but steps 01 and 02 no longer depend on it.
 
 5. **MRMS product catalog and units.** `cfg.mrms.products` is a list — steps 05 and 06 loop over it. The default config enables only `QPE_01H_Pass2` (gauge-bias-corrected hourly accumulation, the standard reference for hydrologic studies). The other supported products are commented in:
    - `QPE_01H_Pass1`, `QPE_03H_Pass2`, `QPE_24H_Pass2` — additional QPE accumulation windows.
@@ -199,7 +199,7 @@ indot_pipeline/
 ├── setup_ec2.sh                           <- one-shot EC2 provisioning
 └── scripts/
     ├── utils.py                           <- shared helpers
-    ├── 01_get_indiana_stations.py         <- NWIS site lookup
+    ├── 01_get_indiana_stations.py         <- Water Data API station inventory
     ├── 02_download_streamflow.py          <- instantaneous/unit values, full record
     ├── 03_delineate_watersheds.py         <- StreamStats watershed.geojson
     ├── 04_get_flow_statistics.py          <- gage stats Q2..Q500
