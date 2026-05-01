@@ -49,16 +49,40 @@ def fetch_monitoring_locations(state_code: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def fetch_iv_series_metadata(state_code: str, parameter_code: str) -> pd.DataFrame:
-    """Fetch IV streamflow time-series metadata for Indiana gauges."""
-    log.info("Querying Water Data time-series metadata for IV streamflow in %s", state_code)
-    df, _ = waterdata.get_time_series_metadata(
-        parameter_code=parameter_code,
-        statistic_id="00011",
-        state_name="Indiana",
+def _chunked(values: list[str], size: int) -> list[list[str]]:
+    return [values[i:i + size] for i in range(0, len(values), size)]
+
+
+def fetch_iv_series_metadata(locations: pd.DataFrame, parameter_code: str) -> pd.DataFrame:
+    """Fetch IV streamflow time-series metadata for a set of monitoring locations."""
+    loc_col = first_present(locations, ["monitoring_location_id", "site_no"])
+    if loc_col is None:
+        raise ValueError("Monitoring locations response did not include monitoring_location_id")
+
+    monitoring_ids = (
+        locations[loc_col]
+        .astype(str)
+        .dropna()
+        .tolist()
     )
-    if df.empty:
-        return df
+    if not monitoring_ids:
+        return pd.DataFrame(columns=["site_no", "begin_date", "end_date", "count_nu"])
+
+    frames: list[pd.DataFrame] = []
+    for batch in _chunked(monitoring_ids, 100):
+        log.info("Querying Water Data time-series metadata for %d monitoring locations", len(batch))
+        df, _ = waterdata.get_time_series_metadata(
+            monitoring_location_id=batch,
+            parameter_code=parameter_code,
+            statistic_id="00011",
+        )
+        if df is not None and not df.empty:
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(columns=["site_no", "begin_date", "end_date", "count_nu"])
+
+    df = pd.concat(frames, ignore_index=True)
 
     loc_col = first_present(df, ["monitoring_location_id"])
     begin_col = first_present(df, ["begin", "begin_utc"])
@@ -138,8 +162,9 @@ def _extract_point_coords(value) -> tuple[object, object]:
 
 
 def fetch_indiana_streamflow_sites(state_code: str, parameter_code: str) -> pd.DataFrame:
-    locations = standardize_locations(fetch_monitoring_locations(state_code))
-    series = fetch_iv_series_metadata(state_code, parameter_code)
+    raw_locations = fetch_monitoring_locations(state_code)
+    locations = standardize_locations(raw_locations)
+    series = fetch_iv_series_metadata(raw_locations, parameter_code)
     sites = locations.merge(series, on="site_no", how="inner")
     sites = sites.drop_duplicates("site_no").reset_index(drop=True)
     log.info("Merged inventory contains %d instantaneous discharge sites", len(sites))
