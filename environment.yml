@@ -1,0 +1,29 @@
+name: indot
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - eccodes
+  - gdal
+  - proj
+  - geos
+  - pip
+  - numpy
+  - pandas
+  - pyarrow
+  - geopandas
+  - shapely
+  - rasterio
+  - rioxarray
+  - xarray
+  - cfgrib
+  - zarr
+  - s3fs
+  - boto3
+  - dask
+  - distributed
+  - tqdm
+  - pyyaml
+  - requests
+  - pip:
+      - dataretrieval>=1.0.10

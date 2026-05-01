@@ -1,0 +1,116 @@
+# Pipeline configuration
+# Edit values below before running any script.
+
+aws:
+  region: us-east-1
+  output_bucket: indot-bridge-pipeline-CHANGEME      # YOUR bucket name
+  output_prefix: v1/                                  # versioned prefix
+
+usgs:
+  state_code: IN
+  parameter_code: "00060"     # discharge, cubic feet per second
+  site_types: ["ST"]           # streams (excludes lakes, wells, etc.)
+  start_date: "1900-01-01"    # capped at actual record start per gauge
+  end_date: null               # null = today
+
+streamstats:
+  rcode: IN
+  base_url: "https://streamstats.usgs.gov/streamstatsservices"
+  max_concurrent: 4            # USGS service limit
+  request_timeout_sec: 180
+  retries: 5
+
+# ---------------------------------------------------------------------------
+# MRMS configuration
+#
+# `products`: which MRMS variants to extract. Each is processed independently,
+# so steps 05 and 06 loop over this list. The set below mirrors the products
+# HNTB's existing pipeline tracks; uncomment any you don't need.
+#
+# `units`: "in" stores depth in inches (matches HNTB's hntb-noaa-prod bucket
+# and INDOT's 2.5"/24h trigger); "mm" stores native MRMS units. Only applies
+# to QPE products; ARI is in years, QPEFFG is %, RQI is dimensionless.
+#
+# `lower_limit`: pixel values below this are treated as zero in the per-pixel
+# (sparse) outputs only. Watershed-mean uses ALL pixels. Units must match
+# `units` above for QPE products.
+# ---------------------------------------------------------------------------
+mrms:
+  bucket: noaa-mrms-pds
+  start_date: "2020-10-14"    # MRMS S3 archive start
+  end_date: null               # null = yesterday
+  units: "in"                  # "in" or "mm"
+  per_pixel_zarr: true         # set false to skip the bulky per-pixel output
+
+  products:
+    - key: QPE_01H_Pass2
+      folder: MultiSensor_QPE_01H_Pass2_00.00
+      kind: qpe                # qpe | ari | qpeffg | rqi
+      lower_limit: 0.1         # inches (matches `units` above)
+      hours: "all"             # "all" or list of hour strings like ["23"]
+
+    # Uncomment any of the below to also extract them:
+    # - key: QPE_01H_Pass1
+    #   folder: MultiSensor_QPE_01H_Pass1_00.00
+    #   kind: qpe
+    #   lower_limit: 0.1
+    #   hours: "all"
+    #
+    # - key: QPE_03H_Pass2
+    #   folder: MultiSensor_QPE_03H_Pass2_00.00
+    #   kind: qpe
+    #   lower_limit: 0.25
+    #   hours: "all"
+    #
+    # - key: QPE_24H_Pass2
+    #   folder: MultiSensor_QPE_24H_Pass2_00.00
+    #   kind: qpe
+    #   lower_limit: 1.0
+    #   hours: "all"
+    #
+    # - key: QPEFFG_MAX
+    #   folder: FLASH_QPE_FFGMAX_00.00
+    #   kind: qpeffg            # % of Flash Flood Guidance, dimensionless
+    #   lower_limit: 80         # 80 = QPE reached 80% of FFG
+    #   hours: "all"
+    #
+    # - key: ARI_01H
+    #   folder: FLASH_QPE_ARI01H_00.00
+    #   kind: ari               # years (recurrence interval)
+    #   lower_limit: 10
+    #   hours: "all"
+    #
+    # - key: ARI_03H
+    #   folder: FLASH_QPE_ARI03H_00.00
+    #   kind: ari
+    #   lower_limit: 10
+    #   hours: "all"
+    #
+    # - key: ARI_06H
+    #   folder: FLASH_QPE_ARI06H_00.00
+    #   kind: ari
+    #   lower_limit: 10
+    #   hours: "all"
+    #
+    # - key: ARI_12H
+    #   folder: FLASH_QPE_ARI12H_00.00
+    #   kind: ari
+    #   lower_limit: 10
+    #   hours: "all"
+    #
+    # - key: ARI_24H
+    #   folder: FLASH_QPE_ARI24H_00.00
+    #   kind: ari
+    #   lower_limit: 10
+    #   hours: "all"
+    #
+    # - key: RQI_24H
+    #   folder: RadarAccumulationQualityIndex_24H_00.00
+    #   kind: rqi               # 0-1, dimensionless
+    #   lower_limit: 0.0
+    #   hours: ["23"]           # 24H radar QI is published once per day at 23Z
+
+execution:
+  max_workers_io: 16           # for streamflow + StreamStats download
+  max_workers_grib: 8          # for MRMS extraction
+  checkpoint_dir: ./checkpoints

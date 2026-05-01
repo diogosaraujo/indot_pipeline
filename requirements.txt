@@ -1,0 +1,22 @@
+# Use environment.yml with mamba/conda when possible — eccodes is a C library
+# that is dramatically easier to install via conda-forge. This file is here as
+# a fallback if you must use pip-only on a machine that already has eccodes
+# system-installed.
+
+dataretrieval>=1.0.10
+numpy
+pandas
+pyarrow
+geopandas
+shapely
+rasterio
+rioxarray
+xarray
+cfgrib
+zarr
+s3fs
+boto3
+pyyaml
+requests
+tqdm
+dask[distributed]
