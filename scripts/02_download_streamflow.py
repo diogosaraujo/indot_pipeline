@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, timedelta
 from typing import Optional
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from dataretrieval import nwis
+from dataretrieval import waterdata
 
 from utils import (
     RetryPolicy,
@@ -33,6 +35,7 @@ from utils import (
 )
 
 log = logging.getLogger("02_streamflow")
+WATERDATA_MAX_YEARS = 3
 
 
 def read_station_inventory(bucket: str, prefix: str) -> pd.DataFrame:
@@ -42,41 +45,60 @@ def read_station_inventory(bucket: str, prefix: str) -> pd.DataFrame:
     return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
 
 
+def _parse_end_date(end: Optional[str]) -> str:
+    if end is None:
+        return pd.Timestamp.utcnow().date().isoformat()
+    return end
+
+
+def _iter_time_windows(start: str, end: Optional[str]) -> list[tuple[str, str]]:
+    """Split a long IV request into <=3-year windows for waterdata.get_continuous()."""
+    start_date = date.fromisoformat(start)
+    end_date = date.fromisoformat(_parse_end_date(end))
+    windows: list[tuple[str, str]] = []
+    current = start_date
+    while current <= end_date:
+        next_start = (pd.Timestamp(current) + pd.DateOffset(years=WATERDATA_MAX_YEARS)).date()
+        window_end = min(end_date, next_start - timedelta(days=1))
+        windows.append((current.isoformat(), window_end.isoformat()))
+        current = window_end + timedelta(days=1)
+    return windows
+
+
 def fetch_one(site_no: str, start: str, end: Optional[str]) -> pd.DataFrame:
     """Instantaneous/unit-value discharge for one site, full record."""
-    def _call():
-        df, _ = nwis.get_iv(
-            sites=site_no,
-            parameterCd="00060",
-            start=start,
-            end=end,
-            multi_index=False,
-        )
-        return df
+    monitoring_location_id = site_no if site_no.startswith("USGS-") else f"USGS-{site_no}"
+    frames: list[pd.DataFrame] = []
 
-    df = with_retries(_call, RetryPolicy(max_attempts=4, base_delay=3.0))
-    if df is None or df.empty:
+    for window_start, window_end in _iter_time_windows(start, end):
+        time_string = f"{window_start}/{window_end}"
+
+        def _call():
+            df, _ = waterdata.get_continuous(
+                monitoring_location_id=monitoring_location_id,
+                parameter_code="00060",
+                time=time_string,
+            )
+            return df
+
+        df = with_retries(_call, RetryPolicy(max_attempts=4, base_delay=3.0))
+        if df is not None and not df.empty:
+            frames.append(df)
+
+    if not frames:
         return pd.DataFrame(columns=["datetime", "site_no", "value_cfs", "qualifier"])
 
-    df = df.reset_index()
-    if "datetime" not in df.columns and "index" in df.columns:
-        df = df.rename(columns={"index": "datetime"})
-    # Instantaneous-value columns are typically "00060" and "00060_cd".
-    val_col = "00060" if "00060" in df.columns else None
-    if val_col is None:
-        val_col = next((c for c in df.columns if c.startswith("00060") and not c.endswith("_cd")), None)
-    qua_col = "00060_cd" if "00060_cd" in df.columns else None
-    if qua_col is None:
-        qua_col = next((c for c in df.columns if c.startswith("00060") and c.endswith("_cd")), None)
-    if val_col is None:
+    df = pd.concat(frames, ignore_index=True)
+    if "time" not in df.columns or "value" not in df.columns:
         return pd.DataFrame(columns=["datetime", "site_no", "value_cfs", "qualifier"])
 
     out = pd.DataFrame({
-        "datetime": pd.to_datetime(df["datetime"], utc=True),
+        "datetime": pd.to_datetime(df["time"], utc=True),
         "site_no": site_no,
-        "value_cfs": pd.to_numeric(df[val_col], errors="coerce"),
-        "qualifier": df[qua_col] if qua_col else None,
+        "value_cfs": pd.to_numeric(df["value"], errors="coerce"),
+        "qualifier": df["qualifier"] if "qualifier" in df.columns else None,
     })
+    out = out.drop_duplicates().sort_values("datetime").reset_index(drop=True)
     return out
 
 
@@ -103,6 +125,10 @@ def main() -> None:
     cfg = load_config()
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
+    if os.getenv("API_USGS_PAT"):
+        log.info("Using USGS API token from API_USGS_PAT")
+    else:
+        log.warning("API_USGS_PAT is not set; Water Data API requests may be more rate-limited")
 
     inv = read_station_inventory(bucket, prefix)
     site_list = inv["site_no"].astype(str).unique().tolist()
