@@ -3,7 +3,7 @@
 
 aws:
   region: us-east-1
-  output_bucket: indot-bridge-pipeline-CHANGEME      # YOUR bucket name
+  output_bucket: indot-bridge-pipeline      # YOUR bucket name
   output_prefix: v1/                                  # versioned prefix
 
 usgs:
