@@ -93,6 +93,12 @@ def fetch_indiana_streamflow_sites(state_name: str, parameter_code: str) -> pd.D
     period_col = first_present(df, ["computation_period_identifier", "computation_period"])
     geom_col = first_present(df, ["geometry"])
 
+    if period_col is None:
+        raise ValueError("Water Data metadata did not include computation_period_identifier")
+    before = len(df)
+    df = df[df[period_col].astype(str).str.lower() == "points"].copy()
+    log.info("Kept %d/%d metadata rows with computation_period_identifier=Points", len(df), before)
+
     records: list[dict] = []
     for station_id, station_data in df.groupby(loc_col, dropna=True):
         row = station_data.iloc[0]
@@ -123,6 +129,9 @@ def fetch_indiana_streamflow_sites(state_name: str, parameter_code: str) -> pd.D
 
 def to_geodataframe(df: pd.DataFrame) -> gpd.GeoDataFrame:
     df = df.copy()
+    for col in ["begin_date", "end_date"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d")
     geom = [Point(xy) for xy in zip(df["dec_long_va"], df["dec_lat_va"])]
     return gpd.GeoDataFrame(df, geometry=geom, crs="EPSG:4326")
 
