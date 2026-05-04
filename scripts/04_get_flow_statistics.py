@@ -139,21 +139,9 @@ def process_site(site_no: str, workspace_id: str, cfg: dict) -> dict:
             record.update(flows)
             return record
 
-    # 2) Fall back to StreamStats regression
-    try:
-        regr = with_retries(
-            lambda: fetch_streamstats_regression(workspace_id, rcode, timeout),
-            RetryPolicy(max_attempts=3, base_delay=5.0),
-            exceptions=(requests.RequestException,),
-        )
-    except Exception as e:
-        log.warning("Regression flowstats failed for %s: %s", site_no, e)
-        regr = None
-
-    if regr and any(v is not None for v in regr["flows"].values()):
-        record["source"] = "regression"
-        record.update(regr["flows"])
-        record["regression_region"] = regr["regression_region"]
+    # Regression fallback via streamstatsservices is disabled —
+    # that endpoint was deprecated 2026-01-30 and no longer responds.
+    # Step 03 now uses NLDI which does not produce workspace IDs.
     return record
 
 
