@@ -135,7 +135,10 @@ def main() -> None:
     cfg = load_config()
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
-    if os.getenv("API_USGS_PAT"):
+    pat = os.getenv("API_USGS_PAT")
+    if pat:
+        import dataretrieval.utils as _dru
+        _dru.session.headers.update({"Authorization": f"Bearer {pat}"})
         log.info("Using USGS API token from API_USGS_PAT")
     else:
         log.warning("API_USGS_PAT is not set; Water Data API requests may be more rate-limited")

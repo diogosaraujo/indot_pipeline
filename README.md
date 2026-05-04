@@ -199,13 +199,27 @@ ssh -i C:\Users\daraujo\Downloads\indot-pipeline-key.pem ubuntu@<ec2-ip>
 
 ```bash
 # Clone using the token embedded in the HTTPS URL
-git clone https://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@github.com/diogosaraujo/indot_pipeline.git
+git clone https://<TOKEN>@github.com/diogosaraujo/indot_pipeline.git
 cd indot_pipeline
 
 # Install miniforge, create the mamba env, and install all dependencies
 bash setup_ec2.sh
+```
+
+`setup_ec2.sh` installs conda/mamba but does not modify your shell's startup file. After it finishes, initialize conda for your shell (one-time step per instance):
+
+```bash
+~/miniforge3/bin/conda init bash
+```
+
+Then activate the environment for the current session:
+
+```bash
+eval "$(mamba shell hook --shell bash)"
 mamba activate indot
 ```
+
+On future reconnections, `mamba activate indot` is all you need — `conda init` only needs to run once per instance.
 
 > If you prefer to copy a local checkout rather than clone from GitHub, you can `scp` it from your local machine before SSHing in:
 > ```bash
@@ -216,7 +230,24 @@ mamba activate indot
 
 Edit `config.yaml` to set your S3 bucket name, output prefix, MRMS product variant, and date range. Defaults are sensible for this project.
 
-### 6.4 Run the pipeline scripts in order
+### 6.4 USGS Water Data API token (required for script 02)
+
+Without a token the USGS API applies a strict rate limit that causes 429 errors across the 297-site inventory. Register for a free token at the USGS Water Data portal (`api.waterdata.usgs.gov`) under **My Account → API Tokens**.
+
+Once you have the token, set it on EC2 before running script 02:
+
+```bash
+# Current session only
+export API_USGS_PAT=your_token_here
+
+# Persist across reconnections
+echo 'export API_USGS_PAT=your_token_here' >> ~/.bashrc
+source ~/.bashrc
+```
+
+The token is injected as a Bearer Authorization header into every `dataretrieval` request automatically — no other changes needed.
+
+### 6.5 Run the pipeline scripts in order
 
 Each script is independent and idempotent — re-running picks up where it left off.
 
@@ -231,7 +262,7 @@ python scripts/06_extract_mrms_watershed.py      # ~10-16 hours, parallelized
 
 Steps 03 and 04 cannot be meaningfully sped up by adding cores — StreamStats limits you to 4 concurrent requests. Steps 05 and 06 *do* scale with CPU; bigger instance = faster. Steps 02, 03, and 04 can run concurrently in three terminals if you want to overlap them.
 
-### 6.5 Cost-saving teardown
+### 6.6 Cost-saving teardown
 
 When step 06 finishes:
 
