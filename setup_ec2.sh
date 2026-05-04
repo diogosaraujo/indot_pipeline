@@ -5,7 +5,15 @@ set -euo pipefail
 
 # System packages
 sudo apt-get update -y
-sudo apt-get install -y build-essential wget curl git unzip awscli
+sudo apt-get install -y build-essential wget curl git unzip
+
+# AWS CLI v2 (not available via apt on Ubuntu 24.04)
+if ! command -v aws &>/dev/null; then
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  sudo /tmp/aws/install
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
 
 # Miniforge (mamba) — keeps eccodes/GDAL clean
 if [[ ! -d "$HOME/miniforge3" ]]; then
