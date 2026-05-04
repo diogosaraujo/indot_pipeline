@@ -199,7 +199,7 @@ ssh -i C:\Users\daraujo\Downloads\indot-pipeline-key.pem ubuntu@<ec2-ip>
 
 ```bash
 # Clone using the token embedded in the HTTPS URL
-git clone https://<TOKEN>@github.com/<your-org>/indot_pipeline.git
+git clone https://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@github.com/diogosaraujo/indot_pipeline.git
 cd indot_pipeline
 
 # Install miniforge, create the mamba env, and install all dependencies
