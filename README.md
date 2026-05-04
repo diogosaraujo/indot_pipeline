@@ -101,39 +101,122 @@ The dominant cost driver is **how many hours your EC2 instance is on**, not data
 
 ---
 
-## 5. Step-by-step procedure
+## 5. Prerequisites — AWS CLI
 
-### 5.1 One-time AWS setup
+The `.bat` helper scripts in this repository use the **AWS Command Line Interface (AWS CLI v2)**. Install it on your local **Windows** machine before running any of the scripts in section 6.
 
-1. Create an S3 bucket in us-east-1, e.g. `indot-bridge-pipeline-<your-id>`. Block public access.
-2. Create an IAM role for EC2 (`EC2-INDOT-Pipeline`) with two managed policies:
-   - `AmazonS3FullAccess` *scoped* to your bucket via a customer-inline policy, not the AWS-managed one.
-   - Read-only S3 access to `arn:aws:s3:::noaa-mrms-pds` (it's public so this is more about keeping principles tidy than authorization).
-3. Launch an EC2 instance:
-   - AMI: Ubuntu 24.04 LTS (any recent LTS is fine)
-   - Type: `m5.2xlarge`
-   - Storage: 200 GB gp3 root volume
-   - Region/AZ: us-east-1, any AZ
-   - Attach the IAM role above
-   - Open inbound port 22 only to your IP
+### Install AWS CLI v2 on Windows
 
-### 5.2 Provision the Python environment
+1. Go to the official AWS CLI documentation page and download the **AWS CLI MSI installer for Windows (64-bit)**. Search for "Install or update to the latest version of the AWS CLI" on the AWS docs site to find the current installer link.
+2. Run the downloaded `.msi` file and follow the installer prompts.
+3. Open a **new** Command Prompt or PowerShell window (the installer updates `PATH` — existing windows won't see it).
+4. Verify the installation:
 
-SSH in and run `setup_ec2.sh` from this repo (it installs miniforge, creates a `mamba` env named `indot`, and installs all dependencies including eccodes).
+   ```
+   aws --version
+   ```
+
+   Expected output: `aws-cli/2.x.x Python/3.x.x Windows/...`
+
+### Configure credentials
+
+You need an IAM user with programmatic access. In the AWS Console go to **IAM → Users → *your user* → Security credentials → Create access key**. Then run:
+
+```
+aws configure
+```
+
+Enter the following when prompted:
+
+| Field | Value |
+|---|---|
+| AWS Access Key ID | The key ID from the step above |
+| AWS Secret Access Key | The matching secret |
+| Default region name | `us-east-1` |
+| Default output format | `json` |
+
+Credentials are written to `~/.aws/credentials` and `~/.aws/config`. All `.bat` scripts in this repository read them automatically — no further configuration needed.
+
+> **Tip:** Use a dedicated IAM user with `AdministratorAccess` (or a tighter policy scoped to EC2, S3, and IAM) rather than root account credentials.
+
+---
+
+## 6. Step-by-step procedure
+
+### 6.1 One-time AWS setup
+
+Run the following `.bat` scripts **in order** from a Command Prompt or PowerShell window on your local machine. Each script is idempotent — safe to re-run if interrupted.
+
+**a. Create the S3 bucket**
+
+Open `create-s3-bucket.bat` in a text editor and set `BUCKET_NAME` to a globally unique name (e.g. `indot-bridge-pipeline-<your-initials>`). Bucket names must be lowercase and contain only letters, numbers, and hyphens. Then run:
+
+```bat
+create-s3-bucket.bat
+```
+
+This creates the bucket in `us-east-1` and blocks all public access.
+
+**b. Create the IAM role**
+
+Open `create-iam-role.bat` and set `BUCKET_NAME` to the **exact same name** used above, then run:
+
+```bat
+create-iam-role.bat
+```
+
+This creates the `EC2-INDOT-Pipeline` IAM role with a trust policy that allows EC2 to assume it, attaches a customer-inline policy scoped to your bucket plus read-only access to `noaa-mrms-pds`, and creates the matching EC2 instance profile. Wait about 15 seconds after this completes before the next step — IAM changes take a moment to propagate.
+
+**c. Launch the EC2 instance**
+
+Open `launch-ec2.bat` and set `KEY_NAME` to an existing EC2 key pair in your account (create one in the AWS Console under **EC2 → Key Pairs** if needed), then run:
+
+```bat
+launch-ec2.bat
+```
+
+This creates a security group that allows SSH only from your current public IP, launches an `m5.2xlarge` Ubuntu 24.04 instance with a 200 GB gp3 root volume, attaches the `EC2-INDOT-Pipeline` instance profile, and prints the SSH connection command when the instance is ready.
+
+### 6.2 Provision the Python environment
+
+#### Authenticate to GitHub from EC2
+
+Use a **GitHub Personal Access Token (PAT)** to clone over HTTPS — no SSH key setup required on the instance.
+
+1. On GitHub: **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**
+2. Under *Repository access*, select your `indot_pipeline` repo
+3. Under *Permissions*, set **Contents → Read-only**
+4. Click **Generate token** and copy it (you won't see it again)
+
+#### Connect to the instance
+
+```powershell
+# Run this from your local machine (use the IP printed by launch-ec2.bat)
+ssh -i C:\Users\daraujo\Downloads\indot-pipeline-key.pem ubuntu@<ec2-ip>
+```
+
+#### Clone and set up the environment
 
 ```bash
-scp -r indot_pipeline/ ubuntu@<ec2-ip>:~/
-ssh ubuntu@<ec2-ip>
-cd ~/indot_pipeline
+# Clone using the token embedded in the HTTPS URL
+git clone https://<TOKEN>@github.com/<your-org>/indot_pipeline.git
+cd indot_pipeline
+
+# Install miniforge, create the mamba env, and install all dependencies
 bash setup_ec2.sh
 mamba activate indot
 ```
 
-### 5.3 Configure pipeline parameters
+> If you prefer to copy a local checkout rather than clone from GitHub, you can `scp` it from your local machine before SSHing in:
+> ```bash
+> scp -r indot_pipeline/ ubuntu@<ec2-ip>:~/
+> ```
+
+### 6.3 Configure pipeline parameters
 
 Edit `config.yaml` to set your S3 bucket name, output prefix, MRMS product variant, and date range. Defaults are sensible for this project.
 
-### 5.4 Run the pipeline scripts in order
+### 6.4 Run the pipeline scripts in order
 
 Each script is independent and idempotent — re-running picks up where it left off.
 
@@ -148,7 +231,7 @@ python scripts/06_extract_mrms_watershed.py      # ~10-16 hours, parallelized
 
 Steps 03 and 04 cannot be meaningfully sped up by adding cores — StreamStats limits you to 4 concurrent requests. Steps 05 and 06 *do* scale with CPU; bigger instance = faster. Steps 02, 03, and 04 can run concurrently in three terminals if you want to overlap them.
 
-### 5.5 Cost-saving teardown
+### 6.5 Cost-saving teardown
 
 When step 06 finishes:
 
@@ -162,7 +245,7 @@ Stopping preserves the EBS volume (cheap, ~$16/month for 200 GB). **Terminating*
 
 ---
 
-## 6. Important caveats specific to this project
+## 7. Important caveats specific to this project
 
 1. **MRMS pre-2020 data is not on AWS.** The retrospective period of record here is roughly 2020-10-14 onward. For your INDOT framework that's a meaningful constraint: you can only attribute condition-rating drops to MRMS-derived events for inspection cycles whose inter-inspection windows fall entirely after that date. Earlier transitions can still be cross-referenced with USGS gauge data.
 
@@ -188,7 +271,7 @@ Stopping preserves the EBS volume (cheap, ~$16/month for 200 GB). **Terminating*
 
 ---
 
-## 7. Files in this project
+## 8. Files in this project
 
 ```
 indot_pipeline/
@@ -197,6 +280,9 @@ indot_pipeline/
 ├── requirements.txt                       <- pip-installable deps
 ├── environment.yml                        <- mamba/conda env (preferred)
 ├── setup_ec2.sh                           <- one-shot EC2 provisioning
+├── create-s3-bucket.bat                   <- AWS CLI: create output S3 bucket
+├── create-iam-role.bat                    <- AWS CLI: create EC2 IAM role + instance profile
+├── launch-ec2.bat                         <- AWS CLI: launch EC2 instance
 └── scripts/
     ├── utils.py                           <- shared helpers
     ├── 01_get_indiana_stations.py         <- Water Data API station inventory
