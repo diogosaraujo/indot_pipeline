@@ -152,6 +152,7 @@ def main() -> None:
 
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
+    # --- Full inventory (all stations, used by scripts 02 and 03) ---
     write_parquet_to_s3(sites, bucket, f"{prefix}stations/indiana_streamflow_sites.parquet")
     log.info("Wrote Parquet: s3://%s/%sstations/indiana_streamflow_sites.parquet", bucket, prefix)
 
@@ -163,6 +164,37 @@ def main() -> None:
     )
     log.info("Wrote GeoJSON: s3://%s/%sstations/indiana_streamflow_sites.geojson", bucket, prefix)
     log.info("Done. %d sites total.", len(sites))
+
+    # --- Active inventory (end_date >= 2018-01-01, used by scripts 05 and 06) ---
+    # Filters to stations with data in the MRMS/NWM era for precipitation pairing.
+    # Stations with earlier end dates are still downloaded by script 02 for future use.
+    active_cutoff = pd.Timestamp("2018-01-01")
+    sites_active = sites[
+        pd.to_datetime(sites["end_date"], errors="coerce") >= active_cutoff
+    ].copy().reset_index(drop=True)
+    log.info(
+        "Active stations (end_date >= 2018-01-01): %d / %d",
+        len(sites_active), len(sites),
+    )
+
+    write_parquet_to_s3(
+        sites_active, bucket, f"{prefix}stations/indiana_streamflow_sites_active.parquet"
+    )
+    log.info(
+        "Wrote Parquet: s3://%s/%sstations/indiana_streamflow_sites_active.parquet",
+        bucket, prefix,
+    )
+
+    gdf_active = to_geodataframe(sites_active)
+    write_bytes_to_s3(
+        gdf_active.to_json().encode(),
+        bucket,
+        f"{prefix}stations/indiana_streamflow_sites_active.geojson",
+    )
+    log.info(
+        "Wrote GeoJSON: s3://%s/%sstations/indiana_streamflow_sites_active.geojson",
+        bucket, prefix,
+    )
 
 
 if __name__ == "__main__":

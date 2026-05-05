@@ -119,7 +119,7 @@ def process_day(args: tuple) -> str:
 
 def read_gauges(bucket: str, prefix: str) -> pd.DataFrame:
     obj = s3_client().get_object(
-        Bucket=bucket, Key=f"{prefix}stations/indiana_streamflow_sites.parquet"
+        Bucket=bucket, Key=f"{prefix}stations/indiana_streamflow_sites_active.parquet"
     )
     return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
 

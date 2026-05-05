@@ -262,7 +262,7 @@ python scripts/06_extract_mrms_watershed.py      # ~10-16 hours, parallelized
 
 Steps 03 and 04 cannot be meaningfully sped up by adding cores — StreamStats limits you to 4 concurrent requests. Steps 05 and 06 *do* scale with CPU; bigger instance = faster. Steps 02, 03, and 04 can run concurrently in three terminals if you want to overlap them.
 
-### 6.6 Cost-saving teardown
+### 6.5 Cost-saving teardown
 
 When step 06 finishes:
 

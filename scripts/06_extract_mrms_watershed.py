@@ -242,17 +242,37 @@ def fetch_template_grid(cfg: dict) -> dict:
 
 
 def build_all_masks(cfg: dict, grid: dict) -> list[dict]:
-    """Read every per-gauge watershed GeoJSON and build its mask once."""
+    """Read per-gauge watershed GeoJSONs for active stations and build masks.
+
+    Only processes stations in indiana_streamflow_sites_active.parquet
+    (end_date >= 2018-01-01) so MRMS extraction is limited to gauges with
+    data in the MRMS/NWM era. All watersheds still exist in S3 for future use.
+    """
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
     s3 = s3_client()
+
+    # Load active station list and use it as the allowed set
+    obj = s3.get_object(
+        Bucket=bucket,
+        Key=f"{prefix}stations/indiana_streamflow_sites_active.parquet",
+    )
+    active_sites = set(
+        pq.read_table(io.BytesIO(obj["Body"].read()))
+        .to_pandas()["site_no"]
+        .astype(str)
+    )
+    log.info("Restricting watershed masks to %d active stations (end_date >= 2018)", len(active_sites))
+
     paginator = s3.get_paginator("list_objects_v2")
     site_ids = []
     for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}watersheds/per_gauge/"):
         for obj in page.get("Contents", []):
             name = obj["Key"].rsplit("/", 1)[-1]
             if name.endswith(".geojson"):
-                site_ids.append(name.replace(".geojson", ""))
+                sid = name.replace(".geojson", "")
+                if sid in active_sites:
+                    site_ids.append(sid)
 
     masks = []
     for sid in site_ids:
