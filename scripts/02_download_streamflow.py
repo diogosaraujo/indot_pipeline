@@ -112,18 +112,21 @@ def fetch_one(site_no: str, start: str, end: Optional[str]) -> pd.DataFrame:
     return out
 
 
-def process_site(site_no: str, cfg: dict) -> tuple[str, int]:
+def process_site(site_no: str, cfg: dict, begin_date: Optional[str], end_date: Optional[str]) -> tuple[str, int]:
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
     key = f"{prefix}streamflow/instantaneous/per_gauge/{site_no}.parquet"
     if s3_object_exists(bucket, key):
         return site_no, -1  # already done
 
-    df = fetch_one(
-        site_no,
-        cfg["usgs"]["start_date"],
-        cfg["usgs"]["end_date"],
-    )
+    # Use the station's actual period of record as bounds, falling back to
+    # config dates. This avoids making empty API calls outside the station's
+    # known active period (e.g. querying 1900-1987 for a station that only
+    # started in 1987).
+    start = begin_date or cfg["usgs"]["start_date"]
+    end = end_date or cfg["usgs"]["end_date"]
+
+    df = fetch_one(site_no, start, end)
     if df.empty:
         log.info("No data for %s", site_no)
         return site_no, 0
@@ -148,20 +151,23 @@ def main() -> None:
         log.warning("API_USGS_PAT is not set; Water Data API requests may be more rate-limited")
 
     inv = read_station_inventory(bucket, prefix)
-    site_list = inv["site_no"].astype(str).unique().tolist()
-    log.info("Downloading streamflow for %d sites", len(site_list))
+    inv["site_no"] = inv["site_no"].astype(str)
+    log.info("Downloading streamflow for %d sites", len(inv))
     log.info(
         "Processing streamflow serially, one station at a time, in <=%d-year windows",
         WATERDATA_MAX_YEARS,
     )
 
-    for i, site in enumerate(site_list, 1):
+    for i, row in enumerate(inv.itertuples(index=False), 1):
+        site = row.site_no
+        begin = str(row.begin_date)[:10] if pd.notna(row.begin_date) else None
+        end = str(row.end_date)[:10] if pd.notna(row.end_date) else None
         try:
-            _, n = process_site(site, cfg)
+            _, n = process_site(site, cfg, begin, end)
             if n == -1:
-                log.info("[%d/%d] %s skipped (already in S3)", i, len(site_list), site)
+                log.info("[%d/%d] %s skipped (already in S3)", i, len(inv), site)
             else:
-                log.info("[%d/%d] %s -> %d rows", i, len(site_list), site, n)
+                log.info("[%d/%d] %s -> %d rows", i, len(inv), site, n)
         except Exception as e:
             log.error("Site %s failed: %s", site, e)
 
