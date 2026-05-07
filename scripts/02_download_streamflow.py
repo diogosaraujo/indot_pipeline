@@ -138,14 +138,16 @@ def main() -> None:
     cfg = load_config()
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
+    import requests as _requests
+    _orig_send = _requests.Session.send
     pat = os.getenv("API_USGS_PAT")
-    if pat:
-        import requests as _requests
-        _orig_send = _requests.Session.send
-        def _authed_send(self, r, **kw):
+    def _patched_send(self, r, **kw):
+        if pat:
             r.headers.setdefault("Authorization", f"Bearer {pat}")
-            return _orig_send(self, r, **kw)
-        _requests.Session.send = _authed_send
+        kw.setdefault("timeout", 120)  # 2-minute hard timeout per request
+        return _orig_send(self, r, **kw)
+    _requests.Session.send = _patched_send
+    if pat:
         log.info("Using USGS API token from API_USGS_PAT")
     else:
         log.warning("API_USGS_PAT is not set; Water Data API requests may be more rate-limited")
