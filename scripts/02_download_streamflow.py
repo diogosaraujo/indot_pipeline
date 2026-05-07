@@ -102,11 +102,14 @@ def fetch_one(site_no: str, start: str, end: Optional[str]) -> pd.DataFrame:
     if "time" not in df.columns or "value" not in df.columns:
         return pd.DataFrame(columns=["datetime", "site_no", "value_cfs", "qualifier"])
 
+    qualifier = df["qualifier"] if "qualifier" in df.columns else None
+    if qualifier is not None:
+        qualifier = qualifier.apply(lambda x: ",".join(x) if isinstance(x, list) else x)
     out = pd.DataFrame({
         "datetime": pd.to_datetime(df["time"], utc=True),
         "site_no": site_no,
         "value_cfs": pd.to_numeric(df["value"], errors="coerce"),
-        "qualifier": df["qualifier"] if "qualifier" in df.columns else None,
+        "qualifier": qualifier,
     })
     out = out.drop_duplicates().sort_values("datetime").reset_index(drop=True)
     return out
