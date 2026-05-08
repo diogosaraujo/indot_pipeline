@@ -18,7 +18,9 @@ Writes:
 from __future__ import annotations
 
 import io
+import json
 import logging
+import re
 import time
 from typing import Optional
 
@@ -37,24 +39,22 @@ log = logging.getLogger("07_atlas14")
 PFDS_URL = "https://hdsc.nws.noaa.gov/cgi-bin/hdsc/new/cgi_readH5.py"
 REQUEST_PAUSE_SEC = 1.0
 
-# Atlas 14 duration labels as returned by the PFDS API, mapped to hours
+# Standard Atlas 14 Volume 2 (Ohio River Basin) duration sequence in order.
+# The PFDS API does not return duration labels — order is fixed by the dataset.
+ATLAS14_DURATION_LABELS = [
+    "5-min", "10-min", "15-min", "30-min", "60-min",
+    "2-hr",  "3-hr",   "6-hr",   "12-hr",  "24-hr",
+    "2-day", "3-day",  "4-day",  "5-day",  "7-day",
+    "10-day","20-day", "30-day", "45-day", "60-day",
+]
+
+# Subset we care about (>= 1h, matching MRMS hourly resolution)
 DURATION_MAP: dict[str, int] = {
-    "60-min":  1,
-    "2-hr":    2,
-    "3-hr":    3,
-    "6-hr":    6,
-    "12-hr":   12,
-    "24-hr":   24,
-    "2-day":   48,
-    "3-day":   72,
-    "4-day":   96,
-    "5-day":   120,
-    "7-day":   168,
-    "10-day":  240,
-    "20-day":  480,
-    "30-day":  720,
-    "45-day":  1080,
-    "60-day":  1440,
+    "60-min": 1,
+    "2-hr":   2,   "3-hr":   3,   "6-hr":   6,   "12-hr":  12,
+    "24-hr":  24,  "2-day":  48,  "3-day":  72,  "4-day":  96,
+    "5-day":  120, "7-day":  168, "10-day": 240, "20-day": 480,
+    "30-day": 720, "45-day": 1080,"60-day": 1440,
 }
 
 RETURN_PERIODS = [1, 2, 5, 10, 25, 50, 100, 200, 500, 1000]
@@ -67,8 +67,11 @@ def read_active_inventory(bucket: str, prefix: str) -> pd.DataFrame:
     return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
 
 
-def fetch_atlas14(lat: float, lon: float) -> Optional[dict]:
-    """Query the NOAA PFDS API and return the raw JSON response."""
+def fetch_atlas14(lat: float, lon: float) -> Optional[str]:
+    """Query the NOAA PFDS API and return the raw response text.
+
+    The API returns JavaScript-style variable assignments, not JSON.
+    """
     params = {
         "lat": round(lat, 6),
         "lon": round(lon, 6),
@@ -81,35 +84,42 @@ def fetch_atlas14(lat: float, lon: float) -> Optional[dict]:
     def _call():
         r = requests.get(PFDS_URL, params=params, timeout=30)
         r.raise_for_status()
-        return r.json()
+        if not r.text.strip():
+            raise ValueError("Empty response from Atlas 14 API")
+        return r.text
 
     return with_retries(_call, RetryPolicy(max_attempts=4, base_delay=5.0))
 
 
-def parse_atlas14(site_no: str, data: dict) -> pd.DataFrame:
-    """Parse PFDS JSON response into long-format rows.
+def parse_atlas14(site_no: str, text: str) -> pd.DataFrame:
+    """Parse PFDS JavaScript-format response into long-format rows.
 
-    The PFDS response has:
-        data["quantiles"]      → list of lists [duration_idx][return_period_idx]
-        data["durations"]      → list of duration label strings
-        data["return_periods"] → list of return period strings (years)
+    The response contains variable assignments like:
+        quantiles = [['0.387', ...], ...];
+    Duration labels are not returned — order follows ATLAS14_DURATION_LABELS.
     """
-    quantiles = data.get("quantiles", [])
-    durations = data.get("durations", [])
-    return_periods = [int(float(rp)) for rp in data.get("return_periods", [])]
-
-    if not quantiles or not durations or not return_periods:
-        log.warning("Site %s: unexpected Atlas 14 response structure", site_no)
+    match = re.search(r"quantiles\s*=\s*(\[\[.*?\]\]);", text, re.DOTALL)
+    if not match:
+        log.warning("Site %s: could not find quantiles in response", site_no)
         return pd.DataFrame()
 
+    quantiles = json.loads(match.group(1).replace("'", '"'))
+    n_durations = len(quantiles)
+    expected = len(ATLAS14_DURATION_LABELS)
+    if n_durations != expected:
+        log.warning(
+            "Site %s: got %d duration rows, expected %d — "
+            "using last %d labels from ATLAS14_DURATION_LABELS",
+            site_no, n_durations, expected, n_durations,
+        )
+    duration_labels = ATLAS14_DURATION_LABELS[-n_durations:]
+
     records = []
-    for dur_label, depths in zip(durations, quantiles):
+    for dur_label, depths in zip(duration_labels, quantiles):
         if dur_label not in DURATION_MAP:
             continue
         duration_hr = DURATION_MAP[dur_label]
-        for rp, depth in zip(return_periods, depths):
-            if rp not in RETURN_PERIODS:
-                continue
+        for rp, depth in zip(RETURN_PERIODS, depths):
             records.append({
                 "site_no": site_no,
                 "duration_hr": duration_hr,
