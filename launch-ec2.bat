@@ -54,5 +54,5 @@ echo  Instance is RUNNING!
 echo  Instance ID : %INSTANCE_ID%
 echo  Public IP   : %PUBLIC_IP%
 echo  Connect with:
-echo  ssh -i C:\Users\daraujo\Downloads\indot-pipeline-key ubuntu@%PUBLIC_IP%
+echo  ssh -i C:\Users\daraujo\Downloads\indot-pipeline-key.pem ubuntu@%PUBLIC_IP%
 echo =========================================

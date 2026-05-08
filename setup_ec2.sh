@@ -31,5 +31,18 @@ conda activate base
 mamba env create -f environment.yml || mamba env update -f environment.yml --prune
 
 echo
-echo "Setup complete. Activate with:"
-echo "  source ~/miniforge3/etc/profile.d/conda.sh && conda activate indot"
+echo "Setup complete. To activate the environment, run the following commands:"
+echo ""
+echo "  # Make conda available in the current shell"
+echo "  source ~/miniforge3/etc/profile.d/conda.sh"
+echo ""
+echo "  # Initialize conda for bash (one-time per instance — writes to ~/.bashrc)"
+echo "  ~/miniforge3/bin/conda init bash"
+echo ""
+echo "  # Initialize mamba for the current session"
+echo "  eval \"\$(mamba shell hook --shell bash)\""
+echo ""
+echo "  # Activate the project environment"
+echo "  mamba activate indot"
+echo ""
+echo "On future reconnections, 'mamba activate indot' is all you need."

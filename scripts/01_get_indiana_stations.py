@@ -122,7 +122,11 @@ def fetch_indiana_streamflow_sites(state_name: str, parameter_code: str) -> pd.D
     out["dec_lat_va"] = pd.to_numeric(out["dec_lat_va"], errors="coerce")
     out["dec_long_va"] = pd.to_numeric(out["dec_long_va"], errors="coerce")
     out["drain_area_va"] = pd.to_numeric(out["drain_area_va"], errors="coerce")
-    out = out.dropna(subset=["dec_lat_va", "dec_long_va"]).sort_values("site_no")
+    before = len(out)
+    out = out.dropna(subset=["dec_lat_va", "dec_long_va", "begin_date", "end_date"]).sort_values("site_no")
+    dropped = before - len(out)
+    if dropped:
+        log.info("Dropped %d stations with missing coordinates or begin/end date", dropped)
     log.info("Extracted %d unique Indiana streamflow stations", len(out))
     return out.reset_index(drop=True)
 
