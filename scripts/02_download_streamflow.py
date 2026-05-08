@@ -134,7 +134,7 @@ def process_site(site_no: str, cfg: dict, begin_date: Optional[str], end_date: O
         log.info("No data for %s", site_no)
         return site_no, 0
     write_parquet_to_s3(df, bucket, key)
-    return site_no, len(df)
+    return site_no, len(df)  # 0 for empty, still written to S3
 
 
 def main() -> None:
@@ -163,6 +163,7 @@ def main() -> None:
         WATERDATA_MAX_YEARS,
     )
 
+    no_data_sites: list[str] = []
     for i, row in enumerate(inv.itertuples(index=False), 1):
         site = row.site_no
         begin = str(row.begin_date)[:10] if pd.notna(row.begin_date) else None
@@ -171,10 +172,19 @@ def main() -> None:
             _, n = process_site(site, cfg, begin, end)
             if n == -1:
                 log.info("[%d/%d] %s skipped (already in S3)", i, len(inv), site)
+            elif n == 0:
+                log.info("[%d/%d] %s -> no data, removing from inventory", i, len(inv), site)
+                no_data_sites.append(site)
             else:
                 log.info("[%d/%d] %s -> %d rows", i, len(inv), site, n)
         except Exception as e:
             log.error("Site %s failed: %s", site, e)
+
+    if no_data_sites:
+        inv_key = f"{prefix}stations/indiana_streamflow_sites.parquet"
+        inv_filtered = inv[~inv["site_no"].isin(no_data_sites)]
+        log.info("Removing %d no-data sites from inventory: %s", len(no_data_sites), no_data_sites)
+        write_parquet_to_s3(inv_filtered, bucket, inv_key)
 
     # Build the combined long-format file by concatenating all per-gauge Parquets.
     log.info("Building combined long-format Parquet...")
