@@ -188,7 +188,7 @@ def main() -> None:
     if not parts:
         log.warning("No per-gauge parquet files found.")
         return
-    combined = pa.concat_tables(parts)
+    combined = pa.concat_tables(parts, promote_options="default")
     buf = io.BytesIO()
     pq.write_table(combined, buf, compression="zstd")
     buf.seek(0)
