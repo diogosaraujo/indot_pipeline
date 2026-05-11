@@ -169,15 +169,15 @@ def main() -> None:
     log.info("Wrote GeoJSON: s3://%s/%sstations/indiana_streamflow_sites.geojson", bucket, prefix)
     log.info("Done. %d sites total.", len(sites))
 
-    # --- Active inventory (end_date >= 2018-01-01, used by scripts 05 and 06) ---
-    # Filters to stations with data in the MRMS/NWM era for precipitation pairing.
+    # --- Active inventory (end_date >= 2020-10-14, used by scripts 05 and 06) ---
+    # Filters to stations with data in the MRMS era (NOAA MRMS S3 starts 2020-10-14).
     # Stations with earlier end dates are still downloaded by script 02 for future use.
-    active_cutoff = pd.Timestamp("2018-01-01")
+    active_cutoff = pd.Timestamp("2020-10-14")
     sites_active = sites[
         pd.to_datetime(sites["end_date"], errors="coerce") >= active_cutoff
     ].copy().reset_index(drop=True)
     log.info(
-        "Active stations (end_date >= 2018-01-01): %d / %d",
+        "Active stations (end_date >= 2020-10-14): %d / %d",
         len(sites_active), len(sites),
     )
 

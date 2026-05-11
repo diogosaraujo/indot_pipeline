@@ -55,7 +55,7 @@ import pyarrow.parquet as pq
 from utils import load_config, s3_client, write_parquet_to_s3
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s",
 )
 log = logging.getLogger("08_trigger")
@@ -278,8 +278,21 @@ def analyse_station(
     common_start = max(mrms_wide.index.min(), flow_hourly.index.min())
     common_end   = min(mrms_wide.index.max(), flow_hourly.index.max())
 
+    log.debug(
+        "Site %s (%s): MRMS %s → %s | flow %s → %s | common %s → %s",
+        site_no, mrms_source,
+        mrms_wide.index.min(), mrms_wide.index.max(),
+        flow_hourly.index.min(), flow_hourly.index.max(),
+        common_start, common_end,
+    )
+
     if common_start >= common_end:
-        log.warning("Site %s (%s): no common period", site_no, mrms_source)
+        log.warning(
+            "Site %s (%s): no common period — MRMS %s → %s | flow %s → %s",
+            site_no, mrms_source,
+            mrms_wide.index.min(), mrms_wide.index.max(),
+            flow_hourly.index.min(), flow_hourly.index.max(),
+        )
         return []
 
     mrms_c  = mrms_wide.loc[common_start:common_end, "precip_in"]
@@ -351,6 +364,21 @@ def main() -> None:
 
     stations = sorted(set(atlas14["site_no"]) & set(flow_stats["site_no"]) & set(streamflow["site_no"]))
     log.info("Stations with all required inputs: %d", len(stations))
+
+    # Drop stations whose streamflow record ends before the MRMS period starts.
+    # These would produce 0 combinations regardless and are not re-run in script 01.
+    mrms_start = pd.Timestamp("2020-10-14", tz="UTC")
+    flow_end_by_site = (
+        streamflow.groupby("site_no")["datetime_utc"].max()
+    )
+    pre_mrms = [s for s in stations if flow_end_by_site.get(s, pd.NaT) < mrms_start]
+    if pre_mrms:
+        log.info(
+            "Skipping %d station(s) with streamflow ending before MRMS start (2020-10-14): %s",
+            len(pre_mrms), sorted(pre_mrms),
+        )
+    stations = [s for s in stations if s not in set(pre_mrms)]
+    log.info("Stations after MRMS-era filter: %d", len(stations))
 
     all_records: list[dict] = []
 

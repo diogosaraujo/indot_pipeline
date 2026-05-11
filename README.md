@@ -216,14 +216,17 @@ source ~/miniforge3/etc/profile.d/conda.sh
 # Initialize conda for bash (one-time per instance — writes to ~/.bashrc)
 ~/miniforge3/bin/conda init bash
 
-# Initialize mamba for the current session
-eval "$(mamba shell hook --shell bash)"
+# Initialize mamba for bash (one-time per instance — required before mamba activate works)
+mamba shell init --shell bash --root-prefix=~/miniforge3
+
+# Reload shell to apply the initialization
+source ~/.bashrc
 
 # Activate the project environment
 mamba activate indot
 ```
 
-On future reconnections, `mamba activate indot` is all you need — `conda init` only needs to run once per instance.
+On future reconnections, `mamba activate indot` is all you need — the shell init only needs to run once per instance.
 
 > If you prefer to copy a local checkout rather than clone from GitHub, you can `scp` it from your local machine before SSHing in:
 > ```bash

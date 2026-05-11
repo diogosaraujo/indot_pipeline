@@ -245,8 +245,8 @@ def build_all_masks(cfg: dict, grid: dict) -> list[dict]:
     """Read per-gauge watershed GeoJSONs for active stations and build masks.
 
     Only processes stations in indiana_streamflow_sites_active.parquet
-    (end_date >= 2018-01-01) so MRMS extraction is limited to gauges with
-    data in the MRMS/NWM era. All watersheds still exist in S3 for future use.
+    (end_date >= 2020-10-14) so MRMS extraction is limited to gauges with
+    data in the MRMS era. All watersheds still exist in S3 for future use.
     """
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
@@ -262,7 +262,7 @@ def build_all_masks(cfg: dict, grid: dict) -> list[dict]:
         .to_pandas()["site_no"]
         .astype(str)
     )
-    log.info("Restricting watershed masks to %d active stations (end_date >= 2018)", len(active_sites))
+    log.info("Restricting watershed masks to %d active stations (end_date >= 2020-10-14)", len(active_sites))
 
     paginator = s3.get_paginator("list_objects_v2")
     site_ids = []
