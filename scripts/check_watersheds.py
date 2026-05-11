@@ -1,0 +1,40 @@
+"""check_watersheds.py
+
+Quick diagnostic: count watersheds downloaded by step 03 and break them
+down by active / inactive station status.
+"""
+import io
+
+import boto3
+import pandas as pd
+import pyarrow.parquet as pq
+
+s3 = boto3.client("s3")
+BUCKET = "indot-bridge-pipeline"
+PREFIX = "v1/"
+
+
+def read_parquet(key: str) -> pd.DataFrame:
+    obj = s3.get_object(Bucket=BUCKET, Key=key)
+    return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
+
+
+ws  = read_parquet(f"{PREFIX}watersheds/workspace_index.parquet")
+inv = read_parquet(f"{PREFIX}stations/indiana_streamflow_sites.parquet")
+
+print("=== workspace_index status counts ===")
+print(ws["status"].value_counts().to_string())
+print(f"\nTotal sites processed: {len(ws)}")
+
+inv["is_active"] = pd.to_datetime(inv["end_date"], errors="coerce") >= "2018-01-01"
+merged = ws.merge(inv[["site_no", "is_active"]], on="site_no", how="left")
+
+downloaded = merged[merged["status"].isin(["ok", "skipped"])]
+print(f"\n=== Downloaded watersheds (ok + skipped): {len(downloaded)} ===")
+print(f"  Active   (end_date >= 2018-01-01): {int(downloaded['is_active'].sum())}")
+print(f"  Inactive:                          {int((~downloaded['is_active']).sum())}")
+
+not_downloaded = merged[~merged["status"].isin(["ok", "skipped"])]
+if len(not_downloaded):
+    print(f"\n=== Sites with no watershed file: {len(not_downloaded)} ===")
+    print(not_downloaded["status"].value_counts().to_string())
