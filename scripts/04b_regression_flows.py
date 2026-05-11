@@ -287,7 +287,20 @@ def process_site(
     # Drainage area —————————————————————————————————————————————————————————
     da = float(da_hint) if (da_hint is not None and not pd.isna(da_hint) and float(da_hint) > 0) else None
     if da is None:
-        log.warning("%s: drain_area_va missing, skipping regression", site_no)
+        # Inventory didn't have drain_area_va — query NWIS directly
+        def _da_call():
+            return fetch_drain_area(site_no, timeout)
+        try:
+            fetched = with_retries(
+                _da_call,
+                RetryPolicy(max_attempts=3, base_delay=2.0),
+                exceptions=(requests.RequestException,),
+            )
+            da = float(fetched) if (fetched is not None and float(fetched) > 0) else None
+        except Exception as e:
+            log.debug("%s: NWIS drain_area fetch failed: %s", site_no, e)
+    if da is None:
+        log.warning("%s: no drain_area_va in inventory or NWIS, skipping regression", site_no)
         return out
 
     # Channel slope ————————————————————————————————————————————————————————
