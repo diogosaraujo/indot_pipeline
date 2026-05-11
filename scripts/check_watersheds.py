@@ -69,7 +69,24 @@ if not_found_sites:
             if r2.status_code == 404:
                 note = "404 — site not in NLDI (not on NHDPlus network)"
             else:
-                note = "site known to NLDI but no basin computed"
+                # Site is known — try basin via its NHDPlus COMID
+                comid = None
+                try:
+                    features = r2.json().get("features", [])
+                    if features:
+                        comid = features[0].get("properties", {}).get("comid")
+                except Exception:
+                    pass
+                if comid:
+                    comid_url = f"https://api.water.usgs.gov/nldi/linked-data/comid/{comid}/basin"
+                    r3 = requests.get(comid_url, timeout=30)
+                    if r3.status_code == 200:
+                        feats = r3.json().get("features", [])
+                        note = f"no basin via nwissite, but COMID {comid} basin OK ({len(feats)} feature(s))"
+                    else:
+                        note = f"no basin via nwissite or COMID {comid} (HTTP {r3.status_code})"
+                else:
+                    note = "site known to NLDI but COMID not found in response"
         else:
             note = f"HTTP {r.status_code}"
         print(f"  {site_no}: {note}")
