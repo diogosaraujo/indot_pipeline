@@ -81,7 +81,8 @@ All figures are us-east-1 on-demand pricing as of late April 2026 and are end-to
 
 | Resource | Unit cost | Quantity | Subtotal |
 |---|---|---|---|
-| EC2 m5.2xlarge (8 vCPU, 32 GB) | $0.384 / hr | ~24 hours wall-clock | **$9.22** |
+| EC2 m5.2xlarge (8 vCPU, 32 GB) — scripts 01–07 | $0.384 / hr | ~24 hours wall-clock | **$9.22** |
+| EC2 r5.2xlarge (8 vCPU, 64 GB) — script 08 only | $0.504 / hr | ~1 hour | **$0.50** |
 | EBS gp3 root + scratch, 200 GB | $0.08 / GB-mo | ~3 days = 0.1 mo | **$1.60** |
 | S3 PUT requests | $0.005 / 1k | ~5,000 PUTs | **$0.03** |
 | S3 GET requests (against MRMS) | $0.0004 / 1k | ~50,000 GETs | **$0.02** |
@@ -257,15 +258,53 @@ Each script is independent and idempotent — re-running picks up where it left 
 ```bash
 python scripts/01_get_indiana_stations.py        # ~1 minute
 python scripts/02_download_streamflow.py         # network-bound; instantaneous records can be large
-python scripts/03_delineate_watersheds.py        # ~6-10 hours, StreamStats rate-limited
+python scripts/03_delineate_watersheds.py        # ~6-10 hours, NLDI rate-limited
 python scripts/04_get_flow_statistics.py         # ~2 hours, StreamStats rate-limited
 python scripts/05_extract_mrms_nearest.py        # ~4-6 hours, parallelized
 python scripts/06_extract_mrms_watershed.py      # ~10-16 hours, parallelized
+python scripts/07_extract_atlas14.py             # ~1 hour, NOAA PFDS rate-limited
 ```
 
 Steps 03 and 04 cannot be meaningfully sped up by adding cores — StreamStats limits you to 4 concurrent requests. Steps 05 and 06 *do* scale with CPU; bigger instance = faster. Steps 02, 03, and 04 can run concurrently in three terminals if you want to overlap them.
 
-### 6.5 Cost-saving teardown
+### 6.6 Run script 08 — instance resize required
+
+Script 08 (`08_trigger_analysis.py`) loads the full MRMS and USGS streamflow records into memory simultaneously. Peak RAM exceeds what the standard `m5.2xlarge` (32 GB) can hold, so it must be run on a larger instance. Follow this procedure from your **local Windows machine**:
+
+**Step 1 — Upsize the instance**
+
+```bat
+upsize-ec2.bat
+```
+
+This stops the running `indot-pipeline` instance, changes its type to `r5.2xlarge` (64 GB RAM), and restarts it. It prints the new SSH connection command when the instance is ready (~3–4 minutes).
+
+**Step 2 — SSH in and run script 08**
+
+```powershell
+ssh -i C:\Users\daraujo\Downloads\indot-pipeline-key.pem ubuntu@<new-ip>
+```
+
+```bash
+cd indot_pipeline
+source ~/miniforge3/etc/profile.d/conda.sh
+mamba activate indot
+python scripts/08_trigger_analysis.py            # ~45-60 minutes
+```
+
+**Step 3 — Downsize the instance back**
+
+Once script 08 finishes, exit the SSH session and run from your local machine:
+
+```bat
+downsize-ec2.bat
+```
+
+This stops the instance, restores it to `m5.2xlarge`, and restarts it. The instance returns to its normal cost tier (~$0.384/hr vs $0.504/hr for the r5.2xlarge).
+
+> **Cost note:** the upsize window costs approximately $0.50 in EC2 time for a single script 08 run. Do not leave the instance running as an r5.2xlarge after the script finishes.
+
+### 6.8 Cost-saving teardown
 
 When step 06 finishes:
 
@@ -316,13 +355,17 @@ indot_pipeline/
 ├── setup_ec2.sh                           <- one-shot EC2 provisioning
 ├── create-s3-bucket.bat                   <- AWS CLI: create output S3 bucket
 ├── create-iam-role.bat                    <- AWS CLI: create EC2 IAM role + instance profile
-├── launch-ec2.bat                         <- AWS CLI: launch EC2 instance
+├── launch-ec2.bat                         <- AWS CLI: launch EC2 instance (m5.2xlarge)
+├── upsize-ec2.bat                         <- AWS CLI: stop instance, resize to r5.2xlarge (64 GB), restart
+├── downsize-ec2.bat                       <- AWS CLI: stop instance, restore to m5.2xlarge, restart
 └── scripts/
     ├── utils.py                           <- shared helpers
     ├── 01_get_indiana_stations.py         <- Water Data API station inventory
     ├── 02_download_streamflow.py          <- instantaneous/unit values, full record
-    ├── 03_delineate_watersheds.py         <- StreamStats watershed.geojson
+    ├── 03_delineate_watersheds.py         <- NLDI watershed delineation
     ├── 04_get_flow_statistics.py          <- gage stats Q2..Q500
     ├── 05_extract_mrms_nearest.py         <- MRMS at gauge point
-    └── 06_extract_mrms_watershed.py       <- MRMS over watershed polygon
+    ├── 06_extract_mrms_watershed.py       <- MRMS over watershed polygon
+    ├── 07_extract_atlas14.py              <- NOAA Atlas 14 precipitation frequency
+    └── 08_trigger_analysis.py             <- precipitation trigger vs. streamflow analysis
 ```
