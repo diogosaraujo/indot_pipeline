@@ -37,9 +37,20 @@ GAGE_STATS_BASE = "https://streamstats.usgs.gov/gagestatsservices"
 # Use the same StreamStats server we used for delineation
 SS_HOST = "prodweba.streamstats.usgs.gov"
 
-# Map StreamStats statistic codes / gage-stats codes to friendly column names.
-# These are the codes the StreamStats stat catalog uses in IN.
+# Map gage-stats regression codes to friendly column names.
+# Current API (2026) uses AEP-style codes nested under regressionType.code.
+# Legacy codes (pre-2026) retained for backwards compatibility.
 RETURN_PERIOD_MAP = {
+    # Current AEP codes
+    "PK50AEP":  "Q2",    # 50% AEP = 2-year
+    "PK20AEP":  "Q5",    # 20% AEP = 5-year
+    "PK10AEP":  "Q10",   # 10% AEP = 10-year
+    "PK4AEP":   "Q25",   # 4%  AEP = 25-year
+    "PK2AEP":   "Q50",   # 2%  AEP = 50-year
+    "PK1AEP":   "Q100",  # 1%  AEP = 100-year
+    "PK0_5AEP": "Q200",  # 0.5% AEP = 200-year
+    "PK0_2AEP": "Q500",  # 0.2% AEP = 500-year
+    # Legacy codes (pre-2026 API)
     "PK2":   "Q2",
     "PK5":   "Q5",
     "PK10":  "Q10",
@@ -67,8 +78,14 @@ def parse_gage_stats(stats: list[dict]) -> dict:
     """Reduce the gage-stats array to a flat dict of Qn values in cfs."""
     out = {v: None for v in RETURN_PERIOD_MAP.values()}
     for s in stats or []:
-        code = (s.get("statisticCode") or s.get("code") or "").upper()
-        # Try multiple shapes used across versions of the service
+        # Current API nests the code under regressionType; legacy API had it at top level.
+        regression_type = s.get("regressionType") or {}
+        code = (
+            regression_type.get("code")
+            or s.get("statisticCode")
+            or s.get("code")
+            or ""
+        ).upper()
         if code in RETURN_PERIOD_MAP:
             value = s.get("value")
             if value is None:

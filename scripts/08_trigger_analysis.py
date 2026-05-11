@@ -55,7 +55,7 @@ import pyarrow.parquet as pq
 from utils import load_config, s3_client, write_parquet_to_s3
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s",
 )
 log = logging.getLogger("08_trigger")
@@ -407,6 +407,10 @@ def main() -> None:
 
             if mrms_site.empty or flow_site.empty or atlas14_site.empty:
                 log.warning("[%s][%d/%d] %s: missing data, skipping", source, i, len(stations), site_no)
+                continue
+
+            if pd.isna(flow_row.get("Q10")) and pd.isna(flow_row.get("Q50")):
+                log.warning("[%s][%d/%d] %s: no flow thresholds (Q10/Q50 both NaN) — skipping", source, i, len(stations), site_no)
                 continue
 
             records = analyse_station(
