@@ -316,7 +316,7 @@ def upload_zarr_per_site(shard_dir: Path, product_key: str, cfg: dict) -> None:
         if not dfs:
             continue
         df = pd.concat(dfs, ignore_index=True).sort_values(["datetime_utc", "pixel_idx"])
-        times = pd.DatetimeIndex(df["datetime_utc"].unique()).sort_values()
+        times = pd.DatetimeIndex(df["datetime_utc"].unique()).sort_values().tz_localize(None)
         pixels = np.sort(df["pixel_idx"].unique())
         time_idx = {t: i for i, t in enumerate(times)}
         pix_idx = {p: i for i, p in enumerate(pixels)}
