@@ -39,3 +39,12 @@ not_downloaded = merged[~merged["status"].isin(["ok", "skipped"])]
 if len(not_downloaded):
     print(f"\n=== Sites with no watershed file: {len(not_downloaded)} ===")
     print(not_downloaded["status"].value_counts().to_string())
+
+# Active stations missing delineation
+active_inv = inv[inv["is_active"]]
+missing_active = active_inv[~active_inv["site_no"].isin(downloaded["site_no"])].copy()
+print(f"\n=== Active stations missing delineation: {len(missing_active)} ===")
+if len(missing_active):
+    report = missing_active[["site_no", "station_nm", "end_date"]].reset_index(drop=True)
+    report.index += 1
+    print(report.to_string())
