@@ -31,8 +31,9 @@ merged = ws.merge(inv[["site_no", "is_active"]], on="site_no", how="left")
 
 downloaded = merged[merged["status"].isin(["ok", "skipped"])]
 print(f"\n=== Downloaded watersheds (ok + skipped): {len(downloaded)} ===")
-print(f"  Active   (end_date >= 2018-01-01): {int(downloaded['is_active'].sum())}")
-print(f"  Inactive:                          {int((~downloaded['is_active']).sum())}")
+active   = downloaded["is_active"].fillna(False)
+print(f"  Active   (end_date >= 2018-01-01): {int(active.sum())}")
+print(f"  Inactive:                          {int((~active).sum())}")
 
 not_downloaded = merged[~merged["status"].isin(["ok", "skipped"])]
 if len(not_downloaded):
