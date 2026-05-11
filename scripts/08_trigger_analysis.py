@@ -83,7 +83,8 @@ def load_mrms(bucket: str, prefix: str, product_key: str, source: MrmsSource) ->
     key = f"{prefix}mrms/{product_key}/{fname}"
     df = _read_parquet_s3(bucket, key)
     df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
-    df = df.rename(columns={"value": "precip_in"})
+    # nearest_pixel.parquet uses "value"; watershed_mean.parquet uses "value_mean"
+    df = df.rename(columns={"value": "precip_in", "value_mean": "precip_in"})
     return df[["datetime_utc", "site_no", "precip_in"]]
 
 
