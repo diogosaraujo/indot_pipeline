@@ -45,6 +45,31 @@ active_inv = inv[inv["is_active"]]
 missing_active = active_inv[~active_inv["site_no"].isin(downloaded["site_no"])].copy()
 print(f"\n=== Active stations missing delineation: {len(missing_active)} ===")
 if len(missing_active):
-    report = missing_active[["site_no", "station_nm", "end_date"]].reset_index(drop=True)
+    report = missing_active[["site_no", "station_nm", "end_date"]].merge(
+        ws[["site_no", "status"]], on="site_no", how="left"
+    ).reset_index(drop=True)
+    report["status"] = report["status"].fillna("not_in_workspace_index")
     report.index += 1
     print(report.to_string())
+
+# Probe NLDI for all 21 not_found sites
+import requests
+NLDI_BASE = "https://api.water.usgs.gov/nldi/linked-data/nwissite"
+not_found_sites = ws[ws["status"] == "not_found"]["site_no"].tolist()
+if not_found_sites:
+    print(f"\n=== NLDI probe for all {len(not_found_sites)} not_found sites ===")
+    for site_no in not_found_sites:
+        url = f"{NLDI_BASE}/USGS-{site_no}/basin"
+        r = requests.get(url, timeout=30)
+        if r.status_code == 200:
+            features = r.json().get("features", [])
+            note = f"OK — {len(features)} feature(s) returned"
+        elif r.status_code == 404:
+            r2 = requests.get(f"{NLDI_BASE}/USGS-{site_no}", timeout=30)
+            if r2.status_code == 404:
+                note = "404 — site not in NLDI (not on NHDPlus network)"
+            else:
+                note = "site known to NLDI but no basin computed"
+        else:
+            note = f"HTTP {r.status_code}"
+        print(f"  {site_no}: {note}")
