@@ -111,6 +111,15 @@ def _duration_tick_labels(index):
     return [DURATION_LABELS.get(v, str(v)) for v in index]
 
 
+def _pool_metrics(df: pd.DataFrame, groupby_cols: list[str]) -> pd.DataFrame:
+    """Sum raw TP/FP/FN/TN counts by groupby_cols, then derive metrics from pooled totals."""
+    counts = df.groupby(groupby_cols)[["tp", "fp", "fn", "tn"]].sum().reset_index()
+    counts["POD"] = counts["tp"] / (counts["tp"] + counts["fn"] + EPS)
+    counts["FAR"] = counts["fp"] / (counts["tp"] + counts["fp"] + EPS)
+    counts["CSI"] = counts["tp"] / (counts["tp"] + counts["fp"] + counts["fn"] + EPS)
+    return counts
+
+
 def _csi_heatmap_ax(ax, data: pd.DataFrame, flow_rp: int, title: str) -> None:
     sub = data[data["flow_rp_yr"] == flow_rp]
     pivot = sub.groupby(["duration_hr", "precip_rp_yr"])["CSI"].mean().unstack()
@@ -142,7 +151,9 @@ def heatmap_fig(
     cmap: str,
 ) -> plt.Figure:
     sub = df[df["flow_rp_yr"] == flow_rp]
-    pivot = sub.groupby(["duration_hr", "precip_rp_yr"])[metric].mean().unstack()
+    pooled = _pool_metrics(sub, ["duration_hr", "precip_rp_yr"])
+    pivot = pooled.set_index("duration_hr")[["precip_rp_yr", metric]]
+    pivot = pivot.pivot(columns="precip_rp_yr", values=metric)
     pivot.index = _duration_tick_labels(pivot.index)
 
     fig, ax = plt.subplots(figsize=(11, 6))
@@ -158,7 +169,7 @@ def heatmap_fig(
     )
     sources = ", ".join(df["mrms_source"].unique())
     ax.set_title(
-        f"Mean {metric} — flow threshold Q{flow_rp}  |  MRMS source: {sources}",
+        f"{metric} (pooled counts) — flow threshold Q{flow_rp}  |  MRMS source: {sources}",
         fontsize=12,
     )
     ax.set_xlabel("Precip Return Period (yr)", fontsize=10)
@@ -170,11 +181,7 @@ def heatmap_fig(
 
 def pod_vs_far_fig(df: pd.DataFrame, flow_rp: int) -> plt.Figure:
     sub = df[df["flow_rp_yr"] == flow_rp]
-    agg = (
-        sub.groupby(["duration_hr", "precip_rp_yr"])[["POD", "FAR"]]
-        .mean()
-        .reset_index()
-    )
+    agg = _pool_metrics(sub, ["duration_hr", "precip_rp_yr"])
 
     duration_vals = sorted(agg["duration_hr"].unique())
     norm = plt.Normalize(vmin=np.log2(min(duration_vals)), vmax=np.log2(max(duration_vals)))
@@ -327,8 +334,10 @@ def log_summary(df: pd.DataFrame) -> None:
     csi = tp / (tp + fp + fn + EPS)
     tss = tp / (tp + fn + EPS) - fp / (fp + tn + EPS)
 
-    best_idx = df.groupby(["duration_hr", "precip_rp_yr", "flow_rp_yr"])["CSI"].mean().idxmax()
-    best_csi = df.groupby(["duration_hr", "precip_rp_yr", "flow_rp_yr"])["CSI"].mean().max()
+    pooled_combos = _pool_metrics(df, ["duration_hr", "precip_rp_yr", "flow_rp_yr"])
+    best_row = pooled_combos.loc[pooled_combos["CSI"].idxmax()]
+    best_idx = (int(best_row["duration_hr"]), int(best_row["precip_rp_yr"]), int(best_row["flow_rp_yr"]))
+    best_csi = float(best_row["CSI"])
 
     n_degen = df[df["degenerate"]]["site_no"].nunique()
     log.info("── Overall skill (all combos aggregated) ──────────────────")
