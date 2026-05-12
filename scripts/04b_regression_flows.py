@@ -41,6 +41,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
+import geopandas as gpd
 import pandas as pd
 import pyarrow.parquet as pq
 import requests
@@ -270,6 +271,57 @@ def apply_regression(
     return round(q, 1) if q > 0 else None
 
 
+# ── Drainage area helpers ─────────────────────────────────────────────────────
+
+_M2_PER_MI2 = 2_589_988.1
+
+
+def area_mi2_from_s3_geojson(site_no: str, bucket: str, prefix: str) -> Optional[float]:
+    """Compute drainage area (mi²) from the watershed polygon stored in S3 by script 03.
+
+    Projects to ESRI:102003 (USA Contiguous Albers Equal Area Conic) before
+    computing area to avoid distortion from geographic coordinates.
+    """
+    key = f"{prefix}watersheds/per_gauge/{site_no}.geojson"
+    try:
+        obj = s3_client().get_object(Bucket=bucket, Key=key)
+        gdf = gpd.read_file(io.BytesIO(obj["Body"].read()))
+        if gdf.empty:
+            return None
+        gdf_proj = gdf.to_crs("ESRI:102003")
+        area_m2 = float(gdf_proj.geometry.area.sum())
+        return area_m2 / _M2_PER_MI2 if area_m2 > 0 else None
+    except Exception as e:
+        log.debug("%s: S3 geojson area failed: %s", site_no, e)
+        return None
+
+
+def fetch_drain_area(site_no: str, timeout: int) -> Optional[float]:
+    """Query NWIS site service for drain_area_va (mi²)."""
+    r = requests.get(
+        NWIS_SITE_URL,
+        params={
+            "sites": site_no,
+            "siteOutput": "expanded",
+            "format": "rdb",
+        },
+        timeout=timeout,
+    )
+    if r.status_code != 200:
+        return None
+    for line in r.text.splitlines():
+        if line.startswith("#") or line.startswith("agency"):
+            continue
+        parts = line.split("\t")
+        if len(parts) > 30:
+            try:
+                val = parts[30].strip()
+                return float(val) if val else None
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
 # ── Per-station processor ─────────────────────────────────────────────────────
 
 def process_site(
@@ -277,6 +329,8 @@ def process_site(
     lat: float,
     lon: float,
     da_hint: Optional[float],
+    bucket: str,
+    prefix: str,
     cfg: dict,
 ) -> dict:
     """Compute regression flows for one station. Returns a partial record."""
@@ -286,8 +340,15 @@ def process_site(
 
     # Drainage area —————————————————————————————————————————————————————————
     da = float(da_hint) if (da_hint is not None and not pd.isna(da_hint) and float(da_hint) > 0) else None
+
     if da is None:
-        # Inventory didn't have drain_area_va — query NWIS directly
+        # Primary fallback: compute from watershed polygon already in S3 from script 03
+        da = area_mi2_from_s3_geojson(site_no, bucket, prefix)
+        if da is not None:
+            log.debug("%s: drain area from S3 geojson = %.2f mi²", site_no, da)
+
+    if da is None:
+        # Secondary fallback: NWIS site service (may be blocked from EC2)
         def _da_call():
             return fetch_drain_area(site_no, timeout)
         try:
@@ -298,9 +359,10 @@ def process_site(
             )
             da = float(fetched) if (fetched is not None and float(fetched) > 0) else None
         except Exception as e:
-            log.debug("%s: NWIS drain_area fetch failed: %s", site_no, e)
+            log.warning("%s: NWIS drain_area fetch failed: %s", site_no, e)
+
     if da is None:
-        log.warning("%s: no drain_area_va in inventory or NWIS, skipping regression", site_no)
+        log.warning("%s: no drain area from inventory, S3 geojson, or NWIS — skipping", site_no)
         return out
 
     # Channel slope ————————————————————————————————————————————————————————
@@ -389,6 +451,8 @@ def main() -> None:
                 float(row["dec_lat_va"]),
                 float(row["dec_long_va"]),
                 row.get("drain_area_va"),
+                bucket,
+                prefix,
                 cfg,
             ): str(row["site_no"])
             for _, row in targets.iterrows()
