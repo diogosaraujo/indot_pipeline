@@ -348,6 +348,9 @@ def analyse_station(
 
 # ---------- Main ----------
 
+COMPLETE_COMBINATIONS = len(DURATIONS_HR) * len(PRECIP_RPS) * len(FLOW_RPS)  # 320
+
+
 def main() -> None:
     cfg = load_config()
     bucket = cfg["aws"]["output_bucket"]
@@ -381,6 +384,22 @@ def main() -> None:
     stations = [s for s in stations if s not in set(pre_mrms)]
     log.info("Stations after MRMS-era filter: %d", len(stations))
 
+    # Load existing results and identify (site_no, source) pairs already at 320 combinations.
+    existing: pd.DataFrame | None = None
+    complete_keys: set[tuple[str, str]] = set()
+    try:
+        existing = _read_parquet_s3(bucket, f"{prefix}analysis/trigger_analysis.parquet")
+        existing["site_no"] = existing["site_no"].astype(str)
+        counts = existing.groupby(["site_no", "mrms_source"]).size()
+        complete_keys = {(s, src) for (s, src), n in counts.items() if n == COMPLETE_COMBINATIONS}
+        incomplete = int((counts < COMPLETE_COMBINATIONS).sum())
+        log.info(
+            "Existing results: %d rows | %d complete pairs | %d incomplete pairs to reprocess",
+            len(existing), len(complete_keys), incomplete,
+        )
+    except Exception:
+        log.info("No existing results found — running fresh.")
+
     all_records: list[dict] = []
 
     for source in ("nearest", "watershed"):
@@ -393,6 +412,11 @@ def main() -> None:
         mrms["site_no"] = mrms["site_no"].astype(str)
 
         for i, site_no in enumerate(stations, 1):
+            if (site_no, source) in complete_keys:
+                log.info("[%s][%d/%d] %s: already complete (%d combinations), skipping",
+                         source, i, len(stations), site_no, COMPLETE_COMBINATIONS)
+                continue
+
             mrms_site = (
                 mrms[mrms["site_no"] == site_no]
                 .set_index("datetime_utc")
@@ -420,11 +444,25 @@ def main() -> None:
             all_records.extend(records)
             log.info("[%s][%d/%d] %s: %d combinations", source, i, len(stations), site_no, len(records))
 
-    if not all_records:
+    # Combine kept existing rows with freshly computed ones
+    parts: list[pd.DataFrame] = []
+    if existing is not None and complete_keys:
+        kept = existing[
+            existing[["site_no", "mrms_source"]].apply(
+                lambda r: (r["site_no"], r["mrms_source"]) in complete_keys, axis=1
+            )
+        ]
+        parts.append(kept)
+        log.info("Retaining %d rows from previous run", len(kept))
+
+    if all_records:
+        parts.append(pd.DataFrame(all_records))
+
+    if not parts:
         log.error("No results produced.")
         return
 
-    out = pd.DataFrame(all_records)
+    out = pd.concat(parts, ignore_index=True)
     write_parquet_to_s3(out, bucket, f"{prefix}analysis/trigger_analysis.parquet")
     log.info(
         "Wrote analysis/trigger_analysis.parquet (%d rows, %d stations)",

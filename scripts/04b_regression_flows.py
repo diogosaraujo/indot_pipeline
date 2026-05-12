@@ -417,9 +417,17 @@ def main() -> None:
     inv["site_no"] = inv["site_no"].astype(str)
     inv = inv[["site_no", "dec_lat_va", "dec_long_va", "drain_area_va"]].copy()
 
-    # Find stations that need regression fills
-    needs_fill = flow_stats[flow_stats["source"].isna()]["site_no"].tolist()
-    log.info("Stations with source=None: %d", len(needs_fill))
+    # Find stations that need regression fills:
+    #   (a) source=None — no gage stats at all
+    #   (b) source="gage_stats" but missing Q10 or Q50 (short-record gauges)
+    no_source = flow_stats["source"].isna()
+    partial_gage = (
+        flow_stats["source"].eq("gage_stats")
+        & (flow_stats["Q10"].isna() | flow_stats["Q50"].isna())
+    )
+    needs_fill = flow_stats[no_source | partial_gage]["site_no"].tolist()
+    log.info("Stations needing regression fill: %d (%d source=None, %d partial gage_stats)",
+             len(needs_fill), int(no_source.sum()), int(partial_gage.sum()))
 
     if not needs_fill:
         log.info("No gaps to fill. Exiting.")
@@ -475,24 +483,30 @@ def main() -> None:
     n_filled = int((reg_df.get("source") == "regression").sum()) if "source" in reg_df.columns else 0
     log.info("Regression filled %d / %d stations", n_filled, len(results))
 
-    # Update flow_stats in place for source=None rows
+    # Merge regression results back — never overwrite a non-null gage_stats value,
+    # but fill any null Q column regardless of source.
     flow_stats = flow_stats.set_index("site_no")
     for _, row in reg_df.iterrows():
         site = row["site_no"]
         if site not in flow_stats.index:
             continue
-        if flow_stats.at[site, "source"] is not None and not pd.isna(flow_stats.at[site, "source"]):
-            continue  # already has gage_stats data — don't overwrite
-        for col in ["source", "Q10", "Q25", "Q50", "Q100", "Q200", "Q500"]:
-            if col in row and not pd.isna(row[col]):
+        existing_source = flow_stats.at[site, "source"]
+        has_gage_stats = existing_source == "gage_stats"
+        for col in ["Q10", "Q25", "Q50", "Q100", "Q200", "Q500"]:
+            # Only fill if the column is currently null
+            if col in row and not pd.isna(row[col]) and pd.isna(flow_stats.at[site, col]):
                 flow_stats.at[site, col] = row[col]
-        if "drainage_area_mi2" in flow_stats.columns:
+        # Set source only if not already set; partial gage_stats keeps its source label
+        if not has_gage_stats:
+            if "source" in row and not pd.isna(row.get("source")):
+                flow_stats.at[site, "source"] = row["source"]
+            if "regression_region" in flow_stats.columns:
+                flow_stats.at[site, "regression_region"] = f"Rao2005_R{row.get('region', '?')}"
+        if "drainage_area_mi2" in flow_stats.columns and not has_gage_stats:
             da_val = targets.loc[targets["site_no"] == site, "drain_area_va"].iloc[0] \
                 if len(targets.loc[targets["site_no"] == site]) else None
             if da_val is not None and not pd.isna(da_val):
                 flow_stats.at[site, "drainage_area_mi2"] = float(da_val)
-        if "regression_region" in flow_stats.columns:
-            flow_stats.at[site, "regression_region"] = f"Rao2005_R{row.get('region', '?')}"
     flow_stats = flow_stats.reset_index()
 
     write_parquet_to_s3(flow_stats, bucket, f"{prefix}flow_stats/per_gauge_flow_stats.parquet")
