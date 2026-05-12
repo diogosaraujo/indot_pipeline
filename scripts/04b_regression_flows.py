@@ -355,21 +355,8 @@ def process_site(
             log.debug("%s: drain area from S3 geojson = %.2f mi²", site_no, da)
 
     if da is None:
-        # Secondary fallback: NWIS site service (may be blocked from EC2)
-        def _da_call():
-            return fetch_drain_area(site_no, timeout)
-        try:
-            fetched = with_retries(
-                _da_call,
-                RetryPolicy(max_attempts=3, base_delay=2.0),
-                exceptions=(requests.RequestException,),
-            )
-            da = float(fetched) if (fetched is not None and float(fetched) > 0) else None
-        except Exception as e:
-            log.warning("%s: NWIS drain_area fetch failed: %s", site_no, e)
-
-    if da is None:
-        log.warning("%s: no drain area from inventory, S3 geojson, or NWIS — skipping", site_no)
+        # waterservices.usgs.gov is blocked from EC2 (SSL EOF) — no fallback available
+        log.warning("%s: no drain area from inventory or S3 geojson — skipping", site_no)
         return out
 
     # Channel slope ————————————————————————————————————————————————————————
