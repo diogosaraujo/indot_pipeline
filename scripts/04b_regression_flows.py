@@ -45,6 +45,7 @@ import geopandas as gpd
 import pandas as pd
 import pyarrow.parquet as pq
 import requests
+from pyproj import Geod
 
 from utils import RetryPolicy, load_config, s3_client, with_retries, write_parquet_to_s3
 
@@ -276,11 +277,14 @@ def apply_regression(
 _M2_PER_MI2 = 2_589_988.1
 
 
+_GEOD = Geod(ellps="WGS84")
+
+
 def area_mi2_from_s3_geojson(site_no: str, bucket: str, prefix: str) -> Optional[float]:
     """Compute drainage area (mi²) from the watershed polygon stored in S3 by script 03.
 
-    Projects to ESRI:102003 (USA Contiguous Albers Equal Area Conic) before
-    computing area to avoid distortion from geographic coordinates.
+    Uses pyproj.Geod.geometry_area_perimeter() to compute geodesic area directly
+    on the WGS84 ellipsoid — no reprojection needed, avoids pyproj ESRI CRS bugs.
     """
     key = f"{prefix}watersheds/per_gauge/{site_no}.geojson"
     try:
@@ -288,9 +292,12 @@ def area_mi2_from_s3_geojson(site_no: str, bucket: str, prefix: str) -> Optional
         gdf = gpd.read_file(io.BytesIO(obj["Body"].read()))
         if gdf.empty:
             return None
-        gdf_proj = gdf.to_crs("ESRI:102003")
-        area_m2 = float(gdf_proj.geometry.area.sum())
-        return area_m2 / _M2_PER_MI2 if area_m2 > 0 else None
+        total_m2 = sum(
+            abs(_GEOD.geometry_area_perimeter(geom)[0])
+            for geom in gdf.geometry
+            if geom is not None
+        )
+        return total_m2 / _M2_PER_MI2 if total_m2 > 0 else None
     except Exception as e:
         log.debug("%s: S3 geojson area failed: %s", site_no, e)
         return None
