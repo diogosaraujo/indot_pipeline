@@ -44,12 +44,12 @@ Writes:
 """
 from __future__ import annotations
 
-import io
 import logging
 from typing import Literal
 
 import numpy as np
 import pandas as pd
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
 from utils import load_config, s3_client, write_parquet_to_s3
@@ -73,9 +73,18 @@ MrmsSource = Literal["nearest", "watershed"]
 
 # ---------- Data loaders ----------
 
+_s3_fs: pafs.S3FileSystem | None = None
+
 def _read_parquet_s3(bucket: str, key: str, columns: list[str] | None = None) -> pd.DataFrame:
-    obj = s3_client().get_object(Bucket=bucket, Key=key)
-    return pq.read_table(io.BytesIO(obj["Body"].read()), columns=columns).to_pandas()
+    """Read parquet from S3 using pyarrow native S3 filesystem.
+
+    Uses HTTP byte-range requests so column pruning happens at the storage layer —
+    only the requested column chunks are fetched, avoiding loading the full file.
+    """
+    global _s3_fs
+    if _s3_fs is None:
+        _s3_fs = pafs.S3FileSystem()   # picks up IAM role credentials automatically
+    return pq.read_table(f"{bucket}/{key}", filesystem=_s3_fs, columns=columns).to_pandas()
 
 
 def load_mrms(bucket: str, prefix: str, product_key: str, source: MrmsSource) -> pd.DataFrame:
