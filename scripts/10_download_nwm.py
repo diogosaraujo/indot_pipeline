@@ -305,27 +305,44 @@ def extract_retrospective(
         retro_vars.append(head_var)
 
     sub = ds[retro_vars].sel(feature_id=comids_ok)
-    log.info("Zarr subset selected (%s). Extracting per-station time windows...", retro_vars)
+
+    # Compute the global time window needed across all stations so we can
+    # bulk-load all COMIDs in one shot instead of 265 separate S3 requests.
+    t_starts, t_ends = [], []
+    for site_no, (begin, end) in station_periods.items():
+        t0 = max(_to_utc(begin), RETRO_START).tz_localize(None)
+        t1 = min(_to_utc(end),   RETRO_END).tz_localize(None)
+        if t0 < t1:
+            t_starts.append(t0)
+            t_ends.append(t1)
+    if not t_starts:
+        return pd.DataFrame()
+
+    global_t0 = min(t_starts)
+    global_t1 = max(t_ends)
+    log.info(
+        "Loading Zarr subset into memory (%s → %s, %d COMIDs, vars=%s) — "
+        "this may take 10–30 min depending on network...",
+        global_t0.date(), global_t1.date(), len(comids_ok), retro_vars,
+    )
+    sub_loaded = sub.sel(time=slice(global_t0, global_t1)).load()
+    log.info("Zarr data loaded. Slicing per-station windows...")
 
     parts: list[pd.DataFrame] = []
     for comid in comids_ok:
         site_nos = comid_to_sites[comid]
-        comid_slice = sub.sel(feature_id=comid)
+        comid_slice = sub_loaded.sel(feature_id=comid)
 
         for site_no in site_nos:
             begin, end = station_periods.get(site_no, (RETRO_START, RETRO_END))
-            t0 = max(_to_utc(begin), RETRO_START)
-            t1 = min(_to_utc(end),   RETRO_END)
+            t0 = max(_to_utc(begin), RETRO_START).tz_localize(None)
+            t1 = min(_to_utc(end),   RETRO_END).tz_localize(None)
             if t0 >= t1:
                 continue
 
-            # Zarr time coordinate is tz-naive; strip tz for slicing, re-attach after
-            t0_naive = t0.tz_localize(None)
-            t1_naive = t1.tz_localize(None)
-
             base_cols = ["streamflow", "velocity"] + ([head_var] if head_var else [])
             df = (
-                comid_slice.sel(time=slice(t0_naive, t1_naive))
+                comid_slice.sel(time=slice(t0, t1))
                 .to_dataframe()[base_cols]
                 .reset_index()
                 .rename(columns={
