@@ -292,8 +292,9 @@ def extract_retrospective(
     ds_vars = list(ds.data_vars)
     log.info("Retrospective Zarr variables: %s", ds_vars)
 
-    # Stage/head variable name varies by NWM version in the Zarr store
-    HEAD_CANDIDATES = ["Head", "head", "qlink", "q_lateral"]
+    # Stage/head variable name varies by NWM version in the Zarr store.
+    # NWM v3.0 Zarr does not include Head; only streamflow and velocity are available.
+    HEAD_CANDIDATES = ["Head", "head", "qlink"]   # q_lateral is lateral inflow, not stage
     head_var = next((v for v in HEAD_CANDIDATES if v in ds_vars), None)
     if head_var is None:
         log.warning("No head/stage variable found in Zarr store (tried %s); head_m will be NaN",
@@ -318,9 +319,13 @@ def extract_retrospective(
             if t0 >= t1:
                 continue
 
+            # Zarr time coordinate is tz-naive; strip tz for slicing, re-attach after
+            t0_naive = t0.tz_localize(None)
+            t1_naive = t1.tz_localize(None)
+
             base_cols = ["streamflow", "velocity"] + ([head_var] if head_var else [])
             df = (
-                comid_slice.sel(time=slice(t0, t1))
+                comid_slice.sel(time=slice(t0_naive, t1_naive))
                 .to_dataframe()[base_cols]
                 .reset_index()
                 .rename(columns={
@@ -330,6 +335,7 @@ def extract_retrospective(
                     **({head_var: "head_m"} if head_var else {}),
                 })
             )
+            df["datetime_utc"] = pd.to_datetime(df["datetime_utc"]).dt.tz_localize("UTC")
             df["site_no"] = site_no
             df["comid"]   = comid
             if "head_m" not in df.columns:
