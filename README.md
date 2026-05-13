@@ -42,6 +42,8 @@ The project is organized to make a large, multi-source hydrologic acquisition wo
 | NWM Retrospective v3.0 — streamflow, velocity, Head/stage per gauge | Parquet | 5–15 GB |
 | NWM Analysis & Assimilation — streamflow, velocity, nudge, stage per gauge | Parquet | 2–8 GB |
 | NWM Open-Loop A&A — streamflow, velocity, stage per gauge | Parquet | 2–8 GB |
+| Aggregate trigger-skill figures (CSI / POD / FAR heatmaps, POD vs FAR scatter, Indiana map) | PNG (S3) | < 5 MB |
+| Per-gauge CSI heatmaps | PNG (S3) | < 50 MB total |
 
 NWM time coverage by product:
 
@@ -283,6 +285,11 @@ python scripts/05_extract_mrms_nearest.py        # ~4-6 hours, parallelized
 python scripts/06_extract_mrms_watershed.py      # ~10-16 hours, parallelized
 python scripts/07_extract_atlas14.py             # ~1 hour, NOAA PFDS rate-limited
 python scripts/04b_regression_flows.py           # ~2 minutes, fills missing Q10/Q50 via Rao 2005
+```
+
+Scripts 08 and 09 require a separate step each — see sections 6.6 and 6.7 below.
+
+```bash
 python scripts/10_download_nwm.py                # ~1 hr (retrospective) + ~4 hrs each for A&A and Open-Loop
 ```
 
@@ -324,6 +331,40 @@ downsize-ec2.bat
 This stops the instance, restores it to `m5.2xlarge`, and restarts it. The instance returns to its normal cost tier (~$0.384/hr vs $0.504/hr for the r5.2xlarge).
 
 > **Cost note:** the upsize window costs approximately $0.50 in EC2 time for a single script 08 run. Do not leave the instance running as an r5.2xlarge after the script finishes.
+
+### 6.7 Run script 09 — figures
+
+Script 09 (`09_figures.py`) reads `analysis/trigger_analysis.parquet` produced by script 08 and writes all figures directly to S3 — no display or local file system needed. Run it on the same instance used for scripts 01–07 (the `m5.2xlarge` is sufficient; the script is CPU-light).
+
+```bash
+python scripts/09_figures.py                     # ~5-10 minutes
+```
+
+Figures are written to `s3://<bucket>/<prefix>analysis/figures/` and `analysis/figures/stations/`. Download them locally with:
+
+```bash
+aws s3 sync s3://indot-bridge-pipeline-<your-id>/v1/analysis/figures/ ./figures/
+```
+
+**Aggregate figures** (one set per flow threshold Q10 / Q50):
+
+| File | Description |
+|---|---|
+| `csi_heatmap_Q{rp}.png` | CSI by duration × precip return period (pooled counts across all stations) |
+| `pod_heatmap_Q{rp}.png` | POD by duration × precip return period (pooled counts) |
+| `far_heatmap_Q{rp}.png` | FAR by duration × precip return period (pooled counts) |
+| `pod_vs_far_Q{rp}.png` | POD vs FAR scatter coloured by accumulation duration (pooled counts) |
+| `best_csi_per_station.png` | Bar chart of best achievable CSI per gauge |
+| `best_combo_per_station.png` | Horizontal bar chart — best (duration / precip RP / flow threshold) per gauge |
+| `map_best_csi.png` | Indiana map of gauges coloured by best CSI |
+
+**Per-gauge figures** (`analysis/figures/stations/`):
+
+| File | Description |
+|---|---|
+| `{site_no}_csi.png` | CSI heatmap for Q10 and Q50 side by side |
+
+> **Note on pooled vs per-station metrics:** The aggregate heatmaps (CSI / POD / FAR) are computed from globally pooled TP/FP/FN/TN counts across all stations, not station averages. This avoids giving equal weight to short-record gauges and gauges with few events. The per-station bar charts and map still use each station's individual best-CSI value.
 
 ### 6.8 Cost-saving teardown
 

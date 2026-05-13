@@ -288,8 +288,23 @@ def extract_retrospective(
     if missing:
         log.warning("Retrospective: %d COMIDs not in NWM domain: %s", len(missing), missing[:10])
 
-    sub = ds[["streamflow", "velocity", "Head"]].sel(feature_id=comids_ok)
-    log.info("Zarr subset selected. Extracting per-station time windows...")
+    # Detect the actual variable names — log them for transparency
+    ds_vars = list(ds.data_vars)
+    log.info("Retrospective Zarr variables: %s", ds_vars)
+
+    # Stage/head variable name varies by NWM version in the Zarr store
+    HEAD_CANDIDATES = ["Head", "head", "qlink", "q_lateral"]
+    head_var = next((v for v in HEAD_CANDIDATES if v in ds_vars), None)
+    if head_var is None:
+        log.warning("No head/stage variable found in Zarr store (tried %s); head_m will be NaN",
+                    HEAD_CANDIDATES)
+
+    retro_vars = ["streamflow", "velocity"]
+    if head_var:
+        retro_vars.append(head_var)
+
+    sub = ds[retro_vars].sel(feature_id=comids_ok)
+    log.info("Zarr subset selected (%s). Extracting per-station time windows...", retro_vars)
 
     parts: list[pd.DataFrame] = []
     for comid in comids_ok:
@@ -303,20 +318,22 @@ def extract_retrospective(
             if t0 >= t1:
                 continue
 
+            base_cols = ["streamflow", "velocity"] + ([head_var] if head_var else [])
             df = (
                 comid_slice.sel(time=slice(t0, t1))
-                .to_dataframe()[["streamflow", "velocity", "Head"]]
+                .to_dataframe()[base_cols]
                 .reset_index()
                 .rename(columns={
                     "time":       "datetime_utc",
                     "streamflow": "streamflow_cms",
                     "velocity":   "velocity_ms",
-                    "Head":       "head_m",
+                    **({head_var: "head_m"} if head_var else {}),
                 })
             )
             df["site_no"] = site_no
             df["comid"]   = comid
-            # For retrospective, Head IS the water surface elevation (stage)
+            if "head_m" not in df.columns:
+                df["head_m"] = np.nan
             df["stage_m"] = df["head_m"]
             parts.append(df[["site_no", "comid", "datetime_utc",
                               "streamflow_cms", "velocity_ms", "head_m", "stage_m"]])
