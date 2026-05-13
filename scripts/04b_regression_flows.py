@@ -233,8 +233,9 @@ def compute_slope_ft_mi(site_no: str, timeout: int) -> Optional[float]:
     e10 = _elevation_ft(*p10, timeout)
     e85 = _elevation_ft(*p85, timeout)
 
-    # Positive slope = rises upstream; guard against flat or DEM noise
-    slope = (e85 - e10) / (0.75 * total)
+    # Use abs() because NLDI flowline coords can be ordered upstream→downstream
+    # (opposite of expected), which would make (e85 - e10) negative.
+    slope = abs(e85 - e10) / (0.75 * total)
     return max(slope, 0.1)
 
 
@@ -420,12 +421,14 @@ def main() -> None:
     # Find stations that need regression fills:
     #   (a) source=None — no gage stats at all
     #   (b) source="gage_stats" but missing Q10 or Q50 (short-record gauges)
+    #   (c) source="regression" — always recompute to pick up any formula fixes
     no_source = flow_stats["source"].isna()
     partial_gage = (
         flow_stats["source"].eq("gage_stats")
         & (flow_stats["Q10"].isna() | flow_stats["Q50"].isna())
     )
-    needs_fill = flow_stats[no_source | partial_gage]["site_no"].tolist()
+    existing_regression = flow_stats["source"].eq("regression")
+    needs_fill = flow_stats[no_source | partial_gage | existing_regression]["site_no"].tolist()
     log.info("Stations needing regression fill: %d (%d source=None, %d partial gage_stats)",
              len(needs_fill), int(no_source.sum()), int(partial_gage.sum()))
 
@@ -493,9 +496,11 @@ def main() -> None:
         existing_source = flow_stats.at[site, "source"]
         has_gage_stats = existing_source == "gage_stats"
         for col in ["Q10", "Q25", "Q50", "Q100", "Q200", "Q500"]:
-            # Only fill if the column is currently null
-            if col in row and not pd.isna(row[col]) and pd.isna(flow_stats.at[site, col]):
-                flow_stats.at[site, col] = row[col]
+            if col in row and not pd.isna(row[col]):
+                # Overwrite regression-derived values (may be correcting a prior bad run);
+                # for gage_stats stations only fill nulls — never overwrite measured values.
+                if not has_gage_stats or pd.isna(flow_stats.at[site, col]):
+                    flow_stats.at[site, col] = row[col]
         # Set source only if not already set; partial gage_stats keeps its source label
         if not has_gage_stats:
             if "source" in row and not pd.isna(row.get("source")):
