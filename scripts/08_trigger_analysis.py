@@ -224,14 +224,22 @@ def classify(
     hourly_flow: pd.Series,
     flow_threshold_cfs: float,
     n_common_hours: int,
+    duration_hr: int = 0,
 ) -> dict:
-    """Compute TP, FP, FN, TN for one (station, duration, precip_rp, flow_rp) combo."""
+    """Compute TP, FP, FN, TN for one (station, duration, precip_rp, flow_rp) combo.
+
+    The response window is [t_trigger - duration_hr, t_trigger + RESPONSE_HOURS].
+    The backward extension accounts for the rolling sum firing at the END of the
+    accumulation window — flood peaks during the accumulation period would
+    otherwise be missed and counted as FN.
+    """
     flow_event_set = set(flow_events)
     tp = fp = fn = 0
     matched_flow_events: set[pd.Timestamp] = set()
 
     for t_trigger in trigger_times:
-        window = hourly_flow[t_trigger: t_trigger + pd.Timedelta(hours=RESPONSE_HOURS)]
+        t_start = t_trigger - pd.Timedelta(hours=duration_hr)
+        window = hourly_flow[t_start: t_trigger + pd.Timedelta(hours=RESPONSE_HOURS)]
         if window.empty:
             fp += 1
             continue
@@ -239,9 +247,8 @@ def classify(
         responded = window.max() >= flow_threshold_cfs
         if responded:
             tp += 1
-            # Mark whichever flow event falls within this window as matched
             for fe in flow_event_set:
-                if t_trigger <= fe <= t_trigger + pd.Timedelta(hours=RESPONSE_HOURS):
+                if t_start <= fe <= t_trigger + pd.Timedelta(hours=RESPONSE_HOURS):
                     matched_flow_events.add(fe)
         else:
             fp += 1
@@ -249,11 +256,12 @@ def classify(
     # Unmatched flow events are false negatives
     fn = len(flow_event_set - matched_flow_events)
 
-    # TN: hours with no active trigger and streamflow below threshold
+    # TN: hours with no active trigger window and streamflow below threshold
     trigger_hours: set[pd.Timestamp] = set()
     for t in trigger_times:
-        for h in range(RESPONSE_HOURS + 1):
-            trigger_hours.add(t + pd.Timedelta(hours=h))
+        t_start = t - pd.Timedelta(hours=duration_hr)
+        for h in range(duration_hr + RESPONSE_HOURS + 1):
+            trigger_hours.add(t_start + pd.Timedelta(hours=h))
 
     exceedance_hours = set(hourly_flow[hourly_flow >= flow_threshold_cfs].index.tolist())
     neither = n_common_hours - len(trigger_hours | exceedance_hours)
@@ -329,7 +337,7 @@ def analyse_station(
 
                 flow_events = find_flow_events(flow_c.dropna(), flow_threshold)
 
-                metrics = classify(triggers, flow_events, flow_c, flow_threshold, n_common)
+                metrics = classify(triggers, flow_events, flow_c, flow_threshold, n_common, duration_hr)
 
                 records.append({
                     "site_no": site_no,
@@ -383,6 +391,29 @@ def main() -> None:
         )
     stations = [s for s in stations if s not in set(pre_mrms)]
     log.info("Stations after MRMS-era filter: %d", len(stations))
+
+    # QC: exclude regulated waterways, ditches, and canals.
+    # Criterion 1: any negative recorded flow → regulated/tidal/reversible channel.
+    # Criterion 2: Q10 < median observed flow → regression Q10 is meaningless.
+    neg_flow_sites = set(streamflow.loc[streamflow["value_cfs"] < 0, "site_no"].unique())
+    pos_medians = (
+        streamflow[streamflow["value_cfs"] >= 0]
+        .groupby("site_no")["value_cfs"]
+        .median()
+    )
+    _fs_q10 = flow_stats[flow_stats["Q10"].notna()].copy()
+    _fs_q10["_median"] = _fs_q10["site_no"].map(pos_medians)
+    bad_q10_sites = set(_fs_q10.loc[_fs_q10["_median"] > _fs_q10["Q10"], "site_no"])
+    excluded_sites = neg_flow_sites | bad_q10_sites
+    if excluded_sites:
+        log.info(
+            "Excluding %d regulated/ditch station(s) "
+            "(negative flows: %d, Q10<median: %d): %s",
+            len(excluded_sites), len(neg_flow_sites), len(bad_q10_sites),
+            sorted(excluded_sites),
+        )
+    stations = [s for s in stations if s not in excluded_sites]
+    log.info("Stations after QC exclusion: %d", len(stations))
 
     # Load existing results and identify (site_no, source) pairs already at 320 combinations.
     existing: pd.DataFrame | None = None
@@ -452,6 +483,7 @@ def main() -> None:
                 lambda r: (r["site_no"], r["mrms_source"]) in complete_keys, axis=1
             )
         ]
+        kept = kept[~kept["site_no"].isin(excluded_sites)]
         parts.append(kept)
         log.info("Retaining %d rows from previous run", len(kept))
 
