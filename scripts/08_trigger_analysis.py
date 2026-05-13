@@ -73,9 +73,9 @@ MrmsSource = Literal["nearest", "watershed"]
 
 # ---------- Data loaders ----------
 
-def _read_parquet_s3(bucket: str, key: str) -> pd.DataFrame:
+def _read_parquet_s3(bucket: str, key: str, columns: list[str] | None = None) -> pd.DataFrame:
     obj = s3_client().get_object(Bucket=bucket, Key=key)
-    return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
+    return pq.read_table(io.BytesIO(obj["Body"].read()), columns=columns).to_pandas()
 
 
 def load_mrms(bucket: str, prefix: str, product_key: str, source: MrmsSource) -> pd.DataFrame:
@@ -91,7 +91,7 @@ def load_mrms(bucket: str, prefix: str, product_key: str, source: MrmsSource) ->
 def load_streamflow(bucket: str, prefix: str) -> pd.DataFrame:
     """Load all per-gauge streamflow and resample 15-min data to hourly max."""
     key = f"{prefix}streamflow/instantaneous/all_gauges_long.parquet"
-    df = _read_parquet_s3(bucket, key)
+    df = _read_parquet_s3(bucket, key, columns=["site_no", "datetime", "value_cfs"])
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     df["value_cfs"] = pd.to_numeric(df["value_cfs"], errors="coerce")
 
