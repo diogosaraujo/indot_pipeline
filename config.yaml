@@ -114,3 +114,19 @@ execution:
   max_workers_io: 16           # for streamflow + StreamStats download
   max_workers_grib: 8          # for MRMS extraction
   checkpoint_dir: ./checkpoints
+
+# ---------------------------------------------------------------------------
+# NWM configuration (script 10)
+#
+# src_s3_bucket / src_s3_key: location of HYDRO_TBL_1D.nc in the noaa-nwm-pds
+# public bucket.  This file contains the HAND-based Synthetic Rating Curves
+# used to derive stage from streamflow for the operational products (A&A and
+# Open-Loop).  The exact path depends on the NWM version archived in the
+# bucket; verify with:
+#   aws s3 ls s3://noaa-nwm-pds/nwm.20240101/domain/ --no-sign-request
+# Leave src_s3_key blank ("") to skip stage derivation for operational products
+# (Retrospective uses Head directly and is unaffected).
+# ---------------------------------------------------------------------------
+nwm:
+  src_s3_bucket: noaa-nwm-pds
+  src_s3_key: ""               # e.g. "nwm.20240101/domain/HYDRO_TBL_1D.nc"

@@ -8,7 +8,7 @@ This repository packages the workflow as a restart-safe AWS data pipeline. It is
 
 - Domain: Indiana hydrology and bridge-screening data acquisition
 - Runtime target: AWS EC2 plus S3 in `us-east-1`
-- Data sources: USGS NWIS, USGS StreamStats, NOAA MRMS
+- Data sources: USGS NWIS, USGS StreamStats, NOAA MRMS, NOAA National Water Model
 - Primary outputs: Parquet, GeoJSON, and Zarr
 - Execution style: sequential scripts with idempotent reruns
 
@@ -19,6 +19,7 @@ This repository packages the workflow as a restart-safe AWS data pipeline. It is
 - Delineates contributing watersheds with StreamStats
 - Retrieves published and regression-based flood-frequency metrics
 - Extracts MRMS precipitation at gauge points and across watersheds
+- Downloads National Water Model streamflow, velocity, nudge, and stage for each gauge
 
 ## Why this repository exists
 
@@ -37,6 +38,20 @@ The project is organized to make a large, multi-source hydrologic acquisition wo
 | MRMS at nearest pixel to each gauge, *per product* | Parquet | 1–3 GB / product |
 | MRMS watershed-mean time series, *per product* | Parquet | 1–3 GB / product |
 | MRMS pixel-level Zarr per watershed (QPE products only, sparse above lower-limit) | Per-gauge Zarr stores | 5–25 GB / product |
+| NWM COMID location table (snap distance from USGS gauge) | Parquet | < 1 MB |
+| NWM Retrospective v3.0 — streamflow, velocity, Head/stage per gauge | Parquet | 5–15 GB |
+| NWM Analysis & Assimilation — streamflow, velocity, nudge, stage per gauge | Parquet | 2–8 GB |
+| NWM Open-Loop A&A — streamflow, velocity, stage per gauge | Parquet | 2–8 GB |
+
+NWM time coverage by product:
+
+| Product | Period | Variables |
+|---|---|---|
+| Retrospective v3.0 | Feb 1979 – Dec 2023, hourly | streamflow, velocity, Head (stage direct) |
+| Analysis & Assimilation | ~Sep 2018 – present, hourly | streamflow, velocity, nudge |
+| Open-Loop A&A | ~Sep 2018 – present, hourly | streamflow, velocity |
+
+Stage for Retrospective is the `Head` variable (water surface elevation, m NAVD88) output directly by NWM. Stage for A&A and Open-Loop is derived by interpolating the HAND-based Synthetic Rating Curves (SRC) stored in `HYDRO_TBL_1D.nc` — see caveat 8 below.
 
 The MRMS section iterates over every entry in `cfg.mrms.products`. Default config has only `QPE_01H_Pass2` enabled. Uncomment ARI_01H..ARI_24H, QPEFFG_MAX, RQI_24H, and the other QPE variants in `config.yaml` to extract them too.
 
@@ -68,7 +83,8 @@ The MRMS public dataset lives at `s3://noaa-mrms-pds`, hosted in **us-east-1**. 
 | StreamStats | `requests` + retries | Watershed + flow stats REST calls |
 | Geospatial | `geopandas`, `shapely`, `rasterio`, `rioxarray` | Watershed handling, masking |
 | MRMS read | `s3fs`, `xarray`, `cfgrib` (eccodes) | Stream GRIB2 directly from S3 |
-| Parallelism | `concurrent.futures` or `dask.distributed` | Multi-process MRMS extraction |
+| NWM read | `s3fs`, `xarray`, `zarr`, `h5py` | Zarr (retrospective) + HDF5 byte-range (operational) |
+| Parallelism | `concurrent.futures` or `dask.distributed` | Multi-process MRMS/NWM extraction |
 | Output | `pyarrow`, `zarr` | Parquet for tabular, Zarr for gridded |
 
 The `cfgrib` library wraps ECMWF's `eccodes` — that is a C dependency, easiest installed via `mamba install -c conda-forge eccodes`.
@@ -266,6 +282,8 @@ python scripts/04_get_flow_statistics.py         # ~2 hours, StreamStats rate-li
 python scripts/05_extract_mrms_nearest.py        # ~4-6 hours, parallelized
 python scripts/06_extract_mrms_watershed.py      # ~10-16 hours, parallelized
 python scripts/07_extract_atlas14.py             # ~1 hour, NOAA PFDS rate-limited
+python scripts/04b_regression_flows.py           # ~2 minutes, fills missing Q10/Q50 via Rao 2005
+python scripts/10_download_nwm.py                # ~1 hr (retrospective) + ~4 hrs each for A&A and Open-Loop
 ```
 
 Steps 03 and 04 cannot be meaningfully sped up by adding cores — StreamStats limits you to 4 concurrent requests. Steps 05 and 06 *do* scale with CPU; bigger instance = faster. Steps 02, 03, and 04 can run concurrently in three terminals if you want to overlap them.
@@ -331,6 +349,18 @@ Stopping preserves the EBS volume (cheap, ~$16/month for 200 GB). **Terminating*
 
 4. **`dataretrieval` is also in transition.** As of its January 2026 release, the package's `waterdata` module wraps USGS's modernized Water Data APIs and is now used by this pipeline for station inventory and instantaneous streamflow retrieval. Legacy `nwis` still exists in the package, but steps 01 and 02 no longer depend on it.
 
+8. **NWM SRC file path must be confirmed before stage is available for operational products.** The HAND-based Synthetic Rating Curves live in `HYDRO_TBL_1D.nc`, which is bundled with the NWM domain files on `noaa-nwm-pds`. Before running script 10, verify the exact key with:
+
+   ```bash
+   aws s3 ls s3://noaa-nwm-pds/nwm.20240101/domain/ --no-sign-request
+   ```
+
+   Then set `nwm.src_s3_key` in `config.yaml` (e.g. `nwm.20240101/domain/HYDRO_TBL_1D.nc`). Until that key is set, `stage_m` is written as NaN for A&A and Open-Loop — Retrospective `stage_m` comes from the `Head` variable and is unaffected.
+
+9. **NWM operational archive depth.** The `noaa-nwm-pds` bucket holds NWM operational output going back to approximately September 2018 (NWM v2.0). Earlier files may be missing or in a different format. Script 10 skips missing hourly files without failing so the parquet is simply sparse for gaps in the archive.
+
+10. **NWM script 10 runtime.** The retrospective uses the public Zarr store and completes in ~1 hour. The two operational products (A&A and Open-Loop) process ~67,000 hourly NetCDF files each using `h5py` byte-range reads; expect ~3–5 hours per product with 16 workers. Run both on the same `m5.2xlarge` used for MRMS — no resize needed.
+
 5. **MRMS product catalog and units.** `cfg.mrms.products` is a list — steps 05 and 06 loop over it. The default config enables only `QPE_01H_Pass2` (gauge-bias-corrected hourly accumulation, the standard reference for hydrologic studies). The other supported products are commented in:
    - `QPE_01H_Pass1`, `QPE_03H_Pass2`, `QPE_24H_Pass2` — additional QPE accumulation windows.
    - `ARI_01H..ARI_24H` — Average Recurrence Interval, in years. Climatology-aware: an ARI value of 25 means *this rainfall is a 25-year event at this location*. Likely the most useful single trigger metric for the INDOT comparison because it normalizes for spatial variation in climatological intensity (a fixed 2.5"/24h means very different things in northern vs. southern Indiana).
@@ -370,5 +400,8 @@ indot_pipeline/
     ├── 05_extract_mrms_nearest.py         <- MRMS at gauge point
     ├── 06_extract_mrms_watershed.py       <- MRMS over watershed polygon
     ├── 07_extract_atlas14.py              <- NOAA Atlas 14 precipitation frequency
-    └── 08_trigger_analysis.py             <- precipitation trigger vs. streamflow analysis
+    ├── 04b_regression_flows.py            <- Rao 2005 regression fill for missing Q10/Q50
+    ├── 08_trigger_analysis.py             <- precipitation trigger vs. streamflow analysis
+    ├── 09_figures.py                      <- summary figures (heatmaps, maps, per-gauge CSI)
+    └── 10_download_nwm.py                 <- NWM retrospective + A&A + Open-Loop per gauge
 ```
