@@ -3,8 +3,8 @@
 # The main config.yaml is not read by these scripts.
 
 gcp:
-  project: ""                        # ← your GCP project ID (e.g. "my-project-123456")
-  output_bucket: ""                  # ← your GCS bucket name (e.g. "indot-nwm-outputs")
+  project: "positive-harbor-496218-u6"  # ← your GCP project ID (e.g. "my-project-123456")
+  output_bucket: "indot-nwm"                  # ← your GCS bucket name (e.g. "indot-nwm-outputs")
   output_prefix: "v1/"
   nwm_bucket: "national-water-model" # public NWM GCS bucket — do not change
 
@@ -25,7 +25,7 @@ usgs:
 # manually copy with gsutil / aws s3 cp later.
 # ─────────────────────────────────────────────────────────────────────────────
 aws:
-  output_bucket: ""          # e.g. "indot-bridge-pipeline"
+  output_bucket: "indot-bridge-pipeline"          # e.g. "indot-bridge-pipeline"
   output_prefix: "v1/"
   region: "us-east-1"
   access_key_id: ""          # or set AWS_ACCESS_KEY_ID env var

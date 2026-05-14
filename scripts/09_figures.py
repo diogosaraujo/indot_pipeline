@@ -96,10 +96,6 @@ def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df["POD"] = df["tp"] / (df["tp"] + df["fn"] + EPS)
     df["FAR"] = df["fp"] / (df["tp"] + df["fp"] + EPS)
     df["CSI"] = df["tp"] / (df["tp"] + df["fp"] + df["fn"] + EPS)
-    df["TSS"] = (
-        df["tp"] / (df["tp"] + df["fn"] + EPS)
-        - df["fp"] / (df["fp"] + df["tn"] + EPS)
-    )
     # Flag degenerate rows: no events AND no triggers → metrics are meaningless
     df["degenerate"] = (df["tp"] == 0) & (df["fn"] == 0) & (df["fp"] == 0)
     return df
@@ -112,8 +108,8 @@ def _duration_tick_labels(index):
 
 
 def _pool_metrics(df: pd.DataFrame, groupby_cols: list[str]) -> pd.DataFrame:
-    """Sum raw TP/FP/FN/TN counts by groupby_cols, then derive metrics from pooled totals."""
-    counts = df.groupby(groupby_cols)[["tp", "fp", "fn", "tn"]].sum().reset_index()
+    """Sum raw TP/FP/FN counts by groupby_cols, then derive metrics from pooled totals."""
+    counts = df.groupby(groupby_cols)[["tp", "fp", "fn"]].sum().reset_index()
     counts["POD"] = counts["tp"] / (counts["tp"] + counts["fn"] + EPS)
     counts["FAR"] = counts["fp"] / (counts["tp"] + counts["fp"] + EPS)
     counts["CSI"] = counts["tp"] / (counts["tp"] + counts["fp"] + counts["fn"] + EPS)
@@ -328,11 +324,9 @@ def log_summary(df: pd.DataFrame) -> None:
     tp = df["tp"].sum()
     fp = df["fp"].sum()
     fn = df["fn"].sum()
-    tn = df["tn"].sum()
     pod = tp / (tp + fn + EPS)
     far = fp / (tp + fp + EPS)
     csi = tp / (tp + fp + fn + EPS)
-    tss = tp / (tp + fn + EPS) - fp / (fp + tn + EPS)
 
     pooled_combos = _pool_metrics(df, ["duration_hr", "precip_rp_yr", "flow_rp_yr"])
     best_row = pooled_combos.loc[pooled_combos["CSI"].idxmax()]
@@ -344,7 +338,6 @@ def log_summary(df: pd.DataFrame) -> None:
     log.info("  POD : %.3f", pod)
     log.info("  FAR : %.3f", far)
     log.info("  CSI : %.3f", csi)
-    log.info("  TSS : %.3f", tss)
     log.info(
         "  Best avg CSI combo: duration=%dh  precip_rp=%dyr  flow_rp=Q%d  CSI=%.3f",
         best_idx[0], best_idx[1], best_idx[2], best_csi,

@@ -502,7 +502,7 @@ Open `config_gcp.yaml` in the project root and fill in:
 | Key | Example value | Notes |
 |---|---|---|
 | `gcp.project` | `my-project-123456` | Your GCP project ID |
-| `gcp.output_bucket` | `indot-nwm-abc123` | Globally unique GCS bucket name |
+| `gcp.output_bucket` | `indot-nwm` | Globally unique GCS bucket name |
 | `gcp.nwm_src_key` | `nwm.20240101/domain/HYDRO_TBL_1D.nc` | Path to the SRC file — see below |
 | `aws.output_bucket` | `indot-bridge-pipeline` | Optional: S3 bucket to push outputs to |
 | `aws.access_key_id` | *(your key)* | Optional: leave blank to use `AWS_ACCESS_KEY_ID` env var |

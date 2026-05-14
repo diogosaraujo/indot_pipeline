@@ -330,24 +330,18 @@ def _extract_one_hour(
 def extract_operational(
     product: str,
     comid_table: pd.DataFrame,
-    station_periods: dict[str, tuple[pd.Timestamp, pd.Timestamp]],
     src_interp: dict,
     max_workers: int,
 ) -> pd.DataFrame:
-    now = pd.Timestamp.utcnow()
+    """Extract the full GCS archive (OPS_START → now) for all COMIDs.
 
-    active_windows = []
-    for site_no, (begin, end) in station_periods.items():
-        t0 = max(_to_utc(begin), OPS_START)
-        t1 = min(_to_utc(end) if pd.notna(end) else now, now)
-        if t0 < t1:
-            active_windows.append((t0, t1))
-    if not active_windows:
-        log.warning("%s: no stations overlap operational period", product)
-        return pd.DataFrame()
-
-    global_start = min(w[0] for w in active_windows)
-    global_end   = max(w[1] for w in active_windows)
+    No per-station time clipping is applied — NWM is a model that runs
+    continuously regardless of USGS gauge activity, so the full record is
+    extracted for every station location.
+    """
+    now          = pd.Timestamp.utcnow()
+    global_start = OPS_START
+    global_end   = now
 
     comid_to_sites: dict[int, list[str]] = {}
     for _, row in comid_table.iterrows():
@@ -399,19 +393,6 @@ def extract_operational(
         for s in sites
     ])
     out = combined.merge(mapping, on="comid", how="inner")
-
-    period_map = {
-        s: (max(_to_utc(b), OPS_START), min(_to_utc(e) if pd.notna(e) else now, now))
-        for s, (b, e) in station_periods.items()
-    }
-    mask = out.apply(
-        lambda r: (
-            r["site_no"] in period_map
-            and period_map[r["site_no"]][0] <= r["datetime_utc"] <= period_map[r["site_no"]][1]
-        ),
-        axis=1,
-    )
-    out = out[mask].copy()
     out = _apply_stage(out, src_interp)
 
     cols = ["site_no", "comid", "datetime_utc", "streamflow_cms", "velocity_ms"]
@@ -438,17 +419,7 @@ def main() -> None:
     log.info("Loading station inventory from GCS...")
     inv = _read_parquet_gcs(bucket, f"{prefix}stations/indiana_streamflow_sites.parquet")
     inv["site_no"] = inv["site_no"].astype(str)
-    inv = inv[["site_no", "dec_lat_va", "dec_long_va", "begin_date", "end_date"]].copy()
-
-    def _parse_date(v) -> pd.Timestamp:
-        if pd.isna(v) or v is None:
-            return pd.Timestamp.now()
-        return pd.Timestamp(v)
-
-    station_periods: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {
-        row["site_no"]: (_parse_date(row["begin_date"]), _parse_date(row["end_date"]))
-        for _, row in inv.iterrows()
-    }
+    inv = inv[["site_no", "dec_lat_va", "dec_long_va"]].copy()
 
     # ── COMID lookup ───────────────────────────────────────────────────────────
     log.info("Fetching NHDPlus COMIDs via NLDI (%d stations)...", len(inv))
@@ -480,7 +451,7 @@ def main() -> None:
 
     for product, blob in product_blobs.items():
         log.info("Starting %s extraction...", product)
-        df = extract_operational(product, comid_table, station_periods, src_interp, max_io)
+        df = extract_operational(product, comid_table, src_interp, max_io)
         if not df.empty:
             _write_parquet_gcs(df, bucket, blob)
             if aws_cfg.get("output_bucket"):
