@@ -1,0 +1,35 @@
+# GCP NWM extraction configuration
+# Used only by scripts/01_get_stations_gcp.py and scripts/10_download_nwm_gcp.py.
+# The main config.yaml is not read by these scripts.
+
+gcp:
+  project: ""                        # ← your GCP project ID (e.g. "my-project-123456")
+  output_bucket: ""                  # ← your GCS bucket name (e.g. "indot-nwm-outputs")
+  output_prefix: "v1/"
+  nwm_bucket: "national-water-model" # public NWM GCS bucket — do not change
+
+  # HYDRO_TBL_1D.nc path within nwm_bucket.
+  # Find the most recent copy with:
+  #   gsutil ls "gs://national-water-model/nwm.*/domain/HYDRO_TBL_1D.nc" | sort | tail -1
+  # Then paste the path below WITHOUT the bucket prefix
+  # (e.g.  "nwm.20240101/domain/HYDRO_TBL_1D.nc")
+  nwm_src_key: ""
+
+usgs:
+  parameter_code: "00060"   # discharge, cubic feet per second
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional AWS destination: if access_key_id is non-empty (or the matching env
+# variables are set) the GCP script will push the output parquets directly to
+# your S3 bucket at the end of the run.  Leave blank to skip the S3 push and
+# manually copy with gsutil / aws s3 cp later.
+# ─────────────────────────────────────────────────────────────────────────────
+aws:
+  output_bucket: ""          # e.g. "indot-bridge-pipeline"
+  output_prefix: "v1/"
+  region: "us-east-1"
+  access_key_id: ""          # or set AWS_ACCESS_KEY_ID env var
+  secret_access_key: ""      # or set AWS_SECRET_ACCESS_KEY env var
+
+execution:
+  max_workers_io: 8

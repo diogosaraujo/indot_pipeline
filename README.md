@@ -423,10 +423,13 @@ Stopping preserves the EBS volume (cheap, ~$16/month for 200 GB). **Terminating*
 ```
 indot_pipeline/
 ├── README.md                              <- you are here
-├── config.yaml                            <- bucket names, dates, product
+├── config.yaml                            <- bucket names, dates, product (AWS run)
+├── config_gcp.yaml                        <- GCP project, bucket, NWM SRC key (GCP run)
 ├── requirements.txt                       <- pip-installable deps
 ├── environment.yml                        <- mamba/conda env (preferred)
 ├── setup_ec2.sh                           <- one-shot EC2 provisioning
+├── setup_gcp_infra.sh                     <- gcloud CLI: create GCS bucket, service account, VM
+├── setup_gcp_vm.sh                        <- on-VM: install miniforge, mamba env, AWS CLI
 ├── create-s3-bucket.bat                   <- AWS CLI: create output S3 bucket
 ├── create-iam-role.bat                    <- AWS CLI: create EC2 IAM role + instance profile
 ├── launch-ec2.bat                         <- AWS CLI: launch EC2 instance (m5.2xlarge)
@@ -434,7 +437,8 @@ indot_pipeline/
 ├── downsize-ec2.bat                       <- AWS CLI: stop instance, restore to m5.2xlarge, restart
 └── scripts/
     ├── utils.py                           <- shared helpers
-    ├── 01_get_indiana_stations.py         <- Water Data API station inventory
+    ├── 01_get_indiana_stations.py         <- Water Data API station inventory → S3
+    ├── 01_get_stations_gcp.py             <- Water Data API station inventory → GCS
     ├── 02_download_streamflow.py          <- instantaneous/unit values, full record
     ├── 03_delineate_watersheds.py         <- NLDI watershed delineation
     ├── 04_get_flow_statistics.py          <- gage stats Q2..Q500
@@ -444,5 +448,200 @@ indot_pipeline/
     ├── 04b_regression_flows.py            <- Rao 2005 regression fill for missing Q10/Q50
     ├── 08_trigger_analysis.py             <- precipitation trigger vs. streamflow analysis
     ├── 09_figures.py                      <- summary figures (heatmaps, maps, per-gauge CSI)
-    └── 10_download_nwm.py                 <- NWM retrospective + A&A + Open-Loop per gauge
+    ├── 10_download_nwm.py                 <- NWM retrospective + A&A + Open-Loop per gauge → S3
+    └── 10_download_nwm_gcp.py             <- NWM retrospective + A&A + Open-Loop per gauge → GCS
 ```
+
+---
+
+## 9. Running script 10 on Google Cloud (NWM extraction)
+
+The National Water Model operational archive lives at `gs://national-water-model` on Google Cloud Storage. Running the NWM extraction step on a GCP Compute Engine VM means all the heavy operational reads stay within GCP, where they are fast and free. The retrospective Zarr store (`s3://noaa-nwm-retrospective-3-0-pds`) is on AWS Open Data — reading it from a GCP VM is free under the Open Data Sponsorship Programme.
+
+A single run of both operational products plus the retrospective completes in roughly **8–10 hours** on an `e2-standard-4` VM (~$0.134/hr), keeping total GCP cost well inside the **$300 free credit** new accounts receive.
+
+> **Why not run script 10 on AWS?** The `noaa-nwm-pds` bucket only retains a ~1-year rolling window of operational data. The full archive back to September 2018 is in `gs://national-water-model`. Reading ~67,000 NetCDF files across clouds is slower than reading them in-region; doing it on GCP keeps latency low and costs negligible.
+
+### 9.1 Cost estimate
+
+| Resource | Unit cost | Quantity | Subtotal |
+|---|---|---|---|
+| GCP e2-standard-4 VM | $0.134 / hr | ~10 hours | **$1.34** |
+| GCS output storage (parquets) | $0.020 / GB-mo | ~800 MB for 1 month | **$0.02** |
+| GCS → S3 egress (optional push) | $0.09 / GB | ~800 MB | **$0.07** |
+| Total | | | **≈ $1.50** |
+
+All costs are well within the $300 free credit. Credit expires 90 days after account creation.
+
+### 9.2 Prerequisites — GCP account and gcloud CLI
+
+**GCP account**
+
+1. Create a GCP account at `cloud.google.com`. New accounts receive **$300 free credit**, valid for 90 days.
+2. In the [Google Cloud Console](https://console.cloud.google.com/projectcreate), create a new project and note the **Project ID** (e.g. `my-project-123456`). Project IDs are permanent and globally unique.
+3. Enable billing on the project (required to use Compute Engine, even with free credits).
+
+**gcloud CLI (on your local Windows machine)**
+
+1. Search for "Google Cloud CLI installer" on `cloud.google.com/sdk/docs/install` and download the Windows installer (`.exe`).
+2. Run the installer. When prompted, leave "Run `gcloud init`" checked.
+3. Open a **new** PowerShell window and verify:
+   ```
+   gcloud --version
+   ```
+4. Authenticate and set your project:
+   ```
+   gcloud auth login
+   gcloud config set project YOUR_PROJECT_ID
+   ```
+
+### 9.3 Fill in config_gcp.yaml
+
+Open `config_gcp.yaml` in the project root and fill in:
+
+| Key | Example value | Notes |
+|---|---|---|
+| `gcp.project` | `my-project-123456` | Your GCP project ID |
+| `gcp.output_bucket` | `indot-nwm-abc123` | Globally unique GCS bucket name |
+| `gcp.nwm_src_key` | `nwm.20240101/domain/HYDRO_TBL_1D.nc` | Path to the SRC file — see below |
+| `aws.output_bucket` | `indot-bridge-pipeline` | Optional: S3 bucket to push outputs to |
+| `aws.access_key_id` | *(your key)* | Optional: leave blank to use `AWS_ACCESS_KEY_ID` env var |
+| `aws.secret_access_key` | *(your secret)* | Optional: leave blank to use `AWS_SECRET_ACCESS_KEY` env var |
+
+**Finding `nwm_src_key`** — run this from any machine that has `gsutil` or the gcloud CLI:
+
+```bash
+gsutil ls "gs://national-water-model/nwm.*/domain/HYDRO_TBL_1D.nc" | sort | tail -1
+```
+
+Copy the output path and remove the `gs://national-water-model/` prefix. Example result: `nwm.20240101/domain/HYDRO_TBL_1D.nc`.
+
+Until this key is set, `stage_m` will be written as NaN for A&A and Open-Loop. Retrospective `stage_m` comes from the `Head` variable directly and is not affected.
+
+### 9.4 Create GCP resources
+
+Open `setup_gcp_infra.sh`, set `PROJECT_ID` and `BUCKET_NAME` at the top to match your `config_gcp.yaml`, then run from your local machine:
+
+```bash
+bash setup_gcp_infra.sh
+```
+
+This script (idempotent — safe to re-run):
+- Enables the Compute, Storage, and IAM APIs on your project
+- Creates the GCS output bucket in `us-central1`
+- Creates a service account (`indot-nwm-sa`) with `Storage Object Admin` on the output bucket
+- Launches a Compute Engine VM (`indot-nwm-vm`, `e2-standard-4`, `us-central1-a`, 50 GB SSD) with the service account attached
+
+Wait about 60 seconds for the VM to finish booting, then connect:
+
+```bash
+gcloud compute ssh indot-nwm-vm --zone=us-central1-a --project=YOUR_PROJECT_ID
+```
+
+### 9.5 Copy the repo to the VM
+
+From your **local machine** (in the directory that contains `indot_pipeline/`):
+
+```bash
+# Option A: copy a local checkout (no GitHub access required)
+gcloud compute scp --recurse indot_pipeline/ indot-nwm-vm:~/ \
+    --zone=us-central1-a --project=YOUR_PROJECT_ID
+```
+
+```bash
+# Option B: clone from GitHub (run from inside the SSH session)
+git clone https://YOUR_PAT@github.com/diogosaraujo/indot_pipeline.git
+```
+
+For option B, create a fine-grained GitHub Personal Access Token with read-only access to the repo (Settings → Developer settings → Personal access tokens → Fine-grained tokens).
+
+### 9.6 Provision the Python environment on the VM
+
+From inside the SSH session, in the project root:
+
+```bash
+bash setup_gcp_vm.sh
+```
+
+When it finishes, initialize the shell and activate the environment:
+
+```bash
+~/miniforge3/bin/conda init bash
+mamba shell init --shell bash --root-prefix=~/miniforge3
+source ~/.bashrc
+mamba activate indot
+```
+
+Set the USGS API token (same requirement as the AWS path — see section 6.4):
+
+```bash
+export API_USGS_PAT=your_token_here
+echo 'export API_USGS_PAT=your_token_here' >> ~/.bashrc
+```
+
+On future SSH reconnections, `mamba activate indot` is all you need.
+
+### 9.7 Run the GCP scripts
+
+```bash
+# ~1 minute — writes station inventory to GCS
+python scripts/01_get_stations_gcp.py
+
+# ~8-10 hours — retrospective + A&A + Open-Loop
+python scripts/10_download_nwm_gcp.py
+```
+
+Script 10 logs progress to stdout and automatically skips the retrospective if `nwm/retrospective.parquet` already exists in the GCS bucket. It is safe to interrupt and resume — the retrospective is the longest step and benefits most from this.
+
+Expected runtimes:
+
+| Step | Approx. time |
+|---|---|
+| Station inventory (script 01) | ~1 minute |
+| COMID lookup via NLDI | ~5 minutes |
+| Retrospective Zarr load | ~30–60 minutes |
+| A&A extraction (~67k files) | ~3–4 hours |
+| Open-Loop extraction (~67k files) | ~3–4 hours |
+
+### 9.8 Transfer outputs to AWS S3
+
+**Option A — Automatic push during extraction (recommended)**
+
+Fill in the `aws` section of `config_gcp.yaml` before running script 10. The script pushes each finished parquet to your S3 bucket immediately after writing it to GCS. Total egress is ~800 MB (~$0.07).
+
+**Option B — Manual transfer after the run**
+
+From the VM (with AWS credentials configured via `aws configure` or environment variables):
+
+```bash
+# Download all NWM parquets from GCS to the VM
+gsutil -m cp "gs://YOUR_GCS_BUCKET/v1/nwm/*.parquet" ./nwm_outputs/
+
+# Upload to S3
+aws s3 cp --recursive ./nwm_outputs/ "s3://YOUR_S3_BUCKET/v1/nwm/"
+```
+
+### 9.9 Teardown
+
+Stop the VM when done (the service account and bucket stay in place):
+
+```bash
+gcloud compute instances stop indot-nwm-vm \
+    --zone=us-central1-a --project=YOUR_PROJECT_ID
+```
+
+A stopped VM accrues no compute charges but keeps its disk (~$0.006/hr for 50 GB SSD). To eliminate all ongoing cost, delete the VM:
+
+```bash
+gcloud compute instances delete indot-nwm-vm \
+    --zone=us-central1-a --project=YOUR_PROJECT_ID
+```
+
+Once outputs are confirmed in S3, delete the GCS bucket too:
+
+```bash
+gsutil rm -r gs://YOUR_GCS_BUCKET
+```
+
+> **Billing alert:** Set a budget alert so you are notified before credits run out.
+> In the Google Cloud Console go to **Billing → Budgets & alerts → Create budget**, set the amount to $5, and configure email notifications at 80% and 100%. You will receive an email well before this workload's ~$1.50 cost is exceeded.

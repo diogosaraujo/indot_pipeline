@@ -92,7 +92,7 @@ RETRO_ZARR   = "s3://noaa-nwm-retrospective-3-0-pds/CONUS/zarr/chrtout.zarr"
 RETRO_START  = pd.Timestamp("1979-02-01", tz="UTC")
 RETRO_END    = pd.Timestamp("2023-12-31 23:00:00", tz="UTC")
 
-# Operational products — public NetCDF/HDF5 files (AWS Open Data)
+# Operational products — AWS Open Data (noaa-nwm-pds keeps a rolling ~18-month window)
 OPS_BUCKET   = "noaa-nwm-pds"
 OPS_START    = pd.Timestamp("2018-09-17", tz="UTC")   # NWM v2.0 archive start
 
@@ -380,7 +380,7 @@ def _ops_key(ts: pd.Timestamp, product: str) -> str:
 
 
 def _extract_one_hour(
-    fs: s3fs.S3FileSystem,
+    fs,
     bucket: str,
     key: str,
     target_comids: np.ndarray,
@@ -560,14 +560,21 @@ def main() -> None:
         log.warning("nwm.src_s3_key not set in config — stage_m will be NaN for A&A / Open-Loop")
 
     # ── Retrospective v3.0 ─────────────────────────────────────────────
-    log.info("Starting retrospective extraction...")
-    retro = extract_retrospective(comid_table, station_periods)
-    if not retro.empty:
-        write_parquet_to_s3(retro, bucket, f"{prefix}nwm/retrospective.parquet")
-        log.info("Wrote nwm/retrospective.parquet (%d rows, %d stations)",
-                 len(retro), retro["site_no"].nunique())
-    else:
-        log.error("Retrospective extraction returned no data")
+    retro_key = f"{prefix}nwm/retrospective.parquet"
+    try:
+        s3_client().head_object(Bucket=bucket, Key=retro_key)
+        log.info("Retrospective already exists — skipping extraction.")
+        retro = None
+    except Exception:
+        log.info("Starting retrospective extraction...")
+        retro = extract_retrospective(comid_table, station_periods)
+    if retro is not None:
+        if not retro.empty:
+            write_parquet_to_s3(retro, bucket, retro_key)
+            log.info("Wrote nwm/retrospective.parquet (%d rows, %d stations)",
+                     len(retro), retro["site_no"].nunique())
+        else:
+            log.error("Retrospective extraction returned no data")
 
     # ── Operational products ───────────────────────────────────────────
     for product, out_key in [
