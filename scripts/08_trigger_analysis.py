@@ -25,8 +25,9 @@ Classification per trigger event:
 Classification for missed events:
     FN  streamflow peak >= flow threshold  AND  no trigger in preceding 24 h
 
-True negatives (hourly):
-    TN  hours in common period with no active trigger AND streamflow < threshold
+TN is not reported.  It would overwhelmingly outnumber TP/FP/FN (most hours
+have neither a trigger nor a flood), is not used by CSI/POD/FAR, and would
+give a misleading picture of classifier performance.
 
 All metrics are computed only over the common period between MRMS and USGS
 observations for each station.
@@ -36,7 +37,7 @@ the time axis coherent with the hourly MRMS data.
 
 Output schema (one row per combination):
     site_no, mrms_source, duration_hr, precip_rp_yr, flow_rp_yr,
-    n_trigger_events, tp, fp, fn, tn,
+    n_trigger_events, tp, fp, fn,
     common_start, common_end, n_common_hours
 
 Writes:
@@ -232,10 +233,9 @@ def classify(
     flow_events: list[pd.Timestamp],
     hourly_flow: pd.Series,
     flow_threshold_cfs: float,
-    n_common_hours: int,
     duration_hr: int = 0,
 ) -> dict:
-    """Compute TP, FP, FN, TN for one (station, duration, precip_rp, flow_rp) combo.
+    """Compute TP, FP, FN for one (station, duration, precip_rp, flow_rp) combo.
 
     The response window is [t_trigger - duration_hr, t_trigger + RESPONSE_HOURS].
     The backward extension accounts for the rolling sum firing at the END of the
@@ -265,20 +265,9 @@ def classify(
     # Unmatched flow events are false negatives
     fn = len(flow_event_set - matched_flow_events)
 
-    # TN: hours with no active trigger window and streamflow below threshold
-    trigger_hours: set[pd.Timestamp] = set()
-    for t in trigger_times:
-        t_start = t - pd.Timedelta(hours=duration_hr)
-        for h in range(duration_hr + RESPONSE_HOURS + 1):
-            trigger_hours.add(t_start + pd.Timedelta(hours=h))
-
-    exceedance_hours = set(hourly_flow[hourly_flow >= flow_threshold_cfs].index.tolist())
-    neither = n_common_hours - len(trigger_hours | exceedance_hours)
-    tn = max(0, neither)
-
     return {
         "n_trigger_events": len(trigger_times),
-        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "tp": tp, "fp": fp, "fn": fn,
     }
 
 
@@ -346,7 +335,7 @@ def analyse_station(
 
                 flow_events = find_flow_events(flow_c.dropna(), flow_threshold)
 
-                metrics = classify(triggers, flow_events, flow_c, flow_threshold, n_common, duration_hr)
+                metrics = classify(triggers, flow_events, flow_c, flow_threshold, duration_hr)
 
                 records.append({
                     "site_no": site_no,
