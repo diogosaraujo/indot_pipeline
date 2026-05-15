@@ -39,9 +39,10 @@ The project is organized to make a large, multi-source hydrologic acquisition wo
 | MRMS watershed-mean time series, *per product* | Parquet | 1–3 GB / product |
 | MRMS pixel-level Zarr per watershed (QPE products only, sparse above lower-limit) | Per-gauge Zarr stores | 5–25 GB / product |
 | NWM COMID location table (snap distance from USGS gauge) | Parquet | < 1 MB |
-| NWM Retrospective v3.0 — streamflow, velocity, Head/stage per gauge | Parquet | 5–15 GB |
-| NWM Analysis & Assimilation — streamflow, velocity, nudge, stage per gauge | Parquet | 2–8 GB |
-| NWM Open-Loop A&A — streamflow, velocity, stage per gauge | Parquet | 2–8 GB |
+| NWM Retrospective v3.0 — streamflow, velocity per gauge | Parquet | 5–15 GB |
+| NWM Analysis & Assimilation — streamflow, velocity, nudge per gauge | Parquet | 2–8 GB |
+| NWM Open-Loop A&A — streamflow, velocity per gauge | Parquet | 2–8 GB |
+| NWM stage (stage_m added to all three products) | Parquet (overwrites above) | no additional size |
 | Aggregate trigger-skill figures (CSI / POD / FAR heatmaps, POD vs FAR scatter, Indiana map) | PNG (S3) | < 5 MB |
 | Per-gauge CSI heatmaps | PNG (S3) | < 50 MB total |
 
@@ -49,11 +50,11 @@ NWM time coverage by product:
 
 | Product | Period | Variables |
 |---|---|---|
-| Retrospective v3.0 | Feb 1979 – Dec 2023, hourly | streamflow, velocity, Head (stage direct) |
+| Retrospective v3.0 | Feb 1979 – Dec 2023, hourly | streamflow, velocity |
 | Analysis & Assimilation | ~Sep 2018 – present, hourly | streamflow, velocity, nudge |
 | Open-Loop A&A | ~Sep 2018 – present, hourly | streamflow, velocity |
 
-Stage for Retrospective is the `Head` variable (water surface elevation, m NAVD88) output directly by NWM. Stage for A&A and Open-Loop is derived by interpolating the HAND-based Synthetic Rating Curves (SRC) stored in `HYDRO_TBL_1D.nc` — see caveat 8 below.
+Script 10 stores only streamflow and velocity (plus nudge for A&A). Script 11 then adds `stage_m` to all three parquets by interpolating HAND-based Synthetic Rating Curves from `HYDRO_TBL_1D.nc` on `noaa-nwm-pds` — see caveat 8 below.
 
 The MRMS section iterates over every entry in `cfg.mrms.products`. Default config has only `QPE_01H_Pass2` enabled. Uncomment ARI_01H..ARI_24H, QPEFFG_MAX, RQI_24H, and the other QPE variants in `config.yaml` to extract them too.
 
@@ -291,6 +292,7 @@ Scripts 08 and 09 require a separate step each — see sections 6.6 and 6.7 belo
 
 ```bash
 python scripts/10_download_nwm.py                # ~1 hr (retrospective) + ~4 hrs each for A&A and Open-Loop
+python scripts/11_derive_stage.py                # ~10-20 min — adds stage_m to all three NWM parquets
 ```
 
 Steps 03 and 04 cannot be meaningfully sped up by adding cores — StreamStats limits you to 4 concurrent requests. Steps 05 and 06 *do* scale with CPU; bigger instance = faster. Steps 02, 03, and 04 can run concurrently in three terminals if you want to overlap them.
@@ -390,13 +392,13 @@ Stopping preserves the EBS volume (cheap, ~$16/month for 200 GB). **Terminating*
 
 4. **`dataretrieval` is also in transition.** As of its January 2026 release, the package's `waterdata` module wraps USGS's modernized Water Data APIs and is now used by this pipeline for station inventory and instantaneous streamflow retrieval. Legacy `nwis` still exists in the package, but steps 01 and 02 no longer depend on it.
 
-8. **NWM SRC file path must be confirmed before stage is available for operational products.** The HAND-based Synthetic Rating Curves live in `HYDRO_TBL_1D.nc`, which is bundled with the NWM domain files on `noaa-nwm-pds`. Before running script 10, verify the exact key with:
+8. **`nwm.src_s3_key` must be set before running script 11.** Stage derivation is handled by script 11, which reads `HYDRO_TBL_1D.nc` from `noaa-nwm-pds`. Before running it, verify the exact key with:
 
    ```bash
    aws s3 ls s3://noaa-nwm-pds/nwm.20240101/domain/ --no-sign-request
    ```
 
-   Then set `nwm.src_s3_key` in `config.yaml` (e.g. `nwm.20240101/domain/HYDRO_TBL_1D.nc`). Until that key is set, `stage_m` is written as NaN for A&A and Open-Loop — Retrospective `stage_m` comes from the `Head` variable and is unaffected.
+   Then set `nwm.src_s3_key` in `config.yaml` (e.g. `nwm.20240101/domain/HYDRO_TBL_1D.nc`). Script 10 no longer writes `stage_m` at all — all three NWM parquets contain only `streamflow_cms` and `velocity_ms` (plus `nudge_cms` for A&A) until script 11 is run.
 
 9. **NWM operational archive depth.** The `noaa-nwm-pds` bucket holds NWM operational output going back to approximately September 2018 (NWM v2.0). Earlier files may be missing or in a different format. Script 10 skips missing hourly files without failing so the parquet is simply sparse for gaps in the archive.
 
@@ -448,8 +450,9 @@ indot_pipeline/
     ├── 04b_regression_flows.py            <- Rao 2005 regression fill for missing Q10/Q50
     ├── 08_trigger_analysis.py             <- precipitation trigger vs. streamflow analysis
     ├── 09_figures.py                      <- summary figures (heatmaps, maps, per-gauge CSI)
-    ├── 10_download_nwm.py                 <- NWM retrospective + A&A + Open-Loop per gauge → S3
-    └── 10_download_nwm_gcp.py             <- NWM retrospective + A&A + Open-Loop per gauge → GCS
+    ├── 10_download_nwm.py                 <- NWM retrospective + A&A + Open-Loop (streamflow + velocity) → S3
+    ├── 10_download_nwm_gcp.py             <- NWM A&A + Open-Loop (streamflow + velocity) → GCS
+    └── 11_derive_stage.py                 <- adds stage_m to all three NWM parquets via SRC interpolation
 ```
 
 ---
@@ -503,20 +506,11 @@ Open `config_gcp.yaml` in the project root and fill in:
 |---|---|---|
 | `gcp.project` | `my-project-123456` | Your GCP project ID |
 | `gcp.output_bucket` | `indot-nwm` | Globally unique GCS bucket name |
-| `gcp.nwm_src_key` | `nwm.20240101/domain/HYDRO_TBL_1D.nc` | Path to the SRC file — see below |
 | `aws.output_bucket` | `indot-bridge-pipeline` | Optional: S3 bucket to push outputs to |
 | `aws.access_key_id` | *(your key)* | Optional: leave blank to use `AWS_ACCESS_KEY_ID` env var |
 | `aws.secret_access_key` | *(your secret)* | Optional: leave blank to use `AWS_SECRET_ACCESS_KEY` env var |
 
-**Finding `nwm_src_key`** — run this from any machine that has `gsutil` or the gcloud CLI:
-
-```bash
-gsutil ls "gs://national-water-model/nwm.*/domain/HYDRO_TBL_1D.nc" | sort | tail -1
-```
-
-Copy the output path and remove the `gs://national-water-model/` prefix. Example result: `nwm.20240101/domain/HYDRO_TBL_1D.nc`.
-
-Until this key is set, `stage_m` will be written as NaN for A&A and Open-Loop. Retrospective `stage_m` comes from the `Head` variable directly and is not affected.
+> Stage derivation for GCP outputs uses the same `11_derive_stage.py` script run on AWS — see caveat 8 and section 6.5.
 
 ### 9.4 Create GCP resources
 
@@ -587,11 +581,11 @@ On future SSH reconnections, `mamba activate indot` is all you need.
 # ~1 minute — writes station inventory to GCS
 python scripts/01_get_stations_gcp.py
 
-# ~8-10 hours — retrospective + A&A + Open-Loop
+# ~6-8 hours — A&A + Open-Loop operational archive (Sep 2018 → present)
 python scripts/10_download_nwm_gcp.py
 ```
 
-Script 10 logs progress to stdout and automatically skips the retrospective if `nwm/retrospective.parquet` already exists in the GCS bucket. It is safe to interrupt and resume — the retrospective is the longest step and benefits most from this.
+Script 10 logs progress to stdout. It is safe to interrupt and resume.
 
 Expected runtimes:
 
@@ -599,7 +593,6 @@ Expected runtimes:
 |---|---|
 | Station inventory (script 01) | ~1 minute |
 | COMID lookup via NLDI | ~5 minutes |
-| Retrospective Zarr load | ~30–60 minutes |
 | A&A extraction (~67k files) | ~3–4 hours |
 | Open-Loop extraction (~67k files) | ~3–4 hours |
 

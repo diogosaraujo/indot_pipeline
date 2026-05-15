@@ -6,15 +6,6 @@ gcp:
   project: "positive-harbor-496218-u6"  # ← your GCP project ID (e.g. "my-project-123456")
   output_bucket: "indot-nwm"                  # ← your GCS bucket name (e.g. "indot-nwm-outputs")
   output_prefix: "v1/"
-  nwm_bucket: "national-water-model" # public NWM GCS bucket — do not change
-
-  # HYDRO_TBL_1D.nc path within nwm_bucket.
-  # Find the most recent copy with:
-  #   gsutil ls "gs://national-water-model/nwm.*/domain/HYDRO_TBL_1D.nc" | sort | tail -1
-  # Then paste the path below WITHOUT the bucket prefix
-  # (e.g.  "nwm.20240101/domain/HYDRO_TBL_1D.nc")
-  nwm_src_key: ""
-
 usgs:
   parameter_code: "00060"   # discharge, cubic feet per second
 

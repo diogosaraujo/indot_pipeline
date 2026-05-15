@@ -48,7 +48,6 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
-import xarray as xr
 import yaml
 from google.cloud import storage
 
@@ -218,69 +217,6 @@ def build_comid_table(inv: pd.DataFrame, timeout: int, max_workers: int) -> pd.D
     return pd.DataFrame(results)
 
 
-# ── HAND-based Synthetic Rating Curves ───────────────────────────────────────
-
-def load_src_interpolators(comids: list[int], nwm_bucket: str, key: str) -> dict:
-    """Load HYDRO_TBL_1D.nc from the public NWM GCS bucket via gcsfs."""
-    if not key:
-        log.warning("gcp.nwm_src_key not set — stage_m will be NaN for A&A / Open-Loop")
-        return {}
-    try:
-        gcs = gcsfs.GCSFileSystem(token="anon")
-        with gcs.open(f"{nwm_bucket}/{key}", "rb") as f:
-            data = f.read()
-        ds = xr.open_dataset(io.BytesIO(data), engine="h5netcdf")
-    except Exception as e:
-        log.warning(
-            "Could not load SRC from gs://%s/%s: %s — stage_m will be NaN", nwm_bucket, key, e
-        )
-        return {}
-
-    comid_set   = set(comids)
-    feature_ids = ds["feature_id"].values.astype(int)
-
-    if "Stage_1" in ds:
-        n_pts     = sum(1 for v in ds.data_vars if v.startswith("Stage_"))
-        stage_arr = np.stack([ds[f"Stage_{i}"].values    for i in range(1, n_pts + 1)], axis=1)
-        q_arr     = np.stack([ds[f"Discharge_{i}"].values for i in range(1, n_pts + 1)], axis=1)
-    elif "stage_ht_NQ" in ds:
-        stage_arr = ds["stage_ht_NQ"].values
-        q_arr     = ds["discharge_ht_NQ"].values
-    else:
-        log.error("SRC file has unrecognised variable layout; stage_m will be NaN")
-        return {}
-
-    interpolators: dict = {}
-    for idx, fid in enumerate(feature_ids):
-        if int(fid) not in comid_set:
-            continue
-        q_pts = q_arr[idx]
-        h_pts = stage_arr[idx]
-        valid = np.isfinite(q_pts) & np.isfinite(h_pts)
-        if valid.sum() < 2:
-            continue
-        q_v, h_v = q_pts[valid], h_pts[valid]
-        order    = np.argsort(q_v)
-        q_s, h_s = q_v[order], h_v[order]
-        interpolators[int(fid)] = lambda q, _q=q_s, _h=h_s: float(
-            np.interp(q, _q, _h, left=_h[0], right=_h[-1])
-        )
-
-    log.info("SRC: built interpolators for %d / %d COMIDs", len(interpolators), len(comids))
-    return interpolators
-
-
-def _apply_stage(df: pd.DataFrame, interp: dict) -> pd.DataFrame:
-    if not interp:
-        df["stage_m"] = np.nan
-        return df
-    df["stage_m"] = [
-        interp[c](q) if c in interp else np.nan
-        for c, q in zip(df["comid"], df["streamflow_cms"])
-    ]
-    return df
-
-
 # ── Operational data — hourly NetCDF/HDF5 extraction ─────────────────────────
 
 def _ops_key(ts: pd.Timestamp, product: str) -> str:
@@ -330,7 +266,6 @@ def _extract_one_hour(
 def extract_operational(
     product: str,
     comid_table: pd.DataFrame,
-    src_interp: dict,
     max_workers: int,
 ) -> pd.DataFrame:
     """Extract the full GCS archive (OPS_START → now) for all COMIDs.
@@ -393,12 +328,10 @@ def extract_operational(
         for s in sites
     ])
     out = combined.merge(mapping, on="comid", how="inner")
-    out = _apply_stage(out, src_interp)
 
     cols = ["site_no", "comid", "datetime_utc", "streamflow_cms", "velocity_ms"]
     if product == "analysis_assim":
         cols.append("nudge_cms")
-    cols.append("stage_m")
     return out[[c for c in cols if c in out.columns]].reset_index(drop=True)
 
 
@@ -410,8 +343,6 @@ def main() -> None:
     aws_cfg    = cfg.get("aws", {})
     bucket     = gcp_cfg["output_bucket"]
     prefix     = gcp_cfg["output_prefix"]
-    nwm_bucket = gcp_cfg.get("nwm_bucket", GCS_BUCKET)
-    src_key    = gcp_cfg.get("nwm_src_key", "")
     max_io     = cfg.get("execution", {}).get("max_workers_io", 8)
     timeout    = 30  # seconds for NLDI requests
 
@@ -435,10 +366,6 @@ def main() -> None:
         log.error("No COMIDs resolved — aborting.")
         return
 
-    # ── SRC interpolators ──────────────────────────────────────────────────────
-    comids = comid_table["comid"].astype(int).tolist()
-    src_interp = load_src_interpolators(comids, nwm_bucket, src_key)
-
     # ── Operational products ───────────────────────────────────────────────────
     product_blobs = {
         "analysis_assim":       f"{prefix}nwm/analysis_assim.parquet",
@@ -451,7 +378,7 @@ def main() -> None:
 
     for product, blob in product_blobs.items():
         log.info("Starting %s extraction...", product)
-        df = extract_operational(product, comid_table, src_interp, max_io)
+        df = extract_operational(product, comid_table, max_io)
         if not df.empty:
             _write_parquet_gcs(df, bucket, blob)
             if aws_cfg.get("output_bucket"):

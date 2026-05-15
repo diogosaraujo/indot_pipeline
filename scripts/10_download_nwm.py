@@ -16,26 +16,20 @@ Variables extracted per product:
   streamflow  (m³/s)   — all three products
   velocity    (m/s)    — all three products
   nudge       (m³/s)   — A&A only; DA correction added to model streamflow
-  head_m      (m)      — Retrospective only; water surface elevation (NAVD88)
-  stage_m     (m)      — all products; for Retro = head_m directly; for A&A
-                         and Open-Loop derived by interpolating the HAND-based
-                         Synthetic Rating Curves (SRC) stored in HYDRO_TBL_1D.nc
 
 Each station's download is clipped to its USGS begin_date / end_date, further
 bounded by the product's available period.
+
+Stage derivation
+----------------
+Water-surface stage is NOT derived here.  Run script 11_derive_stage.py after
+this script to add stage_m to all three parquets using HYDRO_TBL_1D.nc.
 
 COMID matching
 --------------
 USGS gauges are matched to NHDPlus COMIDs through the NLDI service
 (api.water.usgs.gov/nldi).  A separate table records the NHDPlus flowline
 midpoint so the snap distance can be inspected.
-
-SRC note
---------
-The HAND-based SRC file (HYDRO_TBL_1D.nc) path is set in config.yaml under
-nwm.src_s3_bucket / nwm.src_s3_key.  Update those values once the exact path
-in noaa-nwm-pds is confirmed.  If the file is unreachable, stage_m is written
-as NaN for A&A and Open-Loop (Retrospective is unaffected — head_m is direct).
 
 Reads:
     s3://<bucket>/<prefix>stations/indiana_streamflow_sites.parquet
@@ -51,15 +45,15 @@ comid_locations schema:
 
 retrospective schema:
     site_no, comid, datetime_utc,
-    streamflow_cms, velocity_ms, head_m, stage_m
+    streamflow_cms, velocity_ms
 
 analysis_assim schema:
     site_no, comid, datetime_utc,
-    streamflow_cms, velocity_ms, nudge_cms, stage_m
+    streamflow_cms, velocity_ms, nudge_cms
 
 open_loop schema:
     site_no, comid, datetime_utc,
-    streamflow_cms, velocity_ms, stage_m
+    streamflow_cms, velocity_ms
 """
 from __future__ import annotations
 
@@ -190,74 +184,6 @@ def build_comid_table(inv: pd.DataFrame, timeout: int, max_workers: int) -> pd.D
     return pd.DataFrame(results)
 
 
-# ── HAND-based Synthetic Rating Curves ───────────────────────────────────────
-
-def load_src_interpolators(comids: list[int], bucket: str, key: str) -> dict:
-    """Load HYDRO_TBL_1D.nc from S3 and build per-COMID stage interpolators.
-
-    The SRC file maps NHDPlus COMID → (discharge_pts, stage_pts) rating curve.
-    Returns dict: comid (int) → callable(streamflow_cms) → stage_m.
-    COMIDs not in the SRC file are silently omitted.
-
-    Two variable-name conventions are handled:
-      • NWM v2.x : Stage_1 … Stage_N  /  Discharge_1 … Discharge_N
-      • NWM v3.0 : stage_ht_NQ  /  discharge_ht_NQ  (2-D arrays)
-    """
-    try:
-        obj = s3_client().get_object(Bucket=bucket, Key=key)
-        ds = xr.open_dataset(io.BytesIO(obj["Body"].read()), engine="h5netcdf")
-    except Exception as e:
-        log.warning("Could not load SRC from s3://%s/%s: %s — stage_m will be NaN", bucket, key, e)
-        return {}
-
-    comid_set = set(comids)
-    feature_ids = ds["feature_id"].values.astype(int)
-
-    if "Stage_1" in ds:
-        n_pts = sum(1 for v in ds.data_vars if v.startswith("Stage_"))
-        stage_arr = np.stack([ds[f"Stage_{i}"].values    for i in range(1, n_pts + 1)], axis=1)
-        q_arr     = np.stack([ds[f"Discharge_{i}"].values for i in range(1, n_pts + 1)], axis=1)
-    elif "stage_ht_NQ" in ds:
-        stage_arr = ds["stage_ht_NQ"].values       # (n_comids, n_pts)
-        q_arr     = ds["discharge_ht_NQ"].values
-    else:
-        log.error("SRC file has unrecognised variable layout; stage_m will be NaN")
-        return {}
-
-    interpolators: dict = {}
-    for idx, fid in enumerate(feature_ids):
-        if int(fid) not in comid_set:
-            continue
-        q_pts = q_arr[idx]
-        h_pts = stage_arr[idx]
-        valid = np.isfinite(q_pts) & np.isfinite(h_pts)
-        if valid.sum() < 2:
-            continue
-        q_v = q_pts[valid]
-        h_v = h_pts[valid]
-        order = np.argsort(q_v)
-        q_s, h_s = q_v[order], h_v[order]
-        # Capture by value to avoid late-binding closure bug
-        interpolators[int(fid)] = lambda q, _q=q_s, _h=h_s: float(
-            np.interp(q, _q, _h, left=_h[0], right=_h[-1])
-        )
-
-    log.info("SRC: built interpolators for %d / %d COMIDs", len(interpolators), len(comids))
-    return interpolators
-
-
-def _apply_stage(df: pd.DataFrame, interp: dict) -> pd.DataFrame:
-    """Vectorised stage derivation; NaN for COMIDs missing from SRC."""
-    if not interp:
-        df["stage_m"] = np.nan
-        return df
-    df["stage_m"] = [
-        interp[c](q) if c in interp else np.nan
-        for c, q in zip(df["comid"], df["streamflow_cms"])
-    ]
-    return df
-
-
 # ── Retrospective v3.0 — Zarr extraction ─────────────────────────────────────
 
 def extract_retrospective(
@@ -288,22 +214,7 @@ def extract_retrospective(
     if missing:
         log.warning("Retrospective: %d COMIDs not in NWM domain: %s", len(missing), missing[:10])
 
-    # Detect the actual variable names — log them for transparency
-    ds_vars = list(ds.data_vars)
-    log.info("Retrospective Zarr variables: %s", ds_vars)
-
-    # Stage/head variable name varies by NWM version in the Zarr store.
-    # NWM v3.0 Zarr does not include Head; only streamflow and velocity are available.
-    HEAD_CANDIDATES = ["Head", "head", "qlink"]   # q_lateral is lateral inflow, not stage
-    head_var = next((v for v in HEAD_CANDIDATES if v in ds_vars), None)
-    if head_var is None:
-        log.warning("No head/stage variable found in Zarr store (tried %s); head_m will be NaN",
-                    HEAD_CANDIDATES)
-
     retro_vars = ["streamflow", "velocity"]
-    if head_var:
-        retro_vars.append(head_var)
-
     sub = ds[retro_vars].sel(feature_id=comids_ok)
 
     # Compute the global time window needed across all stations so we can
@@ -340,26 +251,21 @@ def extract_retrospective(
             if t0 >= t1:
                 continue
 
-            base_cols = ["streamflow", "velocity"] + ([head_var] if head_var else [])
             df = (
                 comid_slice.sel(time=slice(t0, t1))
-                .to_dataframe()[base_cols]
+                .to_dataframe()[["streamflow", "velocity"]]
                 .reset_index()
                 .rename(columns={
                     "time":       "datetime_utc",
                     "streamflow": "streamflow_cms",
                     "velocity":   "velocity_ms",
-                    **({head_var: "head_m"} if head_var else {}),
                 })
             )
             df["datetime_utc"] = pd.to_datetime(df["datetime_utc"]).dt.tz_localize("UTC")
             df["site_no"] = site_no
             df["comid"]   = comid
-            if "head_m" not in df.columns:
-                df["head_m"] = np.nan
-            df["stage_m"] = df["head_m"]
             parts.append(df[["site_no", "comid", "datetime_utc",
-                              "streamflow_cms", "velocity_ms", "head_m", "stage_m"]])
+                              "streamflow_cms", "velocity_ms"]])
 
     if not parts:
         return pd.DataFrame()
@@ -419,7 +325,6 @@ def extract_operational(
     product: str,
     comid_table: pd.DataFrame,
     station_periods: dict[str, tuple[pd.Timestamp, pd.Timestamp]],
-    src_interp: dict,
     max_workers: int,
 ) -> pd.DataFrame:
     """Download all hourly NWM operational files that overlap any station's active period."""
@@ -500,12 +405,9 @@ def extract_operational(
     )
     out = out[mask].copy()
 
-    out = _apply_stage(out, src_interp)
-
     cols = ["site_no", "comid", "datetime_utc", "streamflow_cms", "velocity_ms"]
     if product == "analysis_assim":
         cols.append("nudge_cms")
-    cols.append("stage_m")
     return out[[c for c in cols if c in out.columns]].reset_index(drop=True)
 
 
@@ -517,9 +419,6 @@ def main() -> None:
     prefix     = cfg["aws"]["output_prefix"]
     timeout    = cfg["streamstats"]["request_timeout_sec"]
     max_io     = cfg["execution"]["max_workers_io"]
-    nwm_cfg    = cfg.get("nwm", {})
-    src_bucket = nwm_cfg.get("src_s3_bucket", OPS_BUCKET)
-    src_key    = nwm_cfg.get("src_s3_key", "")
 
     # ── Station inventory ──────────────────────────────────────────────
     log.info("Loading station inventory...")
@@ -550,15 +449,6 @@ def main() -> None:
         log.error("No COMIDs resolved — aborting.")
         return
 
-    # ── SRC interpolators (for A&A and Open-Loop stage) ───────────────
-    comids = comid_table["comid"].astype(int).tolist()
-    src_interp: dict = {}
-    if src_key:
-        log.info("Loading HAND SRC from s3://%s/%s ...", src_bucket, src_key)
-        src_interp = load_src_interpolators(comids, src_bucket, src_key)
-    else:
-        log.warning("nwm.src_s3_key not set in config — stage_m will be NaN for A&A / Open-Loop")
-
     # ── Retrospective v3.0 ─────────────────────────────────────────────
     retro_key = f"{prefix}nwm/retrospective.parquet"
     try:
@@ -583,7 +473,7 @@ def main() -> None:
     ]:
         log.info("Starting %s extraction...", product)
         df = extract_operational(
-            product, comid_table, station_periods, src_interp, max_workers=max_io,
+            product, comid_table, station_periods, max_workers=max_io,
         )
         if not df.empty:
             write_parquet_to_s3(df, bucket, out_key)
