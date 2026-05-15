@@ -597,16 +597,13 @@ This will (skipping any step already done if re-run):
 3. Install `google-cloud-storage` into the environment
 4. Install the AWS CLI v2 (used for optional manual S3 transfer)
 
-When it finishes, initialize the shell and activate the environment:
+When it finishes, the script has already run the shell init steps. Activate the environment for the current session:
 
 ```bash
-~/miniforge3/bin/conda init bash
-mamba shell init --shell bash --root-prefix=~/miniforge3
-source ~/.bashrc
-mamba activate indot
+source ~/.bashrc && mamba activate indot
 ```
 
-These shell-init commands only need to run once per VM. On future SSH reconnections, `mamba activate indot` is all you need.
+On future SSH reconnections, `mamba activate indot` is all you need.
 
 If you plan to use the S3 push via AWS credentials (rather than embedding them in `config_gcp.yaml`), configure them now:
 

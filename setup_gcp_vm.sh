@@ -59,12 +59,19 @@ else
 fi
 
 echo ""
+echo "==> Initializing shell for mamba..."
+~/miniforge3/bin/conda init bash
+source ~/.bashrc
+~/miniforge3/bin/mamba shell init --shell bash --root-prefix=~/miniforge3
+source ~/.bashrc
+
+echo ""
 echo "==> Done."
 echo ""
-echo "    Initialize your shell for mamba (one-time per VM):"
-echo "      ~/miniforge3/bin/conda init bash"
-echo "      mamba shell init --shell bash --root-prefix=~/miniforge3"
-echo "      source ~/.bashrc"
+echo "    Run the following to finish activating the environment in this session:"
+echo "      source ~/.bashrc && mamba activate indot"
+echo ""
+echo "    On future SSH reconnections, just run:"
 echo "      mamba activate indot"
 echo ""
 echo "    Set your USGS API token:"
