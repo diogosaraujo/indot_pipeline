@@ -48,6 +48,8 @@ echo "==> AWS CLI v2"
 if command -v aws &>/dev/null; then
     echo "    Already installed — skipping."
 else
+    echo "    Installing unzip..."
+    sudo apt-get install -y -q unzip
     echo "    Downloading..."
     curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
     unzip -q /tmp/awscliv2.zip -d /tmp
