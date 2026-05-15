@@ -45,9 +45,9 @@ The project is organized to make a large, multi-source hydrologic acquisition wo
 | NWM Analysis & Assimilation — streamflow, velocity, nudge per gauge | Parquet | 2–8 GB |
 | NWM Open-Loop A&A — streamflow, velocity per gauge | Parquet | 2–8 GB |
 | NWM stage (stage_m added to all three products) | Parquet (overwrites above) | no additional size |
-| NOAA COOP Hourly station inventory (within watershed union) | Parquet | < 1 MB |
+| NOAA ISD/ASOS station inventory (within watershed union) | Parquet | < 1 MB |
 | NOAA GHCNh station inventory (within watershed union) | Parquet | < 1 MB |
-| NOAA COOP Hourly precipitation time series (HPD v2, Oct 2020 → present) | Parquet | ~1–2 GB |
+| NOAA ISD/LCD hourly precipitation time series (ASOS/AWOS, Oct 2020 → present) | Parquet | ~1–2 GB |
 | NOAA GHCNh hourly precipitation time series (Oct 2020 → present) | Parquet | ~1–2 GB |
 | USGS IV precipitation station inventory (param 00045, within watershed union) | Parquet | < 1 MB |
 | USGS IV precipitation instantaneous values (~120-day rolling window) | Parquet | ~20–50 MB |
@@ -383,28 +383,20 @@ aws s3 sync s3://indot-bridge-pipeline-<your-id>/v1/analysis/figures/ ./figures/
 
 > **Note on pooled vs per-station metrics:** The aggregate heatmaps (CSI / POD / FAR) are computed from globally pooled TP/FP/FN/TN counts across all stations, not station averages. This avoids giving equal weight to short-record gauges and gauges with few events. The per-station bar charts and map still use each station's individual best-CSI value.
 
-### 6.8 NOAA CDO API token (required for script 12 — COOP Hourly)
+### 6.8 NOAA precipitation — no token required
 
-Script 12 uses the NOAA Climate Data Online (CDO) API to build the COOP Hourly station inventory. The token is **free** and takes about 30 seconds to obtain.
+Script 12 does not require any API token. Station inventory comes from two publicly accessible NCEI files:
 
-1. Go to `ncdc.noaa.gov/cdo-web/token` and enter your email address.
-2. NOAA will email you a token (a string of letters and digits, ~32 characters).
-3. Open `config.yaml` and paste the token into the `noaa_precip.cdo_token` field:
+- **ISD station history** (`ncei.noaa.gov/pub/data/noaa/isd-history.csv`) — lists all automated ASOS/AWOS stations worldwide
+- **GHCNh station list** — downloaded from NCEI with multiple URL fallbacks
 
-   ```yaml
-   noaa_precip:
-     cdo_token: "AbCdEfGhIjKlMnOpQrStUvWxYz123456"
-   ```
-
-The CDO token is only needed for COOP Hourly station discovery. The **GHCNh** section of script 12 does not require a token — it downloads the station list directly from NCEI.
-
-> **If you skip the COOP token:** Script 12 will log a warning and skip the COOP Hourly section entirely, running only GHCNh. You can add the token later and re-run — the script is gap-filling and will only download what is missing.
+Data is downloaded directly from NCEI without authentication. No setup step is needed before running script 12.
 
 ### 6.9 Run precipitation scripts (12 and 13)
 
 Scripts 12 and 13 are fully independent of each other and of the NWM scripts — they write to separate S3 paths and share no state. Run them in parallel in two terminals to save time. They can run at any point after script 03 has written watershed polygons to S3 (the polygon union is how station selection works). If script 03 has not run yet they fall back to the Indiana bounding box automatically.
 
-**Script 12 — NOAA hourly precipitation (COOP HPD v2 + GHCNh)**
+**Script 12 — NOAA hourly precipitation (ISD/LCD + GHCNh)**
 
 ```bash
 python scripts/12_download_noaa_precip.py
@@ -413,18 +405,18 @@ python scripts/12_download_noaa_precip.py
 What it does:
 
 1. Loads all per-gauge watershed GeoJSONs from S3 (`watersheds/per_gauge/`) and unions them into one Shapely polygon.
-2. Queries the CDO API for COOP Hourly stations (`PRECIP_HLY`) within the watershed bounding box, then filters to those whose coordinates actually fall inside the polygon.
-3. Downloads the NCEI GHCNh station-list CSV and applies the same polygon filter.
+2. Downloads the NCEI ISD station-history CSV (`isd-history.csv`) and filters to US stations active after `noaa_precip.start_date` whose coordinates fall inside the polygon.
+3. Downloads the NCEI GHCNh station-list CSV (tries multiple known URLs) and applies the same polygon filter.
 4. For each station in both datasets, checks whether a combined parquet already exists in S3. If it does, only data newer than `max(datetime_utc)` per station is downloaded (gap-filling). If no parquet exists, data from `noaa_precip.start_date` (default `2020-10-14`) to today is downloaded.
 5. Writes four objects to S3:
-   - `precip/noaa/stations_coop.parquet` — COOP station inventory
+   - `precip/noaa/stations_isd.parquet` — ISD/ASOS station inventory
    - `precip/noaa/stations_ghcnh.parquet` — GHCNh station inventory
-   - `precip/noaa/coop_hourly.parquet` — COOP hourly time series (all stations combined)
+   - `precip/noaa/isd_hourly.parquet` — ISD/LCD hourly time series (all stations combined)
    - `precip/noaa/ghcnh_hourly.parquet` — GHCNh hourly time series (all stations combined)
 
-Downloads run concurrently (`max_workers_io` threads). Expected station counts for Indiana's watershed union: ~100–180 COOP stations, ~60–100 GHCNh stations.
+Downloads run concurrently (`max_workers_io` threads). Expected station counts for Indiana's watershed union: ~150–300 ISD/ASOS stations, ~60–100 GHCNh stations.
 
-Precipitation schema (`coop_hourly.parquet` and `ghcnh_hourly.parquet`):
+Precipitation schema (`isd_hourly.parquet` and `ghcnh_hourly.parquet`):
 
 | Column | Type | Notes |
 |---|---|---|
@@ -551,7 +543,7 @@ indot_pipeline/
     ├── 10_download_nwm.py                 <- NWM retrospective + A&A + Open-Loop (streamflow + velocity) → S3
     ├── 10_download_nwm_gcp.py             <- NWM A&A + Open-Loop (streamflow + velocity) → GCS
     ├── 11_derive_stage.py                 <- adds stage_m to all three NWM parquets via SRC interpolation
-    ├── 12_download_noaa_precip.py         <- NOAA COOP Hourly (HPD v2) + GHCNh hourly precip → S3
+    ├── 12_download_noaa_precip.py         <- NOAA ISD/LCD (ASOS) + GHCNh hourly precip → S3
     └── 13_download_usgs_precip.py         <- USGS IV precipitation (param 00045), ~120-day window → S3
 ```
 
