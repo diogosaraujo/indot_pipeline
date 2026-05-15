@@ -550,7 +550,9 @@ indot_pipeline/
     ├── 09_figures.py                      <- summary figures (heatmaps, maps, per-gauge CSI)
     ├── 10_download_nwm.py                 <- NWM retrospective + A&A + Open-Loop (streamflow + velocity) → S3
     ├── 10_download_nwm_gcp.py             <- NWM A&A + Open-Loop (streamflow + velocity) → GCS
-    └── 11_derive_stage.py                 <- adds stage_m to all three NWM parquets via SRC interpolation
+    ├── 11_derive_stage.py                 <- adds stage_m to all three NWM parquets via SRC interpolation
+    ├── 12_download_noaa_precip.py         <- NOAA COOP Hourly (HPD v2) + GHCNh hourly precip → S3
+    └── 13_download_usgs_precip.py         <- USGS IV precipitation (param 00045), ~120-day window → S3
 ```
 
 ---
