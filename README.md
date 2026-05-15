@@ -429,9 +429,9 @@ indot_pipeline/
 ├── config_gcp.yaml                        <- GCP project, bucket, NWM SRC key (GCP run)
 ├── requirements.txt                       <- pip-installable deps
 ├── environment.yml                        <- mamba/conda env (preferred)
-├── setup_ec2.sh                           <- one-shot EC2 provisioning
-├── setup_gcp_infra.sh                     <- gcloud CLI: create GCS bucket, service account, VM
-├── setup_gcp_vm.sh                        <- on-VM: install miniforge, mamba env, AWS CLI
+├── setup_ec2.sh                           <- on-VM: install miniforge, mamba env (runs on EC2)
+├── setup-gcp-infra.ps1                    <- gcloud CLI: create GCS bucket, service account, VM (runs locally)
+├── setup_gcp_vm.sh                        <- on-VM: install miniforge, mamba env, AWS CLI (runs on GCP VM)
 ├── create-s3-bucket.bat                   <- AWS CLI: create output S3 bucket
 ├── create-iam-role.bat                    <- AWS CLI: create EC2 IAM role + instance profile
 ├── launch-ec2.bat                         <- AWS CLI: launch EC2 instance (m5.2xlarge)
@@ -457,105 +457,145 @@ indot_pipeline/
 
 ---
 
-## 9. Running script 10 on Google Cloud (NWM extraction)
+## 9. Running script 10 on Google Cloud (NWM operational extraction)
 
-The National Water Model operational archive lives at `gs://national-water-model` on Google Cloud Storage. Running the NWM extraction step on a GCP Compute Engine VM means all the heavy operational reads stay within GCP, where they are fast and free. The retrospective Zarr store (`s3://noaa-nwm-retrospective-3-0-pds`) is on AWS Open Data — reading it from a GCP VM is free under the Open Data Sponsorship Programme.
+The full NWM operational archive (Analysis & Assimilation + Open-Loop, Sep 2018 → present) lives at `gs://national-water-model` on Google Cloud Storage. Running the extraction on a GCP Compute Engine VM keeps all the heavy NetCDF reads within GCP — fast and free of egress charges. The retrospective (Feb 1979 – Dec 2023) is handled separately by the AWS script (`10_download_nwm.py`), which reads the public Zarr store on `noaa-nwm-retrospective-3-0-pds`.
 
-A single run of both operational products plus the retrospective completes in roughly **8–10 hours** on an `e2-standard-4` VM (~$0.134/hr), keeping total GCP cost well inside the **$300 free credit** new accounts receive.
+After the GCP run finishes and its parquets land in S3, `11_derive_stage.py` is run on the AWS EC2 instance to add `stage_m` to all three products uniformly.
 
-> **Why not run script 10 on AWS?** The `noaa-nwm-pds` bucket only retains a ~1-year rolling window of operational data. The full archive back to September 2018 is in `gs://national-water-model`. Reading ~67,000 NetCDF files across clouds is slower than reading them in-region; doing it on GCP keeps latency low and costs negligible.
+> **Why not run the operational extraction on AWS?** The `noaa-nwm-pds` bucket only keeps a rolling ~17-month window of files. The complete archive back to September 2018 exists only in `gs://national-water-model`. Running in-region on GCP avoids cross-cloud reads for ~130,000 hourly files and keeps egress cost near zero.
 
 ### 9.1 Cost estimate
 
 | Resource | Unit cost | Quantity | Subtotal |
 |---|---|---|---|
-| GCP e2-standard-4 VM | $0.134 / hr | ~10 hours | **$1.34** |
-| GCS output storage (parquets) | $0.020 / GB-mo | ~800 MB for 1 month | **$0.02** |
-| GCS → S3 egress (optional push) | $0.09 / GB | ~800 MB | **$0.07** |
-| Total | | | **≈ $1.50** |
+| GCP `e2-standard-4` VM | $0.134 / hr | ~8 hours | **$1.07** |
+| GCS output storage (2 parquets) | $0.020 / GB-mo | ~600 MB for 1 month | **$0.01** |
+| GCS → S3 egress (optional push) | $0.09 / GB | ~600 MB | **$0.05** |
+| **Total** | | | **≈ $1.15** |
 
-All costs are well within the $300 free credit. Credit expires 90 days after account creation.
+All costs are well within the $300 free credit that new GCP accounts receive. Credit expires 90 days after account creation.
 
 ### 9.2 Prerequisites — GCP account and gcloud CLI
 
 **GCP account**
 
 1. Create a GCP account at `cloud.google.com`. New accounts receive **$300 free credit**, valid for 90 days.
-2. In the [Google Cloud Console](https://console.cloud.google.com/projectcreate), create a new project and note the **Project ID** (e.g. `my-project-123456`). Project IDs are permanent and globally unique.
+2. In the [Google Cloud Console](https://console.cloud.google.com/projectcreate), create a new project and note the **Project ID** (e.g. `positive-harbor-496218-u6`). Project IDs are permanent and globally unique.
 3. Enable billing on the project (required to use Compute Engine, even with free credits).
 
 **gcloud CLI (on your local Windows machine)**
 
-1. Search for "Google Cloud CLI installer" on `cloud.google.com/sdk/docs/install` and download the Windows installer (`.exe`).
+1. Go to `cloud.google.com/sdk/docs/install` and download the Windows installer (`.exe`).
 2. Run the installer. When prompted, leave "Run `gcloud init`" checked.
-3. Open a **new** PowerShell window and verify:
-   ```
+3. Open a **new** PowerShell window (the installer updates `PATH` — existing windows won't see it) and verify:
+   ```powershell
    gcloud --version
    ```
 4. Authenticate and set your project:
-   ```
+   ```powershell
    gcloud auth login
    gcloud config set project YOUR_PROJECT_ID
    ```
 
+   Verify it took:
+   ```powershell
+   gcloud config get-value project
+   ```
+
 ### 9.3 Fill in config_gcp.yaml
 
-Open `config_gcp.yaml` in the project root and fill in:
+Open `config_gcp.yaml` in the project root and set the following fields:
 
 | Key | Example value | Notes |
 |---|---|---|
-| `gcp.project` | `my-project-123456` | Your GCP project ID |
-| `gcp.output_bucket` | `indot-nwm` | Globally unique GCS bucket name |
-| `aws.output_bucket` | `indot-bridge-pipeline` | Optional: S3 bucket to push outputs to |
-| `aws.access_key_id` | *(your key)* | Optional: leave blank to use `AWS_ACCESS_KEY_ID` env var |
-| `aws.secret_access_key` | *(your secret)* | Optional: leave blank to use `AWS_SECRET_ACCESS_KEY` env var |
+| `gcp.project` | `positive-harbor-496218-u6` | Your GCP project ID |
+| `gcp.output_bucket` | `indot-nwm` | Globally unique GCS bucket name — must be lowercase |
+| `gcp.output_prefix` | `v1/` | Key prefix for all outputs in GCS |
+| `aws.output_bucket` | `indot-bridge-pipeline` | S3 bucket to push parquets to after each product finishes |
+| `aws.output_prefix` | `v1/` | Must match the prefix used by the AWS pipeline |
+| `aws.region` | `us-east-1` | AWS region where the S3 bucket lives |
+| `aws.access_key_id` | *(your key)* | Leave blank to use the `AWS_ACCESS_KEY_ID` environment variable |
+| `aws.secret_access_key` | *(your secret)* | Leave blank to use `AWS_SECRET_ACCESS_KEY` env var |
 
-> Stage derivation for GCP outputs uses the same `11_derive_stage.py` script run on AWS — see caveat 8 and section 6.5.
+Setting the `aws.output_bucket` is recommended — the script automatically pushes each finished parquet to S3 as soon as it completes, so if the VM is stopped mid-run you won't lose any already-finished products.
+
+Leave `aws.access_key_id` and `aws.secret_access_key` blank and configure them via `aws configure` on the VM instead if you prefer not to store credentials in the YAML file.
 
 ### 9.4 Create GCP resources
 
-Open `setup_gcp_infra.sh`, set `PROJECT_ID` and `BUCKET_NAME` at the top to match your `config_gcp.yaml`, then run from your local machine:
+Open `setup-gcp-infra.ps1` in the project root and set the two variables at the top of the file:
 
-```bash
-bash setup_gcp_infra.sh
+```powershell
+$PROJECT_ID  = "positive-harbor-496218-u6"
+$BUCKET_NAME = "indot-nwm"
 ```
 
-This script (idempotent — safe to re-run):
-- Enables the Compute, Storage, and IAM APIs on your project
-- Creates the GCS output bucket in `us-central1`
-- Creates a service account (`indot-nwm-sa`) with `Storage Object Admin` on the output bucket
-- Launches a Compute Engine VM (`indot-nwm-vm`, `e2-standard-4`, `us-central1-a`, 50 GB SSD) with the service account attached
+`BUCKET_NAME` must match `gcp.output_bucket` in `config_gcp.yaml`. The script auto-detects your `gcloud` installation so it works from any PowerShell window. Run from your **local machine**:
 
-Wait about 60 seconds for the VM to finish booting, then connect:
+```powershell
+.\setup-gcp-infra.ps1
+```
 
-```bash
+If PowerShell blocks execution with a script policy error, run once to allow local scripts:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+The script is idempotent — safe to re-run if interrupted. It will:
+
+1. Set the active gcloud project to `PROJECT_ID`
+2. Enable the Compute Engine, Cloud Storage, and IAM APIs
+3. Create the GCS output bucket in `us-central1` with public access blocked
+4. Create a service account `indot-nwm-sa` and grant it `Storage Object Admin` on the bucket
+5. Launch VM `indot-nwm-vm` (`e2-standard-4`, 4 vCPU / 16 GB RAM, 50 GB SSD, `us-central1-a`) with the service account attached
+
+When it finishes it prints the exact SSH command to use. Verify the VM is running:
+
+```powershell
+gcloud compute instances list --project=YOUR_PROJECT_ID
+```
+
+### 9.5 Connect to the VM
+
+The VM uses OS Login, so no key pair file is needed. Connect directly with:
+
+```powershell
 gcloud compute ssh indot-nwm-vm --zone=us-central1-a --project=YOUR_PROJECT_ID
 ```
 
-### 9.5 Copy the repo to the VM
+If this is the first time connecting, gcloud will generate an SSH key pair automatically and upload your public key to the VM. Wait ~60 seconds after `setup_gcp_infra.sh` finishes before connecting to give the VM time to finish booting.
 
-From your **local machine** (in the directory that contains `indot_pipeline/`):
+### 9.6 Copy the repo to the VM
 
-```bash
-# Option A: copy a local checkout (no GitHub access required)
-gcloud compute scp --recurse indot_pipeline/ indot-nwm-vm:~/ \
+Run this from your **local machine**, in the directory that contains `indot_pipeline/`:
+
+```powershell
+gcloud compute scp --recurse indot_pipeline/ indot-nwm-vm:~/ `
     --zone=us-central1-a --project=YOUR_PROJECT_ID
 ```
 
+Alternatively, clone from GitHub inside the SSH session (requires a fine-grained Personal Access Token with read-only access to the repo — Settings → Developer settings → Personal access tokens → Fine-grained tokens):
+
 ```bash
-# Option B: clone from GitHub (run from inside the SSH session)
 git clone https://YOUR_PAT@github.com/diogosaraujo/indot_pipeline.git
 ```
 
-For option B, create a fine-grained GitHub Personal Access Token with read-only access to the repo (Settings → Developer settings → Personal access tokens → Fine-grained tokens).
+### 9.7 Provision the Python environment
 
-### 9.6 Provision the Python environment on the VM
-
-From inside the SSH session, in the project root:
+From inside the SSH session, change to the project root and run the setup script:
 
 ```bash
+cd indot_pipeline
 bash setup_gcp_vm.sh
 ```
+
+This will (skipping any step already done if re-run):
+1. Download and install Miniforge to `~/miniforge3`
+2. Create the `indot` conda/mamba environment from `environment.yml`
+3. Install `google-cloud-storage` into the environment
+4. Install the AWS CLI v2 (used for optional manual S3 transfer)
 
 When it finishes, initialize the shell and activate the environment:
 
@@ -566,26 +606,40 @@ source ~/.bashrc
 mamba activate indot
 ```
 
-Set the USGS API token (same requirement as the AWS path — see section 6.4):
+These shell-init commands only need to run once per VM. On future SSH reconnections, `mamba activate indot` is all you need.
+
+If you plan to use the S3 push via AWS credentials (rather than embedding them in `config_gcp.yaml`), configure them now:
 
 ```bash
-export API_USGS_PAT=your_token_here
-echo 'export API_USGS_PAT=your_token_here' >> ~/.bashrc
+aws configure
+# Enter: access key ID, secret key, region (us-east-1), output format (json)
 ```
 
-On future SSH reconnections, `mamba activate indot` is all you need.
+### 9.8 Run the GCP scripts
 
-### 9.7 Run the GCP scripts
+Script 01 builds the station inventory and writes it to GCS. Script 10 reads it, resolves COMIDs via NLDI, then extracts the two operational products.
 
 ```bash
-# ~1 minute — writes station inventory to GCS
+# ~1 minute
 python scripts/01_get_stations_gcp.py
 
-# ~6-8 hours — A&A + Open-Loop operational archive (Sep 2018 → present)
+# ~6-8 hours total
 python scripts/10_download_nwm_gcp.py
 ```
 
-Script 10 logs progress to stdout. It is safe to interrupt and resume.
+**Recommended: run script 10 inside a persistent session** so it survives SSH disconnection:
+
+```bash
+# Using tmux (pre-installed on Ubuntu)
+tmux new -s nwm
+mamba activate indot
+python scripts/10_download_nwm_gcp.py
+
+# Detach: Ctrl-B then D
+# Reattach later: tmux attach -t nwm
+```
+
+Script 10 logs progress to stdout. If `aws.output_bucket` is set in `config_gcp.yaml`, each parquet is pushed to S3 immediately after it finishes writing to GCS, so partial runs are not lost.
 
 Expected runtimes:
 
@@ -593,48 +647,86 @@ Expected runtimes:
 |---|---|
 | Station inventory (script 01) | ~1 minute |
 | COMID lookup via NLDI | ~5 minutes |
-| A&A extraction (~67k files) | ~3–4 hours |
-| Open-Loop extraction (~67k files) | ~3–4 hours |
+| A&A extraction (~67,000 files, Sep 2018 → present) | ~3–4 hours |
+| Open-Loop extraction (~67,000 files, Sep 2018 → present) | ~3–4 hours |
 
-### 9.8 Transfer outputs to AWS S3
+To confirm the run succeeded, check the output files in GCS:
 
-**Option A — Automatic push during extraction (recommended)**
+```bash
+gsutil ls -l gs://YOUR_GCS_BUCKET/v1/nwm/
+```
 
-Fill in the `aws` section of `config_gcp.yaml` before running script 10. The script pushes each finished parquet to your S3 bucket immediately after writing it to GCS. Total egress is ~800 MB (~$0.07).
+You should see `comid_locations.parquet`, `analysis_assim.parquet`, and `open_loop.parquet`.
+
+### 9.9 Transfer outputs to AWS S3
+
+**Option A — Automatic push (recommended, configured before the run)**
+
+If `aws.output_bucket` is filled in `config_gcp.yaml`, the script pushes each parquet to S3 automatically. No manual step needed — skip to section 9.10.
 
 **Option B — Manual transfer after the run**
 
-From the VM (with AWS credentials configured via `aws configure` or environment variables):
+From inside the SSH session, with AWS credentials configured (see section 9.7):
 
 ```bash
-# Download all NWM parquets from GCS to the VM
-gsutil -m cp "gs://YOUR_GCS_BUCKET/v1/nwm/*.parquet" ./nwm_outputs/
+# Copy parquets from GCS to the VM's local disk
+mkdir -p ~/nwm_outputs
+gsutil -m cp "gs://YOUR_GCS_BUCKET/v1/nwm/*.parquet" ~/nwm_outputs/
 
-# Upload to S3
-aws s3 cp --recursive ./nwm_outputs/ "s3://YOUR_S3_BUCKET/v1/nwm/"
+# Push to S3
+aws s3 cp --recursive ~/nwm_outputs/ "s3://YOUR_S3_BUCKET/v1/nwm/"
 ```
 
-### 9.9 Teardown
+Verify the files arrived in S3:
 
-Stop the VM when done (the service account and bucket stay in place):
+```bash
+aws s3 ls s3://YOUR_S3_BUCKET/v1/nwm/
+```
+
+Expected files: `comid_locations.parquet`, `analysis_assim.parquet`, `open_loop.parquet`.
+
+### 9.10 Run script 11 on AWS to add stage
+
+Once the operational parquets are in S3 (and after `10_download_nwm.py` has also run on AWS to produce `retrospective.parquet`), SSH to your EC2 instance and run script 11:
+
+```bash
+# Confirm all three source parquets exist
+aws s3 ls s3://YOUR_S3_BUCKET/v1/nwm/
+
+# Set the SRC key in config.yaml first if you haven't yet:
+# nwm:
+#   src_s3_key: "nwm.20240101/domain/HYDRO_TBL_1D.nc"
+# Find the current path with:
+aws s3 ls s3://noaa-nwm-pds/ --no-sign-request | grep "nwm\." | sort | tail -5
+# Then:
+aws s3 ls s3://noaa-nwm-pds/nwm.YYYYMMDD/domain/ --no-sign-request | grep HYDRO_TBL
+
+python scripts/11_derive_stage.py   # ~10-20 min
+```
+
+Script 11 overwrites each parquet in place, adding a `stage_m` column derived by interpolating HAND-based Synthetic Rating Curves from `HYDRO_TBL_1D.nc` on `noaa-nwm-pds`.
+
+### 9.11 Teardown
+
+Stop the GCP VM when done (service account and GCS bucket remain):
 
 ```bash
 gcloud compute instances stop indot-nwm-vm \
     --zone=us-central1-a --project=YOUR_PROJECT_ID
 ```
 
-A stopped VM accrues no compute charges but keeps its disk (~$0.006/hr for 50 GB SSD). To eliminate all ongoing cost, delete the VM:
+A stopped VM accrues no compute charges but its SSD disk continues to cost ~$0.17/month for 50 GB. To eliminate all ongoing cost, delete the VM:
 
 ```bash
 gcloud compute instances delete indot-nwm-vm \
     --zone=us-central1-a --project=YOUR_PROJECT_ID
 ```
 
-Once outputs are confirmed in S3, delete the GCS bucket too:
+Once all outputs are confirmed in S3, delete the GCS bucket:
 
 ```bash
 gsutil rm -r gs://YOUR_GCS_BUCKET
 ```
 
 > **Billing alert:** Set a budget alert so you are notified before credits run out.
-> In the Google Cloud Console go to **Billing → Budgets & alerts → Create budget**, set the amount to $5, and configure email notifications at 80% and 100%. You will receive an email well before this workload's ~$1.50 cost is exceeded.
+> In the Google Cloud Console go to **Billing → Budgets & alerts → Create budget**, set the amount to **$5**, and configure email notifications at 80% and 100%. You will receive an email well before this workload's ~$1.15 cost is exceeded.
