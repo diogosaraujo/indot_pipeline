@@ -8,10 +8,12 @@ historical IV precipitation is not archived for most sites.  Each run
 downloads the window [max(existing_record, now-120d), now] per station.
 
 Station discovery:
-    Queries the USGS NWIS site service for parameterCd=00045 in Indiana and
-    four neighboring states (IL, OH, MI, KY), then filters to the watershed
-    union polygon (Option A).  Falls back to the Indiana bounding box if
-    no watershed GeoJSONs are found in S3.
+    Builds the watershed union from S3 GeoJSONs (Option A), derives its
+    bounding box, and queries the USGS NWIS site service for parameterCd=00045
+    with a single bBox request that automatically covers all states in the
+    watershed (IN, IL, OH, MI, KY, NY, PA, VA, WV, NC, etc.).  Results are
+    then filtered to the exact watershed polygon.  Falls back to the Indiana
+    bounding box if no watershed GeoJSONs are found in S3.
 
 Data download:
     Uses dataretrieval.waterdata.get_continuous() — the same Water Data v3
@@ -27,6 +29,7 @@ Reads:
 
 Writes:
     s3://<bucket>/<prefix>precip/usgs/stations.parquet
+    s3://<bucket>/<prefix>precip/usgs/stations.geojson
     s3://<bucket>/<prefix>precip/usgs/precip_iv.parquet
 
 Schema (precip_iv.parquet):
@@ -40,9 +43,9 @@ Schema (precip_iv.parquet):
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -60,6 +63,7 @@ from utils import (
     load_config,
     s3_client,
     with_retries,
+    write_bytes_to_s3,
     write_parquet_to_s3,
 )
 
@@ -72,52 +76,55 @@ log = logging.getLogger("13_usgs_precip")
 PRECIP_PARAM    = "00045"
 # USGS IV archive retention window
 IV_RETENTION_DAYS = 120
-# States to search: Indiana + neighboring states whose watersheds may overlap
-SEARCH_STATES   = ["IN", "IL", "OH", "MI", "KY"]
 # Indiana bounding box fallback (minlat, minlon, maxlat, maxlon)
 INDIANA_BBOX    = (37.77, -88.10, 41.76, -84.78)
 
 NWIS_SITE_URL   = "https://waterservices.usgs.gov/nwis/site/"
-REQUEST_PAUSE   = 0.5
 
 
 # ── Station inventory ─────────────────────────────────────────────────────────
 
-def fetch_usgs_precip_stations(state_codes: list[str]) -> pd.DataFrame:
-    """Query NWIS site service for IV precipitation gauges in the given states."""
-    records: list[dict] = []
-    for state in state_codes:
-        params = {
-            "format":        "rdb",
-            "stateCd":       state,
-            "parameterCd":   PRECIP_PARAM,
-            "siteType":      "ST",
-            "hasDataTypeCd": "iv",
-            "outputDataTypeCd": "iv",
-        }
-        try:
-            r = requests.get(NWIS_SITE_URL, params=params, timeout=60)
-            r.raise_for_status()
-        except requests.RequestException as e:
-            log.warning("NWIS site query for %s failed: %s", state, e)
-            continue
+def fetch_usgs_precip_stations(
+    bbox: tuple[float, float, float, float],
+) -> pd.DataFrame:
+    """Query NWIS site service for IV precipitation gauges within a bounding box.
 
-        lines = [l for l in r.text.splitlines() if not l.startswith("#")]
-        # lines[0] = header, lines[1] = type row, lines[2+] = data
-        if len(lines) < 3:
-            log.info("State %s: no precipitation sites found.", state)
+    bbox = (west_lon, south_lat, east_lon, north_lat) — matches shapely polygon.bounds.
+    A single bBox request automatically covers all states whose territory falls
+    inside the watershed union (IN, IL, OH, MI, KY, NY, PA, VA, WV, NC, etc.)
+    without requiring a hardcoded state list.
+    """
+    west, south, east, north = bbox
+    params = {
+        "format":           "rdb",
+        "bBox":             f"{west:.4f},{south:.4f},{east:.4f},{north:.4f}",
+        "parameterCd":      PRECIP_PARAM,
+        "siteType":         "ST",
+        "hasDataTypeCd":    "iv",
+        "outputDataTypeCd": "iv",
+    }
+    try:
+        r = requests.get(NWIS_SITE_URL, params=params, timeout=60)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log.warning("NWIS bBox site query failed: %s", e)
+        return pd.DataFrame(columns=["site_no", "station_nm", "latitude", "longitude"])
+
+    lines = [l for l in r.text.splitlines() if not l.startswith("#")]
+    # lines[0] = header, lines[1] = type row, lines[2+] = data
+    if len(lines) < 3:
+        log.info("No precipitation sites found in bbox.")
+        return pd.DataFrame(columns=["site_no", "station_nm", "latitude", "longitude"])
+
+    header = lines[0].split("\t")
+    records: list[dict] = []
+    for line in lines[2:]:
+        if not line.strip():
             continue
-        header = lines[0].split("\t")
-        for line in lines[2:]:
-            if not line.strip():
-                continue
-            parts = line.split("\t")
-            if len(parts) < 2:
-                continue
-            row = dict(zip(header, parts))
-            row["_state"] = state
-            records.append(row)
-        time.sleep(REQUEST_PAUSE)
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        records.append(dict(zip(header, parts)))
 
     if not records:
         return pd.DataFrame(columns=["site_no", "station_nm", "latitude", "longitude"])
@@ -139,8 +146,33 @@ def fetch_usgs_precip_stations(state_codes: list[str]) -> pd.DataFrame:
         "longitude":  pd.to_numeric(df[lon_col], errors="coerce"),
     }).dropna(subset=["latitude", "longitude"])
     out = out.drop_duplicates(subset=["site_no"]).reset_index(drop=True)
-    log.info("NWIS precip inventory: %d unique sites across %s", len(out), state_codes)
+    log.info(
+        "NWIS precip inventory: %d unique sites in bbox "
+        "(S=%.3f W=%.3f → N=%.3f E=%.3f)",
+        len(out), south, west, north, east,
+    )
     return out
+
+
+# ── GeoJSON helpers ───────────────────────────────────────────────────────────
+
+def stations_to_geojson(df: pd.DataFrame) -> bytes:
+    """Serialize a stations DataFrame to a GeoJSON FeatureCollection (UTF-8 bytes)."""
+    features = []
+    for _, row in df.iterrows():
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [row["longitude"], row["latitude"]],
+            },
+            "properties": {
+                "site_no":    row.get("site_no", ""),
+                "station_nm": row.get("station_nm", ""),
+            },
+        })
+    fc = {"type": "FeatureCollection", "features": features}
+    return json.dumps(fc).encode("utf-8")
 
 
 # ── Existing-parquet helpers ──────────────────────────────────────────────────
@@ -260,7 +292,15 @@ def main() -> None:
 
     # ── Station inventory ──────────────────────────────────────────────────
     log.info("Fetching USGS precipitation site inventory...")
-    all_stations = fetch_usgs_precip_stations(SEARCH_STATES)
+    if polygon is not None:
+        # Derive bbox from the actual watershed union — automatically covers all
+        # states in the polygon (IN, IL, OH, MI, KY, NY, PA, VA, WV, NC, etc.)
+        west, south, east, north = polygon.bounds
+        query_bbox = (west, south, east, north)
+    else:
+        # Indiana fallback: convert (minlat, minlon, maxlat, maxlon) → (W, S, E, N)
+        query_bbox = (INDIANA_BBOX[1], INDIANA_BBOX[0], INDIANA_BBOX[3], INDIANA_BBOX[2])
+    all_stations = fetch_usgs_precip_stations(query_bbox)
     stations = filter_by_polygon(all_stations, polygon, fallback_bbox=INDIANA_BBOX)
     log.info("Precipitation sites in watershed: %d / %d", len(stations), len(all_stations))
 
@@ -270,6 +310,10 @@ def main() -> None:
 
     write_parquet_to_s3(stations, bucket, f"{prefix}precip/usgs/stations.parquet")
     log.info("Wrote station inventory: s3://%s/%sprecip/usgs/stations.parquet", bucket, prefix)
+
+    geojson_key = f"{prefix}precip/usgs/stations.geojson"
+    write_bytes_to_s3(stations_to_geojson(stations), bucket, geojson_key)
+    log.info("Wrote station GeoJSON:   s3://%s/%s", bucket, geojson_key)
 
     # ── Data download (concurrent) ─────────────────────────────────────────
     existing = _read_parquet_s3(bucket, f"{prefix}precip/usgs/precip_iv.parquet")

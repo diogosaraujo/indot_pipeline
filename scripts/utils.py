@@ -219,11 +219,17 @@ def build_watershed_union(bucket: str, prefix: str):
     Files written by script 03 are GeoJSON Features saved under
     {prefix}watersheds/per_gauge/{site_no}.geojson.  Returns None if no
     files are found so callers can fall back to a bounding-box approach.
+
+    Large basins (e.g. the Ohio River, which drains NY/PA/VA/WV/NC) are kept
+    intact — they are hydrologically correct.  If unary_union raises a
+    topology exception on the full set, the function falls back to an
+    incremental union that skips any individual polygon that causes an error.
     """
     from shapely.geometry import shape
     from shapely.ops import unary_union
     from shapely.validation import make_valid
 
+    log = logging.getLogger(__name__)
     s3 = s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     ws_prefix = f"{prefix}watersheds/per_gauge/"
@@ -233,7 +239,7 @@ def build_watershed_union(bucket: str, prefix: str):
             if obj["Key"].endswith(".geojson"):
                 keys.append(obj["Key"])
     if not keys:
-        logging.getLogger(__name__).warning("No watershed GeoJSONs found under %s", ws_prefix)
+        log.warning("No watershed GeoJSONs found under %s", ws_prefix)
         return None
 
     polys = []
@@ -252,7 +258,27 @@ def build_watershed_union(bucket: str, prefix: str):
                     polys.append(make_valid(shape(geom)))
         except Exception:
             pass
-    return unary_union(polys) if polys else None
+
+    if not polys:
+        return None
+
+    try:
+        return unary_union(polys)
+    except Exception as e:
+        log.warning(
+            "unary_union failed (%s) — falling back to incremental union; "
+            "any polygon that still causes a topology error will be skipped.", e,
+        )
+        result = polys[0]
+        skipped = 0
+        for p in polys[1:]:
+            try:
+                result = result.union(p)
+            except Exception:
+                skipped += 1
+        if skipped:
+            log.warning("Incremental union skipped %d polygon(s) due to topology errors.", skipped)
+        return result
 
 
 def filter_by_polygon(
