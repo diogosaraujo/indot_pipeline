@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import gzip
+import json
 import logging
 import os
 import time
@@ -210,6 +211,77 @@ def list_mrms_keys_for_day(fs, bucket: str, folder: str, day) -> list[str]:
         return sorted(fs.ls(prefix))
     except FileNotFoundError:
         return []
+
+
+def build_watershed_union(bucket: str, prefix: str):
+    """Union all per-gauge watershed GeoJSONs from S3 into one Shapely polygon.
+
+    Files written by script 03 are GeoJSON Features saved under
+    {prefix}watersheds/per_gauge/{site_no}.geojson.  Returns None if no
+    files are found so callers can fall back to a bounding-box approach.
+    """
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+
+    s3 = s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    ws_prefix = f"{prefix}watersheds/per_gauge/"
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=ws_prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".geojson"):
+                keys.append(obj["Key"])
+    if not keys:
+        logging.getLogger(__name__).warning("No watershed GeoJSONs found under %s", ws_prefix)
+        return None
+
+    polys = []
+    for key in keys:
+        try:
+            body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            feat = json.loads(body)
+            candidates = (
+                feat.get("features", [])
+                if feat.get("type") == "FeatureCollection"
+                else [feat]
+            )
+            for c in candidates:
+                geom = c.get("geometry") if isinstance(c, dict) else None
+                if geom:
+                    polys.append(shape(geom))
+        except Exception:
+            pass
+    return unary_union(polys) if polys else None
+
+
+def filter_by_polygon(
+    df,
+    polygon,
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    fallback_bbox: Optional[tuple] = None,
+):
+    """Return rows of df whose (lat_col, lon_col) fall inside polygon.
+
+    If polygon is None, falls back to a (minlat, minlon, maxlat, maxlon) tuple.
+    Applies a fast bounding-box pre-filter before the exact point-in-polygon test.
+    """
+    if polygon is None:
+        if fallback_bbox is None:
+            return df.copy()
+        minlat, minlon, maxlat, maxlon = fallback_bbox
+        mask = df[lat_col].between(minlat, maxlat) & df[lon_col].between(minlon, maxlon)
+        return df[mask].reset_index(drop=True)
+
+    from shapely.geometry import Point
+
+    minx, miny, maxx, maxy = polygon.bounds
+    bbox_mask = df[lat_col].between(miny, maxy) & df[lon_col].between(minx, maxx)
+    cands = df[bbox_mask].copy()
+    inside = cands.apply(
+        lambda r: polygon.contains(Point(r[lon_col], r[lat_col])), axis=1
+    )
+    return cands[inside].reset_index(drop=True)
 
 
 def parse_mrms_timestamp(key: str):

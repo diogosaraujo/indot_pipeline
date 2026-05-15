@@ -116,6 +116,21 @@ execution:
   checkpoint_dir: ./checkpoints
 
 # ---------------------------------------------------------------------------
+# NOAA precipitation (script 12)
+#
+# cdo_token: free token from https://www.ncdc.noaa.gov/cdo-web/token
+#   Required for COOP Hourly (PRECIP_HLY) station inventory via CDO API.
+#   GHCNh does not require a token (inventory comes from NCEI station-list CSV).
+#
+# start_date: aligns with the MRMS archive so all precip sources cover the
+#   same period.  end_date null = yesterday.
+# ---------------------------------------------------------------------------
+noaa_precip:
+  cdo_token: ""                # paste your CDO token here
+  start_date: "2020-10-14"    # align with MRMS archive start
+  end_date: null               # null = today
+
+# ---------------------------------------------------------------------------
 # NWM stage derivation (script 11)
 #
 # src_s3_bucket / src_s3_key: location of HYDRO_TBL_1D.nc in the noaa-nwm-pds
