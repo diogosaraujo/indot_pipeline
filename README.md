@@ -402,7 +402,7 @@ The CDO token is only needed for COOP Hourly station discovery. The **GHCNh** se
 
 ### 6.9 Run precipitation scripts (12 and 13)
 
-Scripts 12 and 13 are independent of each other and of the NWM scripts. They can run at any point after script 03 has written watershed polygons to S3 (the polygon union is how station selection works). If script 03 has not run yet they fall back to the Indiana bounding box automatically.
+Scripts 12 and 13 are fully independent of each other and of the NWM scripts — they write to separate S3 paths and share no state. Run them in parallel in two terminals to save time. They can run at any point after script 03 has written watershed polygons to S3 (the polygon union is how station selection works). If script 03 has not run yet they fall back to the Indiana bounding box automatically.
 
 **Script 12 — NOAA hourly precipitation (COOP HPD v2 + GHCNh)**
 

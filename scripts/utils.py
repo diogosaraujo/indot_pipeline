@@ -222,6 +222,7 @@ def build_watershed_union(bucket: str, prefix: str):
     """
     from shapely.geometry import shape
     from shapely.ops import unary_union
+    from shapely.validation import make_valid
 
     s3 = s3_client()
     paginator = s3.get_paginator("list_objects_v2")
@@ -248,7 +249,7 @@ def build_watershed_union(bucket: str, prefix: str):
             for c in candidates:
                 geom = c.get("geometry") if isinstance(c, dict) else None
                 if geom:
-                    polys.append(shape(geom))
+                    polys.append(make_valid(shape(geom)))
         except Exception:
             pass
     return unary_union(polys) if polys else None
