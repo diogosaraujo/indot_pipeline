@@ -464,7 +464,7 @@ Precipitation schema (`precip_iv.parquet`):
 | `datetime_utc` | datetime64[ns, UTC] | 15-min or hourly depending on gauge |
 | `precip_in` | float64 | |
 
-> **Re-running for fresh data:** Both scripts are idempotent. Re-run script 13 weekly (or on a cron) to keep the rolling 120-day USGS window current. Re-run script 12 any time to append the latest months to the COOP and GHCNh parquets.
+> **Re-running for fresh data:** Both scripts are idempotent. Re-run script 13 at least once every 120 days — USGS only retains IV data online for that window, so any gap longer than 120 days between runs will permanently lose the intervening records. Re-run script 12 any time to append the latest months to the COOP and GHCNh parquets (those files are archived indefinitely on NCEI, so there is no urgency).
 
 ### 6.10 Cost-saving teardown
 
