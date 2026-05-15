@@ -20,6 +20,8 @@ This repository packages the workflow as a restart-safe AWS data pipeline. It is
 - Retrieves published and regression-based flood-frequency metrics
 - Extracts MRMS precipitation at gauge points and across watersheds
 - Downloads National Water Model streamflow, velocity, nudge, and stage for each gauge
+- Downloads hourly station precipitation from NOAA COOP (HPD v2) and GHCNh for all stations within the watershed union
+- Downloads instantaneous precipitation from USGS gauges (param 00045) within the watershed union
 
 ## Why this repository exists
 
@@ -43,6 +45,12 @@ The project is organized to make a large, multi-source hydrologic acquisition wo
 | NWM Analysis & Assimilation — streamflow, velocity, nudge per gauge | Parquet | 2–8 GB |
 | NWM Open-Loop A&A — streamflow, velocity per gauge | Parquet | 2–8 GB |
 | NWM stage (stage_m added to all three products) | Parquet (overwrites above) | no additional size |
+| NOAA COOP Hourly station inventory (within watershed union) | Parquet | < 1 MB |
+| NOAA GHCNh station inventory (within watershed union) | Parquet | < 1 MB |
+| NOAA COOP Hourly precipitation time series (HPD v2, Oct 2020 → present) | Parquet | ~1–2 GB |
+| NOAA GHCNh hourly precipitation time series (Oct 2020 → present) | Parquet | ~1–2 GB |
+| USGS IV precipitation station inventory (param 00045, within watershed union) | Parquet | < 1 MB |
+| USGS IV precipitation instantaneous values (~120-day rolling window) | Parquet | ~20–50 MB |
 | Aggregate trigger-skill figures (CSI / POD / FAR heatmaps, POD vs FAR scatter, Indiana map) | PNG (S3) | < 5 MB |
 | Per-gauge CSI heatmaps | PNG (S3) | < 50 MB total |
 
@@ -295,6 +303,13 @@ python scripts/10_download_nwm.py                # ~1 hr (retrospective) + ~4 hr
 python scripts/11_derive_stage.py                # ~10-20 min — adds stage_m to all three NWM parquets
 ```
 
+Scripts 12 and 13 require a one-time CDO API token — see section 6.8 below, then run:
+
+```bash
+python scripts/12_download_noaa_precip.py        # ~30-60 min (COOP + GHCNh, watershed stations)
+python scripts/13_download_usgs_precip.py        # ~5-10 min (USGS param 00045, ~120-day window)
+```
+
 Steps 03 and 04 cannot be meaningfully sped up by adding cores — StreamStats limits you to 4 concurrent requests. Steps 05 and 06 *do* scale with CPU; bigger instance = faster. Steps 02, 03, and 04 can run concurrently in three terminals if you want to overlap them.
 
 ### 6.6 Run script 08 — instance resize required
@@ -368,7 +383,90 @@ aws s3 sync s3://indot-bridge-pipeline-<your-id>/v1/analysis/figures/ ./figures/
 
 > **Note on pooled vs per-station metrics:** The aggregate heatmaps (CSI / POD / FAR) are computed from globally pooled TP/FP/FN/TN counts across all stations, not station averages. This avoids giving equal weight to short-record gauges and gauges with few events. The per-station bar charts and map still use each station's individual best-CSI value.
 
-### 6.8 Cost-saving teardown
+### 6.8 NOAA CDO API token (required for script 12 — COOP Hourly)
+
+Script 12 uses the NOAA Climate Data Online (CDO) API to build the COOP Hourly station inventory. The token is **free** and takes about 30 seconds to obtain.
+
+1. Go to `ncdc.noaa.gov/cdo-web/token` and enter your email address.
+2. NOAA will email you a token (a string of letters and digits, ~32 characters).
+3. Open `config.yaml` and paste the token into the `noaa_precip.cdo_token` field:
+
+   ```yaml
+   noaa_precip:
+     cdo_token: "AbCdEfGhIjKlMnOpQrStUvWxYz123456"
+   ```
+
+The CDO token is only needed for COOP Hourly station discovery. The **GHCNh** section of script 12 does not require a token — it downloads the station list directly from NCEI.
+
+> **If you skip the COOP token:** Script 12 will log a warning and skip the COOP Hourly section entirely, running only GHCNh. You can add the token later and re-run — the script is gap-filling and will only download what is missing.
+
+### 6.9 Run precipitation scripts (12 and 13)
+
+Scripts 12 and 13 are independent of each other and of the NWM scripts. They can run at any point after script 03 has written watershed polygons to S3 (the polygon union is how station selection works). If script 03 has not run yet they fall back to the Indiana bounding box automatically.
+
+**Script 12 — NOAA hourly precipitation (COOP HPD v2 + GHCNh)**
+
+```bash
+python scripts/12_download_noaa_precip.py
+```
+
+What it does:
+
+1. Loads all per-gauge watershed GeoJSONs from S3 (`watersheds/per_gauge/`) and unions them into one Shapely polygon.
+2. Queries the CDO API for COOP Hourly stations (`PRECIP_HLY`) within the watershed bounding box, then filters to those whose coordinates actually fall inside the polygon.
+3. Downloads the NCEI GHCNh station-list CSV and applies the same polygon filter.
+4. For each station in both datasets, checks whether a combined parquet already exists in S3. If it does, only data newer than `max(datetime_utc)` per station is downloaded (gap-filling). If no parquet exists, data from `noaa_precip.start_date` (default `2020-10-14`) to today is downloaded.
+5. Writes four objects to S3:
+   - `precip/noaa/stations_coop.parquet` — COOP station inventory
+   - `precip/noaa/stations_ghcnh.parquet` — GHCNh station inventory
+   - `precip/noaa/coop_hourly.parquet` — COOP hourly time series (all stations combined)
+   - `precip/noaa/ghcnh_hourly.parquet` — GHCNh hourly time series (all stations combined)
+
+Downloads run concurrently (`max_workers_io` threads). Expected station counts for Indiana's watershed union: ~100–180 COOP stations, ~60–100 GHCNh stations.
+
+Precipitation schema (`coop_hourly.parquet` and `ghcnh_hourly.parquet`):
+
+| Column | Type | Notes |
+|---|---|---|
+| `station_id` | str | CDO format `COOP:XXXXXX` for COOP; NCEI ID for GHCNh |
+| `name` | str | Station name |
+| `latitude` | float64 | |
+| `longitude` | float64 | |
+| `datetime_utc` | datetime64[ns, UTC] | Hourly |
+| `precip_in` | float64 | Trace stored as 0.001; NaN = missing |
+
+**Script 13 — USGS instantaneous precipitation (param 00045)**
+
+```bash
+python scripts/13_download_usgs_precip.py
+```
+
+What it does:
+
+1. Queries the USGS NWIS site service for IV precipitation gauges (`parameterCd=00045`) in Indiana plus four neighboring states (IL, OH, MI, KY).
+2. Filters to stations within the watershed union polygon (same polygon-union approach as script 12).
+3. Checks the existing parquet in S3 for the per-station data horizon. USGS IV records are only retained online for approximately 120 days, so the effective download window is `[max(last_known + 1h, now − 120 days), now]`.
+4. Downloads data via `waterdata.get_continuous()` — the same Water Data v3 endpoint used by script 02.
+5. Writes two objects to S3:
+   - `precip/usgs/stations.parquet` — station inventory
+   - `precip/usgs/precip_iv.parquet` — instantaneous precipitation time series
+
+The script re-uses the `API_USGS_PAT` environment variable set in section 6.4 — no additional token needed.
+
+Precipitation schema (`precip_iv.parquet`):
+
+| Column | Type | Notes |
+|---|---|---|
+| `site_no` | str | USGS site number |
+| `station_nm` | str | Station name |
+| `latitude` | float64 | |
+| `longitude` | float64 | |
+| `datetime_utc` | datetime64[ns, UTC] | 15-min or hourly depending on gauge |
+| `precip_in` | float64 | |
+
+> **Re-running for fresh data:** Both scripts are idempotent. Re-run script 13 weekly (or on a cron) to keep the rolling 120-day USGS window current. Re-run script 12 any time to append the latest months to the COOP and GHCNh parquets.
+
+### 6.10 Cost-saving teardown
 
 When step 06 finishes:
 
