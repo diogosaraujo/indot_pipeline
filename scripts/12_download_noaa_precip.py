@@ -77,16 +77,18 @@ log = logging.getLogger("12_noaa_precip")
 ISD_HISTORY_URL  = "https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv"
 LCD_DATA_BASE    = "https://www.ncei.noaa.gov/data/local-climatological-data/access"
 
-# Try multiple known GHCNh paths — NCEI occasionally moves files between prefixes
+# GHCNh station list — primary URL confirmed working as of 2025; legacy paths kept
+# as fallbacks in case NCEI reorganizes again.
 GHCNH_LIST_URLS = [
+    "https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/doc/ghcnh-station-list.csv",
     "https://www.ncei.noaa.gov/data/global-historical-climatology-network-hourly/doc/ghcnh-station-list.csv",
     "https://www.ncei.noaa.gov/pub/data/ghcn/hourly/ghcnh-station-list.csv",
-    "https://www.ncei.noaa.gov/oa/climate/ghcn/hourly/ghcnh-station-list.csv",
 ]
-GHCNH_DATA_BASES = [
-    "https://www.ncei.noaa.gov/data/global-historical-climatology-network-hourly/access",
-    "https://www.ncei.noaa.gov/pub/data/ghcn/hourly/access",
-]
+# Per-year PSV files: {GHCNH_DATA_BASE}/{YEAR}/psv/GHCNh_{STATIONID}_{YEAR}.psv
+GHCNH_DATA_BASE = (
+    "https://www.ncei.noaa.gov/oa/global-historical-climatology-network"
+    "/hourly/access/by-year"
+)
 
 # Indiana bounding box fallback (minlat, minlon, maxlat, maxlon)
 INDIANA_BBOX = (37.77, -88.10, 41.76, -84.78)
@@ -151,7 +153,7 @@ def fetch_ghcnh_stations() -> pd.DataFrame:
         df = pd.read_csv(io.StringIO(r.text), dtype=str)
         df.columns = [c.strip().upper() for c in df.columns]
 
-        id_col  = next((c for c in df.columns if c in ("ID", "STATION_ID", "STATIONID")), None)
+        id_col  = next((c for c in df.columns if c in ("GHCN_ID", "ID", "STATION_ID", "STATIONID")), None)
         lat_col = next((c for c in df.columns if c in ("LATITUDE", "LAT")), None)
         lon_col = next((c for c in df.columns if c in ("LONGITUDE", "LON")), None)
         nm_col  = next((c for c in df.columns if "NAME" in c), None)
@@ -267,46 +269,62 @@ def download_lcd_station(
 def download_ghcnh_station(
     station_id: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp
 ) -> Optional[pd.DataFrame]:
-    """Try each known GHCNh data base URL until one returns data."""
-    for base in GHCNH_DATA_BASES:
-        url = f"{base}/{station_id}.csv"
+    """Download GHCNh per-year PSV files for each year in [start_dt, end_dt].
+
+    NCEI reorganised GHCNh in 2024: data is now split by calendar year and
+    served as pipe-separated files at:
+      {GHCNH_DATA_BASE}/{YEAR}/psv/GHCNh_{STATIONID}_{YEAR}.psv
+    """
+    frames: list[pd.DataFrame] = []
+    for year in range(start_dt.year, end_dt.year + 1):
+        url = f"{GHCNH_DATA_BASE}/{year}/psv/GHCNh_{station_id}_{year}.psv"
         try:
-            r = requests.get(url, timeout=120)
+            r = requests.get(url, timeout=180)
             if r.status_code == 404:
                 continue
             r.raise_for_status()
-        except requests.RequestException:
+        except requests.RequestException as e:
+            log.debug("GHCNh %s %d: %s", station_id, year, e)
             continue
 
         try:
-            raw = pd.read_csv(io.StringIO(r.text), low_memory=False)
-        except Exception:
+            raw = pd.read_csv(io.StringIO(r.text), sep="|", low_memory=False)
+        except Exception as e:
+            log.debug("GHCNh %s %d: parse error %s", station_id, year, e)
             continue
 
         raw.columns = [c.strip() for c in raw.columns]
-        date_col = _find_col(raw.columns, ["DATE", "DATE_TIME", "DATETIME"])
+        date_col = _find_col(
+            raw.columns,
+            ["DATE", "date", "DATE_TIME", "DATETIME", "datetime"],
+        )
         prcp_col = _find_col(
             raw.columns,
-            ["HourlyPrecipitation", "precipitation_amount", "PRCP",
-             "PCP01", "PRECIPITATION", "P01I"],
+            ["precipitation_amount", "HourlyPrecipitation", "PRCP",
+             "PCP01", "PRECIPITATION", "P01I", "p01i", "HPCP"],
         )
         if date_col is None or prcp_col is None:
-            log.debug("GHCNh %s: no date/precip column in %s", station_id, list(raw.columns)[:8])
+            log.debug(
+                "GHCNh %s %d: no date/precip column — found %s",
+                station_id, year, list(raw.columns)[:10],
+            )
             continue
 
         raw[date_col] = pd.to_datetime(raw[date_col], utc=True, errors="coerce")
         raw = raw.dropna(subset=[date_col])
         raw = raw[(raw[date_col] >= start_dt) & (raw[date_col] <= end_dt)]
         if raw.empty:
-            return None
+            continue
 
-        return pd.DataFrame({
+        frames.append(pd.DataFrame({
             "station_id":   station_id,
             "datetime_utc": raw[date_col].values,
             "precip_in":    _parse_precip(raw[prcp_col]).values,
-        }).dropna(subset=["datetime_utc"]).reset_index(drop=True)
+        }))
 
-    return None
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True).dropna(subset=["datetime_utc"]).reset_index(drop=True)
 
 
 # ── Concurrent download orchestration ────────────────────────────────────────
