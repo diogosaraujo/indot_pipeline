@@ -249,13 +249,26 @@ def _extract_one_hour(
                 if len(idx) == 0:
                     return None
                 idx = np.sort(idx)
+                # h5py does not auto-apply NetCDF scale_factor/add_offset;
+                # read them explicitly. Confirmed from NWM files:
+                # streamflow, velocity, nudge all use scale_factor=0.01, add_offset=0.
+                def _sf(name):
+                    attrs = h[name].attrs
+                    sf  = float(attrs["scale_factor"]) if "scale_factor" in attrs else 1.0
+                    off = float(attrs["add_offset"])   if "add_offset"   in attrs else 0.0
+                    return sf, off
+
+                def _decode(name):
+                    sf, off = _sf(name)
+                    return h[name][idx].astype(float) * sf + off
+
                 df  = pd.DataFrame({
                     "comid":          all_ids[idx].astype(int),
-                    "streamflow_cms": h["streamflow"][idx].astype(float),
-                    "velocity_ms":    h["velocity"][idx].astype(float),
+                    "streamflow_cms": _decode("streamflow"),
+                    "velocity_ms":    _decode("velocity"),
                 })
                 if product == "analysis_assim" and "nudge" in h:
-                    df["nudge_cms"] = h["nudge"][idx].astype(float)
+                    df["nudge_cms"] = _decode("nudge")
                 df["datetime_utc"] = ts
                 return df
     except Exception as e:
