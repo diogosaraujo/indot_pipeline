@@ -386,13 +386,16 @@ def main() -> None:
         active_site_nos = set(
             final_df.loc[final_df["datetime_utc"].dt.year >= 2026, "site_no"].unique()
         )
+        meta_cols = [c for c in ["site_no", "station_nm", "latitude", "longitude"]
+                     if c in final_df.columns]
         active_stations = (
-            stations[stations["site_no"].isin(active_site_nos)]
+            final_df.loc[final_df["site_no"].isin(active_site_nos), meta_cols]
+            .drop_duplicates(subset=["site_no"])
             .reset_index(drop=True)
         )
         log.info(
             "Active stations (2026 data): %d / %d",
-            len(active_stations), len(stations),
+            len(active_stations), final_df["site_no"].nunique(),
         )
         write_parquet_to_s3(
             active_stations, bucket, f"{prefix}precip/usgs/stations_active.parquet"
