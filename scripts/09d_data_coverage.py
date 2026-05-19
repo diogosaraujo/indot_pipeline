@@ -16,7 +16,6 @@ from datetime import timezone
 import boto3
 import botocore.exceptions
 import matplotlib.dates as mdates
-import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import pandas as pd
 import pyarrow.parquet as pq
@@ -117,15 +116,6 @@ def build_figure(rows: list[dict]) -> plt.Figure:
     ax.set_title("INDOT Pipeline — Data Coverage by Dataset\n"
                  "(date ranges read from S3 parquets)", fontsize=12, fontweight="bold")
 
-    # Legend
-    legend_items = [
-        mpatches.Patch(color="#2E86C1", alpha=0.88, label="USGS Streamflow"),
-        mpatches.Patch(color="#E67E22", alpha=0.88, label="MRMS Precipitation"),
-        mpatches.Patch(color="#27AE60", alpha=0.88, label="NWM Streamflow model"),
-        mpatches.Patch(color="#8E44AD", alpha=0.88, label="Supplementary Precipitation"),
-        mpatches.Patch(color="#7F8C8D", alpha=0.88, label="Analysis output"),
-    ]
-    ax.legend(handles=legend_items, loc="lower right", fontsize=8.5, framealpha=0.9)
 
     fig.tight_layout(pad=1.2)
     return fig
