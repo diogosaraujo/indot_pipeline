@@ -1,26 +1,27 @@
 """09_figures.py
 
 Generate summary figures from the trigger analysis results produced by
-script 08.  Figures are written as PNG files to:
+script 08.  All figures are produced separately for each MRMS source
+(nearest_pixel, watershed_mean).  Figures are written as PNG files to:
 
     s3://<bucket>/<prefix>analysis/figures/
     s3://<bucket>/<prefix>analysis/figures/stations/   (per-gauge)
 
-Figures produced
-----------------
-Aggregate (averaged across all stations):
-    csi_heatmap_Q{rp}.png        Mean CSI by duration × precip return period
-    pod_heatmap_Q{rp}.png        Mean POD by duration × precip return period
-    far_heatmap_Q{rp}.png        Mean FAR by duration × precip return period
-    pod_vs_far_Q{rp}.png         POD vs FAR scatter (colour = duration)
-    best_csi_per_station.png     Best achievable CSI bar chart per gauge
-    best_combo_per_station.png   Best (duration, precip_rp) combo per gauge
-    map_best_csi.png             Indiana map of gauges coloured by best CSI
+Figures produced (suffix = nearest_pixel or watershed_mean)
+------------------------------------------------------------
+Aggregate:
+    csi_heatmap_Q{rp}_{suffix}.png         Pooled CSI by duration × precip_rp
+    pod_heatmap_Q{rp}_{suffix}.png         Pooled POD by duration × precip_rp
+    far_heatmap_Q{rp}_{suffix}.png         Pooled FAR by duration × precip_rp
+    pod_vs_far_Q{rp}_{suffix}.png          POD vs FAR scatter (colour = duration)
+    best_csi_per_station_{suffix}.png      Best achievable CSI bar chart
+    best_combo_per_station_{suffix}.png    Best (duration, precip_rp) combo
+    map_csi_{suffix}.png                   Map: best CSI per station
+    map_pod_{suffix}.png                   Map: POD at best-CSI trigger
+    map_far_{suffix}.png                   Map: FAR at best-CSI trigger
 
 Per gauge (figures/stations/):
-    {site_no}_csi.png            CSI heatmap for Q10 and Q50 side by side
-
-A text summary of the overall skill scores is printed to the log.
+    {site_no}_{suffix}.png                 CSI, POD, FAR heatmaps (Q10 and Q50)
 """
 from __future__ import annotations
 
@@ -55,6 +56,8 @@ DURATION_LABELS = {
     168: "7 d", 240: "10 d", 480: "20 d", 720: "30 d",
     1080: "45 d", 1440: "60 d",
 }
+
+METRIC_CMAP = {"CSI": "YlOrRd", "POD": "Greens", "FAR": "Reds"}
 
 
 # ---------- I/O helpers ----------
@@ -96,7 +99,6 @@ def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df["POD"] = df["tp"] / (df["tp"] + df["fn"] + EPS)
     df["FAR"] = df["fp"] / (df["tp"] + df["fp"] + EPS)
     df["CSI"] = df["tp"] / (df["tp"] + df["fp"] + df["fn"] + EPS)
-    # Flag degenerate rows: no events AND no triggers → metrics are meaningless
     df["degenerate"] = (df["tp"] == 0) & (df["fn"] == 0) & (df["fp"] == 0)
     return df
 
@@ -108,7 +110,7 @@ def _duration_tick_labels(index):
 
 
 def _pool_metrics(df: pd.DataFrame, groupby_cols: list[str]) -> pd.DataFrame:
-    """Sum raw TP/FP/FN counts by groupby_cols, then derive metrics from pooled totals."""
+    """Sum raw TP/FP/FN by groupby_cols, then derive metrics from pooled totals."""
     counts = df.groupby(groupby_cols)[["tp", "fp", "fn"]].sum().reset_index()
     counts["POD"] = counts["tp"] / (counts["tp"] + counts["fn"] + EPS)
     counts["FAR"] = counts["fp"] / (counts["tp"] + counts["fp"] + EPS)
@@ -116,15 +118,18 @@ def _pool_metrics(df: pd.DataFrame, groupby_cols: list[str]) -> pd.DataFrame:
     return counts
 
 
-def _csi_heatmap_ax(ax, data: pd.DataFrame, flow_rp: int, title: str) -> None:
+def _metric_heatmap_ax(
+    ax, data: pd.DataFrame, flow_rp: int, metric: str, title: str
+) -> None:
+    cmap = METRIC_CMAP.get(metric, "YlOrRd")
     sub = data[data["flow_rp_yr"] == flow_rp]
-    pivot = sub.groupby(["duration_hr", "precip_rp_yr"])["CSI"].mean().unstack()
+    pivot = sub.groupby(["duration_hr", "precip_rp_yr"])[metric].mean().unstack()
     pivot.index = _duration_tick_labels(pivot.index)
     sns.heatmap(
         pivot,
         annot=True,
         fmt=".2f",
-        cmap="YlOrRd",
+        cmap=cmap,
         vmin=0.0,
         vmax=1.0,
         linewidths=0.4,
@@ -144,8 +149,9 @@ def heatmap_fig(
     df: pd.DataFrame,
     metric: str,
     flow_rp: int,
-    cmap: str,
+    src_label: str,
 ) -> plt.Figure:
+    cmap = METRIC_CMAP.get(metric, "YlOrRd")
     sub = df[df["flow_rp_yr"] == flow_rp]
     pooled = _pool_metrics(sub, ["duration_hr", "precip_rp_yr"])
     pivot = pooled.set_index("duration_hr")[["precip_rp_yr", metric]]
@@ -163,9 +169,8 @@ def heatmap_fig(
         linewidths=0.4,
         ax=ax,
     )
-    sources = ", ".join(df["mrms_source"].unique())
     ax.set_title(
-        f"{metric} (pooled counts) — flow threshold Q{flow_rp}  |  MRMS source: {sources}",
+        f"{metric} (pooled counts) — flow threshold Q{flow_rp}  |  MRMS: {src_label}",
         fontsize=12,
     )
     ax.set_xlabel("Precip Return Period (yr)", fontsize=10)
@@ -175,7 +180,7 @@ def heatmap_fig(
     return fig
 
 
-def pod_vs_far_fig(df: pd.DataFrame, flow_rp: int) -> plt.Figure:
+def pod_vs_far_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.Figure:
     sub = df[df["flow_rp_yr"] == flow_rp]
     agg = _pool_metrics(sub, ["duration_hr", "precip_rp_yr"])
 
@@ -200,9 +205,8 @@ def pod_vs_far_fig(df: pd.DataFrame, flow_rp: int) -> plt.Figure:
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel("False Alarm Ratio (FAR)", fontsize=10)
     ax.set_ylabel("Probability of Detection (POD)", fontsize=10)
-    sources = ", ".join(df["mrms_source"].unique())
     ax.set_title(
-        f"POD vs FAR — flow threshold Q{flow_rp}  |  MRMS source: {sources}",
+        f"POD vs FAR — flow threshold Q{flow_rp}  |  MRMS: {src_label}",
         fontsize=11,
     )
     ax.legend(fontsize=8)
@@ -210,7 +214,7 @@ def pod_vs_far_fig(df: pd.DataFrame, flow_rp: int) -> plt.Figure:
     return fig
 
 
-def best_csi_per_station_fig(df: pd.DataFrame) -> plt.Figure:
+def best_csi_per_station_fig(df: pd.DataFrame, src_label: str) -> plt.Figure:
     best = df.groupby("site_no")["CSI"].max().sort_values(ascending=False)
     n = len(best)
 
@@ -220,32 +224,42 @@ def best_csi_per_station_fig(df: pd.DataFrame) -> plt.Figure:
     ax.set_xticks(range(n))
     ax.set_xticklabels(best.index, rotation=90, fontsize=7)
     ax.set_ylabel("Best CSI (any combination)")
-    ax.set_title("Best achievable CSI per gauge  (green ≥ 0.3 | orange ≥ 0.1 | red < 0.1)")
+    ax.set_title(
+        f"Best achievable CSI per gauge — MRMS: {src_label}\n"
+        "(green ≥ 0.3 | orange ≥ 0.1 | red < 0.1)"
+    )
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
     ax.set_xlim(-0.5, n - 0.5)
     ax.grid(axis="y", alpha=0.3)
     return fig
 
 
-def best_combo_per_station_fig(df: pd.DataFrame) -> plt.Figure:
+def best_combo_per_station_fig(df: pd.DataFrame, src_label: str) -> plt.Figure:
     """For each station show which (duration, precip_rp, flow_rp) gave the best CSI."""
     idx = df.groupby("site_no")["CSI"].idxmax()
     best = df.loc[idx, ["site_no", "duration_hr", "precip_rp_yr", "flow_rp_yr", "CSI"]].copy()
     best["duration_label"] = best["duration_hr"].map(DURATION_LABELS)
-    best["combo"] = best["duration_label"] + " / " + best["precip_rp_yr"].astype(str) + "yr / Q" + best["flow_rp_yr"].astype(str)
+    best["combo"] = (
+        best["duration_label"] + " / "
+        + best["precip_rp_yr"].astype(str) + "yr / Q"
+        + best["flow_rp_yr"].astype(str)
+    )
     best = best.sort_values("CSI", ascending=True)
 
     n = len(best)
     fig, ax = plt.subplots(figsize=(8, max(6, n * 0.22)))
     colors = ["#2ecc71" if v >= 0.3 else "#e67e22" if v >= 0.1 else "#e74c3c" for v in best["CSI"]]
-    bars = ax.barh(range(n), best["CSI"], color=colors, edgecolor="none")
+    ax.barh(range(n), best["CSI"], color=colors, edgecolor="none")
     ax.set_yticks(range(n))
     ax.set_yticklabels(
         [f"{row.site_no}  ({row.combo})" for _, row in best.iterrows()],
         fontsize=7,
     )
     ax.set_xlabel("Best CSI")
-    ax.set_title("Best trigger combination per gauge\n(duration / precip return period / flow threshold)")
+    ax.set_title(
+        f"Best trigger combination per gauge — MRMS: {src_label}\n"
+        "(duration / precip return period / flow threshold)"
+    )
     ax.axvline(0.3, color="#2ecc71", linestyle="--", linewidth=0.8, alpha=0.6)
     ax.axvline(0.1, color="#e67e22", linestyle="--", linewidth=0.8, alpha=0.6)
     ax.grid(axis="x", alpha=0.3)
@@ -253,18 +267,31 @@ def best_combo_per_station_fig(df: pd.DataFrame) -> plt.Figure:
     return fig
 
 
-def map_best_csi_fig(df: pd.DataFrame, stations: pd.DataFrame) -> plt.Figure:
-    best = df.groupby("site_no")["CSI"].max().reset_index()
+def map_metric_at_best_csi_fig(
+    df: pd.DataFrame,
+    stations: pd.DataFrame,
+    metric: str,
+    src_label: str,
+) -> plt.Figure:
+    """Map stations coloured by `metric` evaluated at each station's best-CSI trigger."""
+    idx = df.groupby("site_no")["CSI"].idxmax()
+    best = df.loc[idx, ["site_no", "CSI", "POD", "FAR"]].copy()
     merged = stations.merge(best, on="site_no", how="inner")
 
-    fig, ax = plt.subplots(figsize=(7, 9))
-    norm = mcolors.Normalize(vmin=0, vmax=max(0.3, merged["CSI"].max()))
-    cmap = plt.get_cmap("RdYlGn")
+    # FAR: lower = better → reversed colormap
+    cmap = "RdYlGn" if metric in ("CSI", "POD") else "RdYlGn_r"
+    labels = {
+        "CSI": "Best CSI (any trigger)",
+        "POD": "POD at best-CSI trigger",
+        "FAR": "FAR at best-CSI trigger",
+    }
 
+    fig, ax = plt.subplots(figsize=(7, 9))
+    norm = mcolors.Normalize(vmin=0, vmax=1)
     sc = ax.scatter(
         merged["dec_long_va"],
         merged["dec_lat_va"],
-        c=merged["CSI"],
+        c=merged[metric],
         cmap=cmap,
         norm=norm,
         s=60,
@@ -273,22 +300,30 @@ def map_best_csi_fig(df: pd.DataFrame, stations: pd.DataFrame) -> plt.Figure:
         zorder=3,
     )
     cbar = fig.colorbar(sc, ax=ax, pad=0.02, shrink=0.7)
-    cbar.set_label("Best CSI (any combination)", fontsize=9)
+    cbar.set_label(labels[metric], fontsize=9)
 
-    # Annotate stations with notably good CSI
-    for _, row in merged[merged["CSI"] >= 0.3].iterrows():
-        ax.annotate(
-            row["site_no"],
-            (row["dec_long_va"], row["dec_lat_va"]),
-            textcoords="offset points",
-            xytext=(5, 3),
-            fontsize=6,
-            color="black",
-        )
+    # Annotate stations with notably good skill
+    for _, row in merged.iterrows():
+        if metric == "FAR":
+            annotate = row[metric] <= 0.3
+        else:
+            annotate = row[metric] >= 0.3
+        if annotate:
+            ax.annotate(
+                row["site_no"],
+                (row["dec_long_va"], row["dec_lat_va"]),
+                textcoords="offset points",
+                xytext=(5, 3),
+                fontsize=6,
+                color="black",
+            )
 
     ax.set_xlabel("Longitude", fontsize=9)
     ax.set_ylabel("Latitude", fontsize=9)
-    ax.set_title("Indiana gauges — best achievable CSI\n(red = poor, green = skilful)", fontsize=11)
+    ax.set_title(
+        f"{labels[metric]}\nMRMS: {src_label}",
+        fontsize=11,
+    )
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
     return fig
@@ -296,21 +331,31 @@ def map_best_csi_fig(df: pd.DataFrame, stations: pd.DataFrame) -> plt.Figure:
 
 # ---------- Per-station figures ----------
 
-def station_csi_fig(site_no: str, station_nm: str, df_site: pd.DataFrame) -> plt.Figure:
+def station_metrics_fig(
+    site_no: str,
+    station_nm: str,
+    df_site: pd.DataFrame,
+    src_label: str,
+) -> plt.Figure:
+    """CSI, POD, FAR heatmaps (rows) × flow thresholds (columns) for one station."""
     flow_rps = sorted(df_site["flow_rp_yr"].unique())
+    metrics = ["CSI", "POD", "FAR"]
     ncols = len(flow_rps)
-    fig, axes = plt.subplots(1, ncols, figsize=(9 * ncols, 6))
+    nrows = len(metrics)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(9 * ncols, 5 * nrows))
     if ncols == 1:
-        axes = [axes]
+        axes = axes.reshape(-1, 1)
 
-    for ax, flow_rp in zip(axes, flow_rps):
-        title = f"Q{flow_rp} threshold"
-        _csi_heatmap_ax(ax, df_site, flow_rp, title)
+    for row_i, metric in enumerate(metrics):
+        for col_i, flow_rp in enumerate(flow_rps):
+            ax = axes[row_i, col_i]
+            _metric_heatmap_ax(ax, df_site, flow_rp, metric, f"{metric} — Q{flow_rp}")
 
-    sources = ", ".join(df_site["mrms_source"].unique())
     n_events = int(df_site["tp"].max() + df_site["fn"].max())
     fig.suptitle(
-        f"CSI — Station {site_no}  |  {station_nm}\nMRMS: {sources}  |  max flow events detected/missed: {n_events}",
+        f"Station {site_no}  |  {station_nm}\n"
+        f"MRMS: {src_label}  |  max flow events detected/missed: {n_events}",
         fontsize=11,
         y=1.01,
     )
@@ -320,7 +365,7 @@ def station_csi_fig(site_no: str, station_nm: str, df_site: pd.DataFrame) -> plt
 
 # ---------- Summary log ----------
 
-def log_summary(df: pd.DataFrame) -> None:
+def log_summary(df: pd.DataFrame, src_label: str) -> None:
     tp = df["tp"].sum()
     fp = df["fp"].sum()
     fn = df["fn"].sum()
@@ -334,7 +379,7 @@ def log_summary(df: pd.DataFrame) -> None:
     best_csi = float(best_row["CSI"])
 
     n_degen = df[df["degenerate"]]["site_no"].nunique()
-    log.info("── Overall skill (all combos aggregated) ──────────────────")
+    log.info("── Overall skill — MRMS: %s ────────────────────────────", src_label)
     log.info("  POD : %.3f", pod)
     log.info("  FAR : %.3f", far)
     log.info("  CSI : %.3f", csi)
@@ -342,10 +387,8 @@ def log_summary(df: pd.DataFrame) -> None:
         "  Best avg CSI combo: duration=%dh  precip_rp=%dyr  flow_rp=Q%d  CSI=%.3f",
         best_idx[0], best_idx[1], best_idx[2], best_csi,
     )
-    log.info(
-        "  Stations with no events AND no triggers (degenerate rows): %d", n_degen
-    )
-    log.info("───────────────────────────────────────────────────────────")
+    log.info("  Stations with degenerate rows (no events, no triggers): %d", n_degen)
+    log.info("────────────────────────────────────────────────────────────")
 
 
 # ---------- Main ----------
@@ -356,53 +399,62 @@ def main() -> None:
     prefix = cfg["aws"]["output_prefix"]
 
     log.info("Loading trigger_analysis.parquet from S3...")
-    df = load_trigger_analysis(bucket, prefix)
-    log.info("Loaded %d rows, %d stations", len(df), df["site_no"].nunique())
-
-    df = add_metrics(df)
-    log_summary(df)
+    df_all = load_trigger_analysis(bucket, prefix)
+    df_all = add_metrics(df_all)
+    log.info("Loaded %d rows, %d stations", len(df_all), df_all["site_no"].nunique())
 
     log.info("Loading station coordinates from S3...")
     stations = load_stations(bucket, prefix)
 
-    # ── Aggregate figures ──────────────────────────────────────────────
-    for flow_rp in sorted(df["flow_rp_yr"].unique()):
-        log.info("Generating aggregate figures for Q%d...", flow_rp)
+    sources = sorted(df_all["mrms_source"].unique())
+    log.info("MRMS sources found: %s", sources)
 
-        fig = heatmap_fig(df, "CSI", flow_rp, cmap="YlOrRd")
-        save_figure(fig, bucket, f"{prefix}{FIGURES_PREFIX}csi_heatmap_Q{flow_rp}.png")
+    for src_key in sources:
+        df = df_all[df_all["mrms_source"] == src_key].copy()
+        src_label = src_key.replace("_", " ").title()
+        sfx = src_key  # file suffix, e.g. "nearest_pixel"
+        log.info("── Generating figures for MRMS source: %s (%d rows) ──", src_label, len(df))
 
-        fig = heatmap_fig(df, "POD", flow_rp, cmap="Greens")
-        save_figure(fig, bucket, f"{prefix}{FIGURES_PREFIX}pod_heatmap_Q{flow_rp}.png")
+        log_summary(df, src_label)
 
-        fig = heatmap_fig(df, "FAR", flow_rp, cmap="Reds")
-        save_figure(fig, bucket, f"{prefix}{FIGURES_PREFIX}far_heatmap_Q{flow_rp}.png")
+        # ── Aggregate figures ────────────────────────────────────────────
+        for flow_rp in sorted(df["flow_rp_yr"].unique()):
+            log.info("  Aggregate figures Q%d...", flow_rp)
+            for metric in ("CSI", "POD", "FAR"):
+                fig = heatmap_fig(df, metric, flow_rp, src_label)
+                save_figure(fig, bucket,
+                            f"{prefix}{FIGURES_PREFIX}{metric.lower()}_heatmap_Q{flow_rp}_{sfx}.png")
 
-        fig = pod_vs_far_fig(df, flow_rp)
-        save_figure(fig, bucket, f"{prefix}{FIGURES_PREFIX}pod_vs_far_Q{flow_rp}.png")
+            fig = pod_vs_far_fig(df, flow_rp, src_label)
+            save_figure(fig, bucket,
+                        f"{prefix}{FIGURES_PREFIX}pod_vs_far_Q{flow_rp}_{sfx}.png")
 
-    fig = best_csi_per_station_fig(df)
-    save_figure(fig, bucket, f"{prefix}{FIGURES_PREFIX}best_csi_per_station.png")
+        fig = best_csi_per_station_fig(df, src_label)
+        save_figure(fig, bucket,
+                    f"{prefix}{FIGURES_PREFIX}best_csi_per_station_{sfx}.png")
 
-    fig = best_combo_per_station_fig(df)
-    save_figure(fig, bucket, f"{prefix}{FIGURES_PREFIX}best_combo_per_station.png")
+        fig = best_combo_per_station_fig(df, src_label)
+        save_figure(fig, bucket,
+                    f"{prefix}{FIGURES_PREFIX}best_combo_per_station_{sfx}.png")
 
-    fig = map_best_csi_fig(df, stations)
-    save_figure(fig, bucket, f"{prefix}{FIGURES_PREFIX}map_best_csi.png")
+        for metric in ("CSI", "POD", "FAR"):
+            fig = map_metric_at_best_csi_fig(df, stations, metric, src_label)
+            save_figure(fig, bucket,
+                        f"{prefix}{FIGURES_PREFIX}map_{metric.lower()}_{sfx}.png")
 
-    # ── Per-station figures ────────────────────────────────────────────
-    station_map = stations.set_index("site_no")["station_nm"].to_dict()
-    stations_in_df = sorted(df["site_no"].unique())
-    log.info("Generating per-station CSI figures for %d stations...", len(stations_in_df))
+        # ── Per-station figures ──────────────────────────────────────────
+        station_map = stations.set_index("site_no")["station_nm"].to_dict()
+        stations_in_df = sorted(df["site_no"].unique())
+        log.info("  Per-station figures: %d stations...", len(stations_in_df))
 
-    for i, site_no in enumerate(stations_in_df, 1):
-        df_site = df[df["site_no"] == site_no]
-        station_nm = station_map.get(site_no, "")
-        fig = station_csi_fig(site_no, station_nm, df_site)
-        key = f"{prefix}{STATIONS_PREFIX}{site_no}_csi.png"
-        save_figure(fig, bucket, key)
-        if i % 10 == 0:
-            log.info("  %d / %d stations done", i, len(stations_in_df))
+        for i, site_no in enumerate(stations_in_df, 1):
+            df_site = df[df["site_no"] == site_no]
+            station_nm = station_map.get(site_no, "")
+            fig = station_metrics_fig(site_no, station_nm, df_site, src_label)
+            key = f"{prefix}{STATIONS_PREFIX}{site_no}_{sfx}.png"
+            save_figure(fig, bucket, key)
+            if i % 10 == 0:
+                log.info("    %d / %d stations done", i, len(stations_in_df))
 
     log.info(
         "All figures written to s3://%s/%s%s",
