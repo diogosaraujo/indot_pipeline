@@ -353,31 +353,54 @@ def main() -> None:
 
     if not new_frames:
         log.info("No new rows — parquet unchanged.")
-        return
+        final_df = existing
+    else:
+        new_df = pd.concat(new_frames, ignore_index=True)
 
-    new_df = pd.concat(new_frames, ignore_index=True)
+        # Attach station metadata (name/lat/lon) to new rows
+        meta_cols = ["site_no", "station_nm", "latitude", "longitude"]
+        meta_cols = [c for c in meta_cols if c in stations.columns]
+        new_df = new_df.merge(stations[meta_cols], on="site_no", how="left")
 
-    # Attach station metadata (name/lat/lon) to new rows
-    meta_cols = ["site_no", "station_nm", "latitude", "longitude"]
-    meta_cols = [c for c in meta_cols if c in stations.columns]
-    new_df = new_df.merge(stations[meta_cols], on="site_no", how="left")
+        # Merge with existing and dedup
+        parts = [p for p in [existing, new_df] if p is not None and not p.empty]
+        combined = pd.concat(parts, ignore_index=True)
+        combined["datetime_utc"] = pd.to_datetime(combined["datetime_utc"], utc=True)
+        combined = (
+            combined
+            .drop_duplicates(subset=["site_no", "datetime_utc"], keep="last")
+            .sort_values(["site_no", "datetime_utc"])
+            .reset_index(drop=True)
+        )
 
-    # Merge with existing and dedup
-    parts = [p for p in [existing, new_df] if p is not None and not p.empty]
-    combined = pd.concat(parts, ignore_index=True)
-    combined["datetime_utc"] = pd.to_datetime(combined["datetime_utc"], utc=True)
-    combined = (
-        combined
-        .drop_duplicates(subset=["site_no", "datetime_utc"], keep="last")
-        .sort_values(["site_no", "datetime_utc"])
-        .reset_index(drop=True)
-    )
+        write_parquet_to_s3(combined, bucket, f"{prefix}precip/usgs/precip_iv.parquet")
+        log.info(
+            "Wrote precip_iv.parquet: %d rows for %d stations.",
+            len(combined), combined["site_no"].nunique(),
+        )
+        final_df = combined
 
-    write_parquet_to_s3(combined, bucket, f"{prefix}precip/usgs/precip_iv.parquet")
-    log.info(
-        "Wrote precip_iv.parquet: %d rows for %d stations.",
-        len(combined), combined["site_no"].nunique(),
-    )
+    # ── Active stations (stations with any record in 2026) ────────────────
+    if final_df is not None and not final_df.empty:
+        final_df["datetime_utc"] = pd.to_datetime(final_df["datetime_utc"], utc=True)
+        active_site_nos = set(
+            final_df.loc[final_df["datetime_utc"].dt.year >= 2026, "site_no"].unique()
+        )
+        active_stations = (
+            stations[stations["site_no"].isin(active_site_nos)]
+            .reset_index(drop=True)
+        )
+        log.info(
+            "Active stations (2026 data): %d / %d",
+            len(active_stations), len(stations),
+        )
+        write_parquet_to_s3(
+            active_stations, bucket, f"{prefix}precip/usgs/stations_active.parquet"
+        )
+        key_gj = f"{prefix}precip/usgs/stations_active.geojson"
+        write_bytes_to_s3(stations_to_geojson(active_stations), bucket, key_gj)
+        log.info("Wrote s3://%s/%s", bucket, key_gj)
+
     log.info("Done.")
 
 
