@@ -99,7 +99,6 @@ def fetch_usgs_precip_stations(
         "format":           "rdb",
         "bBox":             f"{west:.4f},{south:.4f},{east:.4f},{north:.4f}",
         "parameterCd":      PRECIP_PARAM,
-        "siteType":         "ST",
         "hasDataTypeCd":    "iv",
         "outputDataTypeCd": "iv",
     }
