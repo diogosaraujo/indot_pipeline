@@ -78,42 +78,22 @@ PRECIP_PARAM    = "00045"
 IV_RETENTION_DAYS = 120
 # Indiana bounding box fallback (minlat, minlon, maxlat, maxlon)
 INDIANA_BBOX    = (37.77, -88.10, 41.76, -84.78)
+# States spanning the Ohio River watershed and adjacent drainage basins.
+# Per-state queries avoid the NWIS bBox result-count limit that rejects
+# large multi-state bounding boxes.
+SEARCH_STATES   = ["IN", "IL", "OH", "MI", "KY", "WV", "PA", "NY", "VA", "NC", "TN"]
 
 NWIS_SITE_URL   = "https://waterservices.usgs.gov/nwis/site/"
 
 
 # ── Station inventory ─────────────────────────────────────────────────────────
 
-def fetch_usgs_precip_stations(
-    bbox: tuple[float, float, float, float],
-) -> pd.DataFrame:
-    """Query NWIS site service for IV precipitation gauges within a bounding box.
-
-    bbox = (west_lon, south_lat, east_lon, north_lat) — matches shapely polygon.bounds.
-    A single bBox request automatically covers all states whose territory falls
-    inside the watershed union (IN, IL, OH, MI, KY, NY, PA, VA, WV, NC, etc.)
-    without requiring a hardcoded state list.
-    """
-    west, south, east, north = bbox
-    params = {
-        "format":           "rdb",
-        "bBox":             f"{west:.4f},{south:.4f},{east:.4f},{north:.4f}",
-        "parameterCd":      PRECIP_PARAM,
-        "hasDataTypeCd":    "iv",
-        "outputDataTypeCd": "iv",
-    }
-    try:
-        r = requests.get(NWIS_SITE_URL, params=params, timeout=60)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        log.warning("NWIS bBox site query failed: %s", e)
-        return pd.DataFrame(columns=["site_no", "station_nm", "latitude", "longitude"])
-
-    lines = [l for l in r.text.splitlines() if not l.startswith("#")]
-    # lines[0] = header, lines[1] = type row, lines[2+] = data
+def _parse_nwis_rdb(text: str, state: str = "") -> pd.DataFrame | None:
+    """Parse an NWIS RDB response into a stations DataFrame."""
+    lines = [l for l in text.splitlines() if not l.startswith("#")]
     if len(lines) < 3:
-        log.info("No precipitation sites found in bbox.")
-        return pd.DataFrame(columns=["site_no", "station_nm", "latitude", "longitude"])
+        log.info("No precipitation sites found for state %s.", state)
+        return None
 
     header = lines[0].split("\t")
     records: list[dict] = []
@@ -126,17 +106,17 @@ def fetch_usgs_precip_stations(
         records.append(dict(zip(header, parts)))
 
     if not records:
-        return pd.DataFrame(columns=["site_no", "station_nm", "latitude", "longitude"])
+        return None
 
     df = pd.DataFrame(records)
-    # NWIS RDB columns include dec_lat_va, dec_long_va, station_nm, site_no
     lat_col = next((c for c in df.columns if "lat" in c.lower()), None)
     lon_col = next((c for c in df.columns if "long" in c.lower() or "lon" in c.lower()), None)
     nm_col  = next((c for c in df.columns if "station_nm" in c.lower()), None)
 
     if lat_col is None or lon_col is None:
-        log.warning("Could not locate lat/lon columns in NWIS RDB output: %s", list(df.columns)[:10])
-        return pd.DataFrame(columns=["site_no", "station_nm", "latitude", "longitude"])
+        log.warning("Could not locate lat/lon columns in NWIS RDB for %s: %s",
+                    state, list(df.columns)[:10])
+        return None
 
     out = pd.DataFrame({
         "site_no":    df["site_no"].astype(str).str.strip(),
@@ -144,12 +124,43 @@ def fetch_usgs_precip_stations(
         "latitude":   pd.to_numeric(df[lat_col],  errors="coerce"),
         "longitude":  pd.to_numeric(df[lon_col], errors="coerce"),
     }).dropna(subset=["latitude", "longitude"])
+    log.info("  %s: %d sites", state, len(out))
+    return out
+
+
+def fetch_usgs_precip_stations() -> pd.DataFrame:
+    """Query NWIS per state for IV precipitation gauges across SEARCH_STATES.
+
+    A single bBox request spanning the full watershed exceeds NWIS's result-count
+    limit and returns HTTP 400.  Per-state queries are reliable and the results
+    are later filtered to the exact watershed polygon.
+    """
+    frames: list[pd.DataFrame] = []
+    for state in SEARCH_STATES:
+        params = {
+            "format":           "rdb",
+            "stateCd":          state,
+            "parameterCd":      PRECIP_PARAM,
+            "hasDataTypeCd":    "iv",
+            "outputDataTypeCd": "iv",
+        }
+        try:
+            r = requests.get(NWIS_SITE_URL, params=params, timeout=60)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            log.warning("NWIS state query failed for %s: %s", state, e)
+            continue
+        df = _parse_nwis_rdb(r.text, state)
+        if df is not None and not df.empty:
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(columns=["site_no", "station_nm", "latitude", "longitude"])
+
+    out = pd.concat(frames, ignore_index=True)
     out = out.drop_duplicates(subset=["site_no"]).reset_index(drop=True)
-    log.info(
-        "NWIS precip inventory: %d unique sites in bbox "
-        "(S=%.3f W=%.3f → N=%.3f E=%.3f)",
-        len(out), south, west, north, east,
-    )
+    log.info("NWIS precip inventory: %d unique sites across %d states",
+             len(out), len(SEARCH_STATES))
     return out
 
 
@@ -291,15 +302,7 @@ def main() -> None:
 
     # ── Station inventory ──────────────────────────────────────────────────
     log.info("Fetching USGS precipitation site inventory...")
-    if polygon is not None:
-        # Derive bbox from the actual watershed union — automatically covers all
-        # states in the polygon (IN, IL, OH, MI, KY, NY, PA, VA, WV, NC, etc.)
-        west, south, east, north = polygon.bounds
-        query_bbox = (west, south, east, north)
-    else:
-        # Indiana fallback: convert (minlat, minlon, maxlat, maxlon) → (W, S, E, N)
-        query_bbox = (INDIANA_BBOX[1], INDIANA_BBOX[0], INDIANA_BBOX[3], INDIANA_BBOX[2])
-    all_stations = fetch_usgs_precip_stations(query_bbox)
+    all_stations = fetch_usgs_precip_stations()
     stations = filter_by_polygon(all_stations, polygon, fallback_bbox=INDIANA_BBOX)
     log.info("Precipitation sites in watershed: %d / %d", len(stations), len(all_stations))
 
