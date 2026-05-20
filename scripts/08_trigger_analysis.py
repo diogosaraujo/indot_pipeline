@@ -312,31 +312,6 @@ def analyse_station(
     flow_c = flow_c.reindex(mrms_c.index)  # keep NaN gaps in flow
     n_common = len(mrms_c)
 
-    # Precompute flow events per threshold — constant across all trigger combinations.
-    # Skip flow_rps with zero events: those stations add only FP to the aggregate
-    # metrics and cannot contribute meaningful skill scores.
-    flow_rp_data: dict[int, tuple[float, list]] = {}
-    for flow_rp in FLOW_RPS:
-        q_col = f"Q{flow_rp}"
-        if q_col not in flow_stats_row or pd.isna(flow_stats_row[q_col]):
-            continue
-        flow_threshold = float(flow_stats_row[q_col])
-        events = find_flow_events(flow_c.dropna(), flow_threshold)
-        if not events:
-            log.debug(
-                "Site %s (%s): Q%d — 0 events in common period, excluded",
-                site_no, mrms_source, flow_rp,
-            )
-            continue
-        flow_rp_data[flow_rp] = (flow_threshold, events)
-
-    if not flow_rp_data:
-        log.info(
-            "Site %s (%s): no flow events for any threshold in common period — skipping",
-            site_no, mrms_source,
-        )
-        return []
-
     records = []
     for duration_hr in DURATIONS_HR:
         rolling = mrms_c.rolling(window=duration_hr, min_periods=duration_hr).sum()
@@ -352,8 +327,16 @@ def analyse_station(
 
             triggers = find_trigger_events(mrms_c, rolling, threshold_in)
 
-            for flow_rp, (flow_threshold, flow_events) in flow_rp_data.items():
+            for flow_rp in FLOW_RPS:
+                q_col = f"Q{flow_rp}"
+                if q_col not in flow_stats_row or pd.isna(flow_stats_row[q_col]):
+                    continue
+                flow_threshold = float(flow_stats_row[q_col])
+
+                flow_events = find_flow_events(flow_c.dropna(), flow_threshold)
+
                 metrics = classify(triggers, flow_events, flow_c, flow_threshold, duration_hr)
+
                 records.append({
                     "site_no": site_no,
                     "mrms_source": mrms_source,
@@ -371,7 +354,7 @@ def analyse_station(
 
 # ---------- Main ----------
 
-COMBOS_PER_FLOW_RP = len(DURATIONS_HR) * len(PRECIP_RPS)  # 160 per active flow threshold
+COMPLETE_COMBINATIONS = len(DURATIONS_HR) * len(PRECIP_RPS) * len(FLOW_RPS)  # 320
 
 
 def main() -> None:
@@ -437,11 +420,8 @@ def main() -> None:
         existing = _read_parquet_s3(bucket, f"{prefix}analysis/trigger_analysis.parquet")
         existing["site_no"] = existing["site_no"].astype(str)
         counts = existing.groupby(["site_no", "mrms_source"]).size()
-        complete_keys = {
-            (s, src) for (s, src), n in counts.items()
-            if n > 0 and n % COMBOS_PER_FLOW_RP == 0
-        }
-        incomplete = int((counts % COMBOS_PER_FLOW_RP != 0).sum())
+        complete_keys = {(s, src) for (s, src), n in counts.items() if n == COMPLETE_COMBINATIONS}
+        incomplete = int((counts < COMPLETE_COMBINATIONS).sum())
         log.info(
             "Existing results: %d rows | %d complete pairs | %d incomplete pairs to reprocess",
             len(existing), len(complete_keys), incomplete,
@@ -502,8 +482,6 @@ def main() -> None:
             )
         ]
         kept = kept[~kept["site_no"].isin(excluded_sites)]
-        # Drop no-event rows carried over from runs before this filter was added
-        kept = kept[(kept["tp"] + kept["fn"]) > 0]
         parts.append(kept)
         log.info("Retaining %d rows from previous run", len(kept))
 
