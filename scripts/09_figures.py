@@ -397,6 +397,21 @@ def main() -> None:
     df_all = add_metrics(df_all)
     log.info("Loaded %d rows, %d stations", len(df_all), df_all["site_no"].nunique())
 
+    # Keep only stations that have at least one Q10 or Q50 event in the record.
+    # Stations with zero events contribute only FP to pooled metrics, inflating
+    # FAR without any signal, and produce meaningless per-station figures.
+    n_total = df_all["site_no"].nunique()
+    sites_with_events = (
+        df_all.groupby("site_no")
+        .apply(lambda g: (g["tp"] + g["fn"]).max() > 0)
+        .pipe(lambda s: s[s].index.tolist())
+    )
+    df_all = df_all[df_all["site_no"].isin(sites_with_events)]
+    log.info(
+        "Stations with ≥1 Q10 or Q50 event: %d / %d (excluded %d with zero events)",
+        len(sites_with_events), n_total, n_total - len(sites_with_events),
+    )
+
     log.info("Loading station coordinates from S3...")
     stations = load_stations(bucket, prefix)
 
