@@ -141,3 +141,18 @@ noaa_precip:
 nwm:
   src_s3_bucket: noaa-nwm-pds
   src_s3_key: ""               # e.g. "nwm.20240101/domain/HYDRO_TBL_1D.nc"
+
+# ---------------------------------------------------------------------------
+# Historical precipitation back-fill (scripts 05b and 06b)
+#
+# These scripts extend the MRMS nearest_pixel and watershed_mean parquets
+# backwards using:
+#   - Iowa State MRMS archive (2015-01-01 onwards, same GRIB2 format)
+#   - NOAA Stage IV QPE   (2002-01-01 onwards, 4-km HRAP grid, fallback)
+#
+# start_date: earliest date to attempt downloading.
+# end_date:   last date before the noaa-mrms-pds archive begins (2020-10-13).
+# ---------------------------------------------------------------------------
+historical_precip:
+  start_date: "2002-01-01"    # Stage IV operational start
+  end_date:   "2020-10-13"    # day before noaa-mrms-pds archive starts
