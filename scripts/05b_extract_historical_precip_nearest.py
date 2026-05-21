@@ -72,6 +72,12 @@ STAGE4_START    = date(2002,  1,  1)   # Stage IV operational start
 ISU_MRMS_START  = date(2015,  1,  1)   # approximate ISU MRMS archive start
 MRMS_PDS_START  = date(2020, 10, 14)   # noaa-mrms-pds archive start
 
+# The ISU MRMS archive carries GaugeCorr_QPE_01H (the pre-2020 predecessor to
+# MultiSensor_QPE_01H_Pass2).  The folder and file-stem differ from the config
+# folder, so they are hardcoded here rather than read from config.
+ISU_MRMS_FOLDER = "GaugeCorr_QPE_01H"
+ISU_MRMS_FSTEM  = "GaugeCorr_QPE_01H_00.00"
+
 MM_TO_IN = 1.0 / 25.4
 
 
@@ -85,17 +91,17 @@ def _get(url: str, timeout: int = 60) -> bytes | None:
         return None
 
 
-def fetch_isu_mrms(folder: str, dt: datetime) -> bytes | None:
-    fname = f"{folder}_{dt.strftime('%Y%m%d')}-{dt.strftime('%H')}0000.grib2.gz"
+def fetch_isu_mrms(dt: datetime) -> bytes | None:
+    fname = f"{ISU_MRMS_FSTEM}_{dt.strftime('%Y%m%d')}-{dt.strftime('%H')}0000.grib2.gz"
     url = (f"{ISU_MRMS_BASE}/{dt.year}/{dt.month:02d}/{dt.day:02d}"
-           f"/mrms/ncep/{folder}/{fname}")
+           f"/mrms/ncep/{ISU_MRMS_FOLDER}/{fname}")
     return _get(url)
 
 
 def fetch_stage4(dt: datetime) -> bytes | None:
     base = (f"{ISU_STAGE4_BASE}/{dt.year}/{dt.month:02d}/{dt.day:02d}/stage4")
     stem = f"ST4.{dt.strftime('%Y%m%d%H')}.01h"
-    for ext in (".grb2", ".grb"):
+    for ext in (".grib", ".grb2", ".grb"):
         raw = _get(f"{base}/{stem}{ext}")
         if raw is not None:
             return raw
@@ -153,7 +159,7 @@ def stage4_nearest_values(
 # ── Per-day worker ────────────────────────────────────────────────────────────
 
 def process_day(args: tuple) -> str:
-    (day_iso, folder, gauges_records, shard_dir) = args
+    (day_iso, gauges_records, shard_dir) = args
     day   = date.fromisoformat(day_iso)
     lats  = np.array([float(g["dec_lat_va"])  for g in gauges_records])
     lons  = np.array([float(g["dec_long_va"]) for g in gauges_records])
@@ -171,7 +177,7 @@ def process_day(args: tuple) -> str:
             source = None
 
             if day >= ISU_MRMS_START:
-                raw = fetch_isu_mrms(folder, dt)
+                raw = fetch_isu_mrms(dt)
                 if raw:
                     source = "mrms"
 
@@ -255,7 +261,6 @@ def main() -> None:
     cfg_end   = parse_iso_or_none(hist_cfg.get("end_date",   "")) or (MRMS_PDS_START - timedelta(days=1))
 
     product_key = cfg["mrms"]["products"][0]["key"]
-    folder      = cfg["mrms"]["products"][0]["folder"]
     parquet_key = f"{prefix}mrms/{product_key}/nearest_pixel.parquet"
 
     gauges = read_gauges(bucket, prefix).dropna(
@@ -286,7 +291,7 @@ def main() -> None:
     shard_dir  = ensure_dir("./hist_shards_nearest")
     n_workers  = cfg["execution"].get("max_workers_io", 8)
 
-    args  = [(d.isoformat(), folder, gauges_records, shard_dir) for d in days]
+    args  = [(d.isoformat(), gauges_records, shard_dir) for d in days]
     paths: list[str] = []
 
     with ThreadPoolExecutor(max_workers=n_workers) as ex:

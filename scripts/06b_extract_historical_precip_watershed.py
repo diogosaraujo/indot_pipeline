@@ -80,6 +80,11 @@ STAGE4_START   = date(2002,  1,  1)
 ISU_MRMS_START = date(2015,  1,  1)
 MRMS_PDS_START = date(2020, 10, 14)
 
+# The ISU MRMS archive carries GaugeCorr_QPE_01H (the pre-2020 predecessor to
+# MultiSensor_QPE_01H_Pass2).  Hardcoded here — independent of config folder.
+ISU_MRMS_FOLDER = "GaugeCorr_QPE_01H"
+ISU_MRMS_FSTEM  = "GaugeCorr_QPE_01H_00.00"
+
 MM_TO_IN = 1.0 / 25.4
 
 # Stage IV masks built once on the first valid Stage IV file, then cached
@@ -97,17 +102,17 @@ def _get(url: str, timeout: int = 60) -> bytes | None:
         return None
 
 
-def fetch_isu_mrms(folder: str, dt: datetime) -> bytes | None:
-    fname = f"{folder}_{dt.strftime('%Y%m%d')}-{dt.strftime('%H')}0000.grib2.gz"
+def fetch_isu_mrms(dt: datetime) -> bytes | None:
+    fname = f"{ISU_MRMS_FSTEM}_{dt.strftime('%Y%m%d')}-{dt.strftime('%H')}0000.grib2.gz"
     url = (f"{ISU_MRMS_BASE}/{dt.year}/{dt.month:02d}/{dt.day:02d}"
-           f"/mrms/ncep/{folder}/{fname}")
+           f"/mrms/ncep/{ISU_MRMS_FOLDER}/{fname}")
     return _get(url)
 
 
 def fetch_stage4(dt: datetime) -> bytes | None:
     base = f"{ISU_STAGE4_BASE}/{dt.year}/{dt.month:02d}/{dt.day:02d}/stage4"
     stem = f"ST4.{dt.strftime('%Y%m%d%H')}.01h"
-    for ext in (".grb2", ".grb"):
+    for ext in (".grib", ".grb2", ".grb"):
         raw = _get(f"{base}/{stem}{ext}")
         if raw is not None:
             return raw
@@ -247,7 +252,7 @@ def build_stage4_masks(
 def process_day(args: tuple) -> str:
     global _stage4_masks_cache
 
-    (day_iso, folder, mrms_masks, gauges_list, shard_dir) = args
+    (day_iso, mrms_masks, gauges_list, shard_dir) = args
     day  = date.fromisoformat(day_iso)
     rows: list[tuple] = []
 
@@ -260,7 +265,7 @@ def process_day(args: tuple) -> str:
             source = None
 
             if day >= ISU_MRMS_START:
-                raw = fetch_isu_mrms(folder, dt)
+                raw = fetch_isu_mrms(dt)
                 if raw:
                     source = "mrms"
 
@@ -398,7 +403,6 @@ def main() -> None:
     cfg_end   = parse_iso_or_none(hist_cfg.get("end_date",   "")) or (MRMS_PDS_START - timedelta(days=1))
 
     product_key = cfg["mrms"]["products"][0]["key"]
-    folder      = cfg["mrms"]["products"][0]["folder"]
     parquet_key = f"{prefix}mrms/{product_key}/watershed_mean.parquet"
 
     # ── Load gauges + watershed GeoJSONs ──────────────────────────────────────
@@ -446,7 +450,7 @@ def main() -> None:
     shard_dir = ensure_dir("./hist_shards_watershed")
     n_workers = cfg["execution"].get("max_workers_io", 8)
 
-    args  = [(d.isoformat(), folder, mrms_masks, gauges_list, shard_dir) for d in days]
+    args  = [(d.isoformat(), mrms_masks, gauges_list, shard_dir) for d in days]
     paths: list[str] = []
 
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
