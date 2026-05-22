@@ -474,8 +474,14 @@ def main() -> None:
         log.info("No new data downloaded.")
         return
 
+    _shard_schema = pa.schema([
+        ("datetime_utc", pa.timestamp("ns", tz="UTC")),
+        ("site_no",      pa.string()),
+        ("value_mean",   pa.float64()),
+    ])
     new_df = pa.concat_tables(
-        [pq.read_table(p) for p in paths if Path(p).exists()]
+        [pq.read_table(p).cast(_shard_schema)
+         for p in paths if Path(p).exists()]
     ).to_pandas()
 
     parts = [p for p in [new_df, existing] if p is not None and not p.empty]
