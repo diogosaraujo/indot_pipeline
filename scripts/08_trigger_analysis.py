@@ -45,6 +45,8 @@ Writes:
 """
 from __future__ import annotations
 
+import io
+import json
 import logging
 from typing import Literal
 
@@ -69,7 +71,7 @@ DURATIONS_HR = [1, 2, 3, 6, 12, 24, 48, 72, 96, 120, 168, 240, 480, 720, 1080, 1
 PRECIP_RPS   = [1, 2, 5, 10, 25, 50, 100, 200, 500, 1000]
 FLOW_RPS     = [10, 50]
 
-MrmsSource = Literal["nearest", "watershed"]
+MrmsSource = Literal["nearest", "watershed", "station_nearest", "station_watershed"]
 
 
 # ---------- Data loaders ----------
@@ -126,6 +128,142 @@ def load_flow_stats(bucket: str, prefix: str) -> pd.DataFrame:
     df = _read_parquet_s3(bucket, f"{prefix}flow_stats/per_gauge_flow_stats.parquet")
     df["site_no"] = df["site_no"].astype(str)
     return df[["site_no", "Q10", "Q50"]]
+
+
+def load_gauges(bucket: str, prefix: str) -> pd.DataFrame:
+    """Load active streamflow gauge locations."""
+    df = _read_parquet_s3(
+        bucket, f"{prefix}stations/indiana_streamflow_sites_active.parquet"
+    )
+    df["site_no"] = df["site_no"].astype(str)
+    return df[["site_no", "dec_lat_va", "dec_long_va"]].dropna().reset_index(drop=True)
+
+
+def load_precip_stations_combined(
+    bucket: str, prefix: str
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Merge ISD, GHCNh, and USGS IV hourly precip into one DataFrame.
+
+    Returns (hourly_df, stations_meta).
+    hourly_df columns:   station_id, datetime_utc, precip_in
+    stations_meta cols:  station_id, latitude, longitude
+    """
+    sources_cfg = [
+        ("isd",     f"{prefix}precip/noaa/isd_hourly.parquet",   "station_id"),
+        ("ghcnh",   f"{prefix}precip/noaa/ghcnh_hourly.parquet", "station_id"),
+        ("usgs_iv", f"{prefix}precip/usgs/precip_iv.parquet",    "site_no"),
+    ]
+    frames: list[pd.DataFrame] = []
+    for tag, key, id_col in sources_cfg:
+        try:
+            df = _read_parquet_s3(bucket, key)
+            df = df.rename(columns={id_col: "_sid"})
+            df["station_id"] = tag + "_" + df["_sid"].astype(str)
+            df["precip_in"] = pd.to_numeric(df["precip_in"], errors="coerce")
+            frames.append(df[["station_id", "latitude", "longitude",
+                               "datetime_utc", "precip_in"]].copy())
+            log.info("Loaded %s precip: %d rows, %d stations",
+                     tag, len(df), df["station_id"].nunique())
+        except Exception as e:
+            log.warning("Could not load %s precip: %s", tag, e)
+
+    if not frames:
+        return pd.DataFrame(), pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined["datetime_utc"] = pd.to_datetime(combined["datetime_utc"], utc=True)
+
+    stations_meta = (
+        combined[["station_id", "latitude", "longitude"]]
+        .dropna(subset=["latitude", "longitude"])
+        .drop_duplicates(subset=["station_id"])
+        .reset_index(drop=True)
+    )
+    return combined[["station_id", "datetime_utc", "precip_in"]], stations_meta
+
+
+def assign_nearest_station(
+    gauges: pd.DataFrame, stations_meta: pd.DataFrame
+) -> dict[str, str]:
+    """Map each streamflow gauge to the nearest precipitation station (by Euclidean
+    distance in lat/lon degrees — adequate for the Indiana region)."""
+    from scipy.spatial import KDTree
+
+    if stations_meta.empty:
+        return {}
+    kd = KDTree(stations_meta[["latitude", "longitude"]].values)
+    result: dict[str, str] = {}
+    for _, row in gauges.iterrows():
+        _, idx = kd.query([float(row["dec_lat_va"]), float(row["dec_long_va"])])
+        result[str(row["site_no"])] = stations_meta.iloc[idx]["station_id"]
+    return result
+
+
+def build_watershed_station_masks(
+    bucket: str,
+    prefix: str,
+    site_nos: list[str],
+    stations_meta: pd.DataFrame,
+    nearest: dict[str, str],
+) -> dict[str, list[str]]:
+    """For each watershed polygon find all precip stations inside it.
+
+    Falls back to the nearest station when no station centre falls within
+    the polygon (common for small headwater catchments).
+    """
+    from shapely.geometry import Point
+    from shapely.geometry import shape as shapely_shape
+
+    if stations_meta.empty:
+        return {s: [] for s in site_nos}
+
+    s3 = s3_client()
+    masks: dict[str, list[str]] = {}
+
+    for site_no in site_nos:
+        try:
+            obj = s3.get_object(
+                Bucket=bucket,
+                Key=f"{prefix}watersheds/per_gauge/{site_no}.geojson",
+            )
+            feat = json.loads(obj["Body"].read())
+            geom = shapely_shape(
+                feat["geometry"] if "geometry" in feat else feat
+            )
+            inside = [
+                row["station_id"]
+                for _, row in stations_meta.iterrows()
+                if geom.contains(
+                    Point(float(row["longitude"]), float(row["latitude"]))
+                )
+            ]
+            masks[site_no] = inside if inside else ([nearest[site_no]] if site_no in nearest else [])
+        except Exception:
+            masks[site_no] = [nearest[site_no]] if site_no in nearest else []
+
+    log.info(
+        "Watershed station masks: %d gauges | avg %.1f stations/watershed",
+        len(masks),
+        np.mean([len(v) for v in masks.values()]) if masks else 0,
+    )
+    return masks
+
+
+def station_precip_for_gauge(
+    site_no: str,
+    station_ids: list[str],
+    precip_hourly: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return hourly precip for one gauge from one or more station IDs.
+
+    Multiple stations are averaged at each hour (watershed-mean analogue).
+    """
+    sub = precip_hourly[precip_hourly["station_id"].isin(station_ids)]
+    if sub.empty:
+        return pd.DataFrame(columns=["datetime_utc", "site_no", "precip_in"])
+    agg = sub.groupby("datetime_utc", as_index=False)["precip_in"].mean()
+    agg["site_no"] = site_no
+    return agg[["datetime_utc", "site_no", "precip_in"]]
 
 
 # ---------- Event detection ----------
@@ -372,25 +510,13 @@ def main() -> None:
     streamflow = load_streamflow(bucket, prefix)
     streamflow["site_no"] = streamflow["site_no"].astype(str)
 
-    stations = sorted(set(atlas14["site_no"]) & set(flow_stats["site_no"]) & set(streamflow["site_no"]))
-    log.info("Stations with all required inputs: %d", len(stations))
-
-    # Drop stations whose streamflow record ends before the MRMS period starts.
-    # These would produce 0 combinations regardless and are not re-run in script 01.
-    mrms_start = pd.Timestamp("2020-10-14", tz="UTC")
-    flow_end_by_site = (
-        streamflow.groupby("site_no")["datetime_utc"].max()
+    stations_all = sorted(
+        set(atlas14["site_no"]) & set(flow_stats["site_no"]) & set(streamflow["site_no"])
     )
-    pre_mrms = [s for s in stations if flow_end_by_site.get(s, pd.NaT) < mrms_start]
-    if pre_mrms:
-        log.info(
-            "Skipping %d station(s) with streamflow ending before MRMS start (2020-10-14): %s",
-            len(pre_mrms), sorted(pre_mrms),
-        )
-    stations = [s for s in stations if s not in set(pre_mrms)]
-    log.info("Stations after MRMS-era filter: %d", len(stations))
+    log.info("Stations with all required inputs: %d", len(stations_all))
 
     # QC: exclude regulated waterways, ditches, and canals.
+    # Applies to ALL precipitation sources.
     # Criterion 1: any negative recorded flow → regulated/tidal/reversible channel.
     # Criterion 2: Q10 < median observed flow → regression Q10 is meaningless.
     neg_flow_sites = set(streamflow.loc[streamflow["value_cfs"] < 0, "site_no"].unique())
@@ -410,8 +536,24 @@ def main() -> None:
             len(excluded_sites), len(neg_flow_sites), len(bad_q10_sites),
             sorted(excluded_sites),
         )
-    stations = [s for s in stations if s not in excluded_sites]
-    log.info("Stations after QC exclusion: %d", len(stations))
+    stations_all = [s for s in stations_all if s not in excluded_sites]
+    log.info("Stations after QC exclusion: %d", len(stations_all))
+
+    # MRMS sources: only stations whose streamflow overlaps the MRMS era.
+    # Station sources have no such restriction — ISD/GHCNh go back to the 1970s.
+    mrms_start = pd.Timestamp("2020-10-14", tz="UTC")
+    flow_end_by_site = streamflow.groupby("site_no")["datetime_utc"].max()
+    pre_mrms = [s for s in stations_all if flow_end_by_site.get(s, pd.NaT) < mrms_start]
+    if pre_mrms:
+        log.info(
+            "Skipping %d station(s) with streamflow ending before MRMS start (2020-10-14) "
+            "for MRMS sources: %s",
+            len(pre_mrms), sorted(pre_mrms),
+        )
+    stations_mrms    = [s for s in stations_all if s not in set(pre_mrms)]
+    stations_station = stations_all   # station-based sources use all QC-passed gauges
+    log.info("Stations for MRMS sources: %d | for station sources: %d",
+             len(stations_mrms), len(stations_station))
 
     # Load existing results and identify (site_no, source) pairs already at 320 combinations.
     existing: pd.DataFrame | None = None
@@ -440,10 +582,11 @@ def main() -> None:
             continue
         mrms["site_no"] = mrms["site_no"].astype(str)
 
-        for i, site_no in enumerate(stations, 1):
+        n_mrms = len(stations_mrms)
+        for i, site_no in enumerate(stations_mrms, 1):
             if (site_no, source) in complete_keys:
                 log.info("[%s][%d/%d] %s: already complete (%d combinations), skipping",
-                         source, i, len(stations), site_no, COMPLETE_COMBINATIONS)
+                         source, i, n_mrms, site_no, COMPLETE_COMBINATIONS)
                 continue
 
             mrms_site = (
@@ -460,18 +603,96 @@ def main() -> None:
             flow_row = flow_stats[flow_stats["site_no"] == site_no].iloc[0]
 
             if mrms_site.empty or flow_site.empty or atlas14_site.empty:
-                log.warning("[%s][%d/%d] %s: missing data, skipping", source, i, len(stations), site_no)
+                log.warning("[%s][%d/%d] %s: missing data, skipping", source, i, n_mrms, site_no)
                 continue
 
             if pd.isna(flow_row.get("Q10")) and pd.isna(flow_row.get("Q50")):
-                log.warning("[%s][%d/%d] %s: no flow thresholds (Q10/Q50 both NaN) — skipping", source, i, len(stations), site_no)
+                log.warning("[%s][%d/%d] %s: no flow thresholds — skipping", source, i, n_mrms, site_no)
                 continue
 
             records = analyse_station(
                 site_no, mrms_site, flow_site, atlas14_site, flow_row, source
             )
             all_records.extend(records)
-            log.info("[%s][%d/%d] %s: %d combinations", source, i, len(stations), site_no, len(records))
+            log.info("[%s][%d/%d] %s: %d combinations", source, i, n_mrms, site_no, len(records))
+
+    # ── Station-based precipitation sources ──────────────────────────────────
+    log.info("Loading combined station precipitation (ISD + GHCNh + USGS IV)...")
+    precip_hourly, stations_meta = load_precip_stations_combined(bucket, prefix)
+
+    if precip_hourly.empty or stations_meta.empty:
+        log.warning("No station precip data — skipping station_nearest and station_watershed.")
+    else:
+        log.info("Station precip: %d rows, %d unique stations",
+                 len(precip_hourly), stations_meta["station_id"].nunique())
+
+        log.info("Loading gauge locations for nearest-station assignment...")
+        gauges = load_gauges(bucket, prefix)
+
+        nearest_assignments = assign_nearest_station(gauges, stations_meta)
+        log.info("Nearest-station assignments built for %d gauges", len(nearest_assignments))
+
+        log.info("Building watershed station masks...")
+        watershed_masks = build_watershed_station_masks(
+            bucket, prefix, stations_station, stations_meta, nearest_assignments
+        )
+
+        n_st = len(stations_station)
+        for source in ("station_nearest", "station_watershed"):
+            log.info("── Station source: %s (%d gauges) ──", source, n_st)
+
+            for i, site_no in enumerate(stations_station, 1):
+                if (site_no, source) in complete_keys:
+                    log.info("[%s][%d/%d] %s: already complete, skipping",
+                             source, i, n_st, site_no)
+                    continue
+
+                if source == "station_nearest":
+                    station_ids = ([nearest_assignments[site_no]]
+                                   if site_no in nearest_assignments else [])
+                else:
+                    station_ids = watershed_masks.get(site_no, [])
+
+                if not station_ids:
+                    log.warning("[%s][%d/%d] %s: no station assigned, skipping",
+                                source, i, n_st, site_no)
+                    continue
+
+                precip_gauge = station_precip_for_gauge(
+                    site_no, station_ids, precip_hourly
+                )
+                if precip_gauge.empty:
+                    log.warning("[%s][%d/%d] %s: no precip data, skipping",
+                                source, i, n_st, site_no)
+                    continue
+
+                mrms_site = (
+                    precip_gauge.set_index("datetime_utc")[["precip_in"]].sort_index()
+                )
+                flow_site = (
+                    streamflow[streamflow["site_no"] == site_no]
+                    .set_index("datetime_utc")["value_cfs"]
+                    .sort_index()
+                )
+                atlas14_site = atlas14[atlas14["site_no"] == site_no].copy()
+                flow_row_rows = flow_stats[flow_stats["site_no"] == site_no]
+                if flow_row_rows.empty or flow_site.empty or atlas14_site.empty:
+                    log.warning("[%s][%d/%d] %s: missing flow/atlas14, skipping",
+                                source, i, n_st, site_no)
+                    continue
+                flow_row = flow_row_rows.iloc[0]
+
+                if pd.isna(flow_row.get("Q10")) and pd.isna(flow_row.get("Q50")):
+                    log.warning("[%s][%d/%d] %s: no flow thresholds — skipping",
+                                source, i, n_st, site_no)
+                    continue
+
+                records = analyse_station(
+                    site_no, mrms_site, flow_site, atlas14_site, flow_row, source
+                )
+                all_records.extend(records)
+                log.info("[%s][%d/%d] %s: %d combinations",
+                         source, i, n_st, site_no, len(records))
 
     # Combine kept existing rows with freshly computed ones
     parts: list[pd.DataFrame] = []

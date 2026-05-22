@@ -59,6 +59,13 @@ DURATION_LABELS = {
 
 METRIC_CMAP = {"CSI": "YlOrRd", "POD": "Greens", "FAR": "Reds"}
 
+SOURCE_LABELS = {
+    "nearest":           "MRMS Nearest Pixel",
+    "watershed":         "MRMS Watershed Mean",
+    "station_nearest":   "Station Nearest",
+    "station_watershed": "Station Watershed Mean",
+}
+
 
 # ---------- I/O helpers ----------
 
@@ -170,7 +177,7 @@ def heatmap_fig(
         ax=ax,
     )
     ax.set_title(
-        f"{metric} (pooled counts) — flow threshold Q{flow_rp}  |  MRMS: {src_label}",
+        f"{metric} (pooled counts) — flow threshold Q{flow_rp}  |  Source: {src_label}",
         fontsize=12,
     )
     ax.set_xlabel("Precip Return Period (yr)", fontsize=10)
@@ -206,7 +213,7 @@ def pod_vs_far_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.Figure
     ax.set_xlabel("False Alarm Ratio (FAR)", fontsize=10)
     ax.set_ylabel("Probability of Detection (POD)", fontsize=10)
     ax.set_title(
-        f"POD vs FAR — flow threshold Q{flow_rp}  |  MRMS: {src_label}",
+        f"POD vs FAR — flow threshold Q{flow_rp}  |  Source: {src_label}",
         fontsize=11,
     )
     ax.legend(fontsize=8)
@@ -226,7 +233,7 @@ def best_csi_per_station_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> 
     ax.set_xticklabels(best.index, rotation=90, fontsize=7)
     ax.set_ylabel("Best CSI (any combination)")
     ax.set_title(
-        f"Best achievable CSI per gauge — Q{flow_rp} threshold  |  MRMS: {src_label}\n"
+        f"Best achievable CSI per gauge — Q{flow_rp} threshold  |  Source: {src_label}\n"
         "(green ≥ 0.3 | orange ≥ 0.1 | red < 0.1)"
     )
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
@@ -255,7 +262,7 @@ def best_combo_per_station_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -
     )
     ax.set_xlabel("Best CSI")
     ax.set_title(
-        f"Best trigger combination per gauge — Q{flow_rp} threshold  |  MRMS: {src_label}\n"
+        f"Best trigger combination per gauge — Q{flow_rp} threshold  |  Source: {src_label}\n"
         "(duration / precip return period)"
     )
     ax.axvline(0.3, color="#2ecc71", linestyle="--", linewidth=0.8, alpha=0.6)
@@ -316,7 +323,7 @@ def map_metric_at_best_csi_fig(
 
     ax.set_xlabel("Longitude", fontsize=9)
     ax.set_ylabel("Latitude", fontsize=9)
-    ax.set_title(f"{labels[metric]}\nMRMS: {src_label}", fontsize=11)
+    ax.set_title(f"{labels[metric]}\nSource: {src_label}", fontsize=11)
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
     return fig
@@ -348,7 +355,7 @@ def station_metrics_fig(
     n_events = int(df_site["tp"].max() + df_site["fn"].max())
     fig.suptitle(
         f"Station {site_no}  |  {station_nm}\n"
-        f"MRMS: {src_label}  |  max flow events detected/missed: {n_events}",
+        f"Source: {src_label}  |  max flow events detected/missed: {n_events}",
         fontsize=11,
         y=1.01,
     )
@@ -420,7 +427,7 @@ def main() -> None:
 
     for src_key in sources:
         df = df_all[df_all["mrms_source"] == src_key].copy()
-        src_label = src_key.replace("_", " ").title()
+        src_label = SOURCE_LABELS.get(src_key, src_key.replace("_", " ").title())
         sfx = src_key  # file suffix, e.g. "nearest_pixel"
         log.info("── Generating figures for MRMS source: %s (%d rows) ──", src_label, len(df))
 
