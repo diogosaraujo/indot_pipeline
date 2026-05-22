@@ -160,7 +160,10 @@ def stage4_nearest_values(
 
 def process_day(args: tuple) -> str:
     (day_iso, gauges_records, shard_dir) = args
-    day   = date.fromisoformat(day_iso)
+    day = date.fromisoformat(day_iso)
+    out = shard_dir / f"hist_nearest_{day:%Y%m%d}.parquet"
+    if out.exists():
+        return str(out)
     lats  = np.array([float(g["dec_lat_va"])  for g in gauges_records])
     lons  = np.array([float(g["dec_long_va"]) for g in gauges_records])
     sids  = np.array([str(g["site_no"])        for g in gauges_records])

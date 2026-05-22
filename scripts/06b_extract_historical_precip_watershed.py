@@ -253,7 +253,10 @@ def process_day(args: tuple) -> str:
     global _stage4_masks_cache
 
     (day_iso, mrms_masks, gauges_list, shard_dir) = args
-    day  = date.fromisoformat(day_iso)
+    day = date.fromisoformat(day_iso)
+    out = shard_dir / f"hist_watershed_{day:%Y%m%d}.parquet"
+    if out.exists():
+        return str(out)
     rows: list[tuple] = []
 
     with tempfile.TemporaryDirectory() as scratch_str:
