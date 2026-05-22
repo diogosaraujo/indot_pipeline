@@ -339,6 +339,7 @@ def process_day(args: tuple) -> str:
         return ""
 
     df = pd.DataFrame(rows, columns=["datetime_utc", "site_no", "value_mean"])
+    df["value_mean"] = df["value_mean"].astype("float64")
     out = shard_dir / f"hist_watershed_{day:%Y%m%d}.parquet"
     df.to_parquet(out, compression="zstd")
     return str(out)

@@ -226,6 +226,7 @@ def process_day(args: tuple) -> str:
         return ""
 
     df = pd.DataFrame(rows, columns=["datetime_utc", "site_no", "value"])
+    df["value"] = df["value"].astype("float64")
     out = shard_dir / f"hist_nearest_{day:%Y%m%d}.parquet"
     df.to_parquet(out, compression="zstd")
     return str(out)
