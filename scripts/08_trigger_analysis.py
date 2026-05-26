@@ -142,16 +142,15 @@ def load_gauges(bucket: str, prefix: str) -> pd.DataFrame:
 def load_precip_stations_combined(
     bucket: str, prefix: str
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Merge ISD, GHCNh, and USGS IV hourly precip into one DataFrame.
+    """Merge ISD and GHCNh hourly precip into one DataFrame.
 
     Returns (hourly_df, stations_meta).
     hourly_df columns:   station_id, datetime_utc, precip_in
     stations_meta cols:  station_id, latitude, longitude
     """
     sources_cfg = [
-        ("isd",     f"{prefix}precip/noaa/isd_hourly.parquet",   "station_id"),
-        ("ghcnh",   f"{prefix}precip/noaa/ghcnh_hourly.parquet", "station_id"),
-        ("usgs_iv", f"{prefix}precip/usgs/precip_iv.parquet",    "site_no"),
+        ("isd",   f"{prefix}precip/noaa/isd_hourly.parquet",   "station_id"),
+        ("ghcnh", f"{prefix}precip/noaa/ghcnh_hourly.parquet", "station_id"),
     ]
     frames: list[pd.DataFrame] = []
     for tag, key, id_col in sources_cfg:
@@ -558,7 +557,8 @@ def main() -> None:
     # Load existing results and identify (site_no, source) pairs already at 320 combinations.
     existing: pd.DataFrame | None = None
     complete_keys: set[tuple[str, str]] = set()
-    existing_common_end: dict[tuple[str, str], pd.Timestamp] = {}
+    existing_common_end:   dict[tuple[str, str], pd.Timestamp] = {}
+    existing_common_start: dict[tuple[str, str], pd.Timestamp] = {}
     try:
         existing = _read_parquet_s3(bucket, f"{prefix}analysis/trigger_analysis.parquet")
         existing["site_no"] = existing["site_no"].astype(str)
@@ -566,6 +566,11 @@ def main() -> None:
         complete_keys = {(s, src) for (s, src), n in counts.items() if n == COMPLETE_COMBINATIONS}
         existing_common_end = {
             (s, src): grp["common_end"].max()
+            for (s, src), grp in existing.groupby(["site_no", "mrms_source"])
+            if (s, src) in complete_keys
+        }
+        existing_common_start = {
+            (s, src): grp["common_start"].min()
             for (s, src), grp in existing.groupby(["site_no", "mrms_source"])
             if (s, src) in complete_keys
         }
@@ -634,7 +639,7 @@ def main() -> None:
             log.info("[%s][%d/%d] %s: %d combinations", source, i, n_mrms, site_no, len(records))
 
     # ── Station-based precipitation sources ──────────────────────────────────
-    log.info("Loading combined station precipitation (ISD + GHCNh + USGS IV)...")
+    log.info("Loading combined station precipitation (ISD + GHCNh)...")
     precip_hourly, stations_meta = load_precip_stations_combined(bucket, prefix)
 
     if precip_hourly.empty or stations_meta.empty:
@@ -654,21 +659,38 @@ def main() -> None:
             bucket, prefix, stations_station, stations_meta, nearest_assignments
         )
 
+        precip_end_by_sid   = precip_hourly.groupby("station_id")["datetime_utc"].max()
+        precip_start_by_sid = precip_hourly.groupby("station_id")["datetime_utc"].min()
+
         n_st = len(stations_station)
         for source in ("station_nearest", "station_watershed"):
             log.info("── Station source: %s (%d gauges) ──", source, n_st)
 
             for i, site_no in enumerate(stations_station, 1):
-                if (site_no, source) in complete_keys:
-                    log.info("[%s][%d/%d] %s: already complete, skipping",
-                             source, i, n_st, site_no)
-                    continue
-
                 if source == "station_nearest":
                     station_ids = ([nearest_assignments[site_no]]
                                    if site_no in nearest_assignments else [])
                 else:
                     station_ids = watershed_masks.get(site_no, [])
+
+                if (site_no, source) in complete_keys:
+                    precip_end   = max((precip_end_by_sid.get(s, pd.NaT)   for s in station_ids), default=pd.NaT)
+                    precip_start = min((precip_start_by_sid.get(s, pd.NaT) for s in station_ids), default=pd.NaT)
+                    flow_end = flow_end_by_site.get(site_no, pd.NaT)
+                    expected_end = min(precip_end, flow_end) if pd.notna(precip_end) and pd.notna(flow_end) else pd.NaT
+                    stored_end   = existing_common_end.get((site_no, source),   pd.NaT)
+                    stored_start = existing_common_start.get((site_no, source), pd.NaT)
+                    end_unchanged   = pd.notna(expected_end)  and pd.notna(stored_end)   and expected_end  <= stored_end
+                    start_unchanged = not (pd.notna(precip_start) and pd.notna(stored_start) and precip_start < stored_start)
+                    if end_unchanged and start_unchanged:
+                        log.info("[%s][%d/%d] %s: already complete, skipping",
+                                 source, i, n_st, site_no)
+                        continue
+                    log.info("[%s][%d/%d] %s: complete but data changed (start %s | end %s → %s), reprocessing",
+                             source, i, n_st, site_no,
+                             precip_start.date() if pd.notna(precip_start) else "?",
+                             stored_end.date()   if pd.notna(stored_end)   else "?",
+                             expected_end.date() if pd.notna(expected_end) else "?")
 
                 if not station_ids:
                     log.warning("[%s][%d/%d] %s: no station assigned, skipping",

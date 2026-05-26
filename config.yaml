@@ -126,7 +126,7 @@ execution:
 #   same period.  end_date null = today.
 # ---------------------------------------------------------------------------
 noaa_precip:
-  start_date: "2020-10-14"    # align with MRMS archive start
+  start_date: "2002-01-01"    # align with streamflow and Stage IV record start
   end_date: null               # null = today
 
 # ---------------------------------------------------------------------------
