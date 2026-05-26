@@ -205,6 +205,8 @@ launch-ec2.bat
 
 This creates a security group that allows SSH only from your current public IP, launches an `m5.2xlarge` Ubuntu 24.04 instance with a 200 GB gp3 root volume, attaches the `EC2-INDOT-Pipeline` instance profile, and prints the SSH connection command when the instance is ready.
 
+> **Connecting from a different machine (or after your IP changes):** The security group rule is locked to the IP that ran `launch-ec2.bat`. If your public IP has changed — or you are connecting from a different machine — run `update-ssh-access.bat` first. It detects your current IP, revokes the old SSH rule, and adds the new one. No instance restart is needed.
+
 ### 6.2 Provision the Python environment
 
 #### Authenticate to GitHub from EC2
@@ -525,6 +527,7 @@ indot_pipeline/
 ├── create-s3-bucket.bat                   <- AWS CLI: create output S3 bucket
 ├── create-iam-role.bat                    <- AWS CLI: create EC2 IAM role + instance profile
 ├── launch-ec2.bat                         <- AWS CLI: launch EC2 instance (m5.2xlarge)
+├── update-ssh-access.bat                  <- AWS CLI: update SSH security group rule to current machine's IP
 ├── upsize-ec2.bat                         <- AWS CLI: stop instance, resize to r5.2xlarge (64 GB), restart
 ├── downsize-ec2.bat                       <- AWS CLI: stop instance, restore to m5.2xlarge, restart
 └── scripts/
