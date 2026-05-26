@@ -197,6 +197,14 @@ def get_max_dates(df: Optional[pd.DataFrame]) -> dict:
     return df.groupby("station_id")["datetime_utc"].max().to_dict()
 
 
+def get_min_dates(df: Optional[pd.DataFrame]) -> dict:
+    if df is None or df.empty:
+        return {}
+    df = df.copy()
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+    return df.groupby("station_id")["datetime_utc"].min().to_dict()
+
+
 def _find_col(columns: list[str], candidates: list[str]) -> Optional[str]:
     upper = {c.upper(): c for c in columns}
     for cand in candidates:
@@ -335,18 +343,38 @@ def download_all(
     start_dt: pd.Timestamp,
     end_dt: pd.Timestamp,
     max_dates: dict,
+    min_dates: dict,
     max_workers: int = 8,
 ) -> pd.DataFrame:
+    def _fetch(sid, s, e) -> Optional[pd.DataFrame]:
+        if source == "isd":
+            return download_lcd_station(sid, s, e)
+        return download_ghcnh_station(sid, s, e)
+
     def _worker(row) -> Optional[pd.DataFrame]:
         sid = row["station_id"]
+        parts: list[pd.DataFrame] = []
+
+        # Historical gap: existing data starts after configured start_dt
+        existing_min = min_dates.get(sid)
+        if existing_min is not None:
+            existing_min = pd.Timestamp(existing_min)
+            if existing_min > start_dt + pd.Timedelta(hours=1):
+                hist_end = existing_min - pd.Timedelta(hours=1)
+                df = _fetch(sid, start_dt, hist_end)
+                if df is not None and not df.empty:
+                    parts.append(df)
+
+        # Recent gap: new data since existing max date
         eff_start = max_dates.get(sid, start_dt)
         if isinstance(eff_start, pd.Timestamp) and eff_start.tzinfo is not None:
             eff_start = eff_start + pd.Timedelta(hours=1)
-        if pd.Timestamp(eff_start) >= end_dt:
-            return None
-        if source == "isd":
-            return download_lcd_station(sid, pd.Timestamp(eff_start), end_dt)
-        return download_ghcnh_station(sid, pd.Timestamp(eff_start), end_dt)
+        if pd.Timestamp(eff_start) < end_dt:
+            df = _fetch(sid, pd.Timestamp(eff_start), end_dt)
+            if df is not None and not df.empty:
+                parts.append(df)
+
+        return pd.concat(parts, ignore_index=True) if parts else None
 
     frames: list[pd.DataFrame] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -430,7 +458,8 @@ def main() -> None:
 
     existing_isd  = _read_parquet_s3(bucket, f"{prefix}precip/noaa/isd_hourly.parquet")
     max_dates_isd = get_max_dates(existing_isd)
-    new_isd = download_all(isd_stations, "isd", start_dt, end_dt, max_dates_isd, max_workers)
+    min_dates_isd = get_min_dates(existing_isd)
+    new_isd = download_all(isd_stations, "isd", start_dt, end_dt, max_dates_isd, min_dates_isd, max_workers)
     _merge_and_write(
         new_isd, existing_isd, isd_stations,
         bucket, f"{prefix}precip/noaa/isd_hourly.parquet", "ISD/LCD",
@@ -446,7 +475,8 @@ def main() -> None:
 
         existing_ghcnh  = _read_parquet_s3(bucket, f"{prefix}precip/noaa/ghcnh_hourly.parquet")
         max_dates_ghcnh = get_max_dates(existing_ghcnh)
-        new_ghcnh = download_all(ghcnh_stations, "ghcnh", start_dt, end_dt, max_dates_ghcnh, max_workers)
+        min_dates_ghcnh = get_min_dates(existing_ghcnh)
+        new_ghcnh = download_all(ghcnh_stations, "ghcnh", start_dt, end_dt, max_dates_ghcnh, min_dates_ghcnh, max_workers)
         _merge_and_write(
             new_ghcnh, existing_ghcnh, ghcnh_stations,
             bucket, f"{prefix}precip/noaa/ghcnh_hourly.parquet", "GHCNh",
