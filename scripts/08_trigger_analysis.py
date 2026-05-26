@@ -558,11 +558,17 @@ def main() -> None:
     # Load existing results and identify (site_no, source) pairs already at 320 combinations.
     existing: pd.DataFrame | None = None
     complete_keys: set[tuple[str, str]] = set()
+    existing_common_end: dict[tuple[str, str], pd.Timestamp] = {}
     try:
         existing = _read_parquet_s3(bucket, f"{prefix}analysis/trigger_analysis.parquet")
         existing["site_no"] = existing["site_no"].astype(str)
         counts = existing.groupby(["site_no", "mrms_source"]).size()
         complete_keys = {(s, src) for (s, src), n in counts.items() if n == COMPLETE_COMBINATIONS}
+        existing_common_end = {
+            (s, src): grp["common_end"].max()
+            for (s, src), grp in existing.groupby(["site_no", "mrms_source"])
+            if (s, src) in complete_keys
+        }
         incomplete = int((counts < COMPLETE_COMBINATIONS).sum())
         log.info(
             "Existing results: %d rows | %d complete pairs | %d incomplete pairs to reprocess",
@@ -581,13 +587,24 @@ def main() -> None:
             log.error("Could not load MRMS %s: %s", source, e)
             continue
         mrms["site_no"] = mrms["site_no"].astype(str)
+        mrms_end_by_site = mrms.groupby("site_no")["datetime_utc"].max()
 
         n_mrms = len(stations_mrms)
         for i, site_no in enumerate(stations_mrms, 1):
             if (site_no, source) in complete_keys:
-                log.info("[%s][%d/%d] %s: already complete (%d combinations), skipping",
-                         source, i, n_mrms, site_no, COMPLETE_COMBINATIONS)
-                continue
+                mrms_end = mrms_end_by_site.get(site_no, pd.NaT)
+                flow_end = flow_end_by_site.get(site_no, pd.NaT)
+                expected_end = min(mrms_end, flow_end) if pd.notna(mrms_end) and pd.notna(flow_end) else pd.NaT
+                stored_end = existing_common_end.get((site_no, source), pd.NaT)
+                if pd.notna(expected_end) and pd.notna(stored_end) and expected_end <= stored_end:
+                    log.info("[%s][%d/%d] %s: already complete (%d combinations), skipping",
+                             source, i, n_mrms, site_no, COMPLETE_COMBINATIONS)
+                    continue
+                log.info("[%s][%d/%d] %s: complete but data extended (%s → %s), reprocessing",
+                         source, i, n_mrms, site_no,
+                         stored_end.date() if pd.notna(stored_end) else "?",
+                         expected_end.date() if pd.notna(expected_end) else "?")
+                complete_keys.discard((site_no, source))
 
             mrms_site = (
                 mrms[mrms["site_no"] == site_no]
