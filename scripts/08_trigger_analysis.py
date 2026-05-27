@@ -139,46 +139,55 @@ def load_gauges(bucket: str, prefix: str) -> pd.DataFrame:
     return df[["site_no", "dec_lat_va", "dec_long_va"]].dropna().reset_index(drop=True)
 
 
-def load_precip_stations_combined(
-    bucket: str, prefix: str
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Merge ISD and GHCNh hourly precip into one DataFrame.
+_STATION_SOURCES_CFG = [
+    ("isd",   "precip/noaa/isd_hourly.parquet",   "station_id"),
+    ("ghcnh", "precip/noaa/ghcnh_hourly.parquet", "station_id"),
+]
 
-    Returns (hourly_df, stations_meta).
-    hourly_df columns:   station_id, datetime_utc, precip_in
-    stations_meta cols:  station_id, latitude, longitude
-    """
-    sources_cfg = [
-        ("isd",   f"{prefix}precip/noaa/isd_hourly.parquet",   "station_id"),
-        ("ghcnh", f"{prefix}precip/noaa/ghcnh_hourly.parquet", "station_id"),
-    ]
+
+def load_station_meta(bucket: str, prefix: str) -> pd.DataFrame:
+    """Load only station_id/lat/lon from ISD and GHCNh — no time series rows."""
     frames: list[pd.DataFrame] = []
-    for tag, key, id_col in sources_cfg:
+    for tag, fname, id_col in _STATION_SOURCES_CFG:
         try:
-            df = _read_parquet_s3(bucket, key)
+            df = _read_parquet_s3(bucket, f"{prefix}{fname}",
+                                  columns=[id_col, "latitude", "longitude"])
             df = df.rename(columns={id_col: "_sid"})
             df["station_id"] = tag + "_" + df["_sid"].astype(str)
+            frames.append(
+                df[["station_id", "latitude", "longitude"]]
+                .dropna(subset=["latitude", "longitude"])
+                .drop_duplicates("station_id")
+            )
+        except Exception as e:
+            log.warning("Could not load %s station metadata: %s", tag, e)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).drop_duplicates("station_id").reset_index(drop=True)
+
+
+def load_precip_for_stations(
+    bucket: str, prefix: str, station_ids: set[str]
+) -> pd.DataFrame:
+    """Load full hourly precip filtered to the given station_ids."""
+    frames: list[pd.DataFrame] = []
+    for tag, fname, id_col in _STATION_SOURCES_CFG:
+        try:
+            df = _read_parquet_s3(bucket, f"{prefix}{fname}")
+            df = df.rename(columns={id_col: "_sid"})
+            df["station_id"] = tag + "_" + df["_sid"].astype(str)
+            df = df[df["station_id"].isin(station_ids)]
             df["precip_in"] = pd.to_numeric(df["precip_in"], errors="coerce")
-            frames.append(df[["station_id", "latitude", "longitude",
-                               "datetime_utc", "precip_in"]].copy())
+            frames.append(df[["station_id", "datetime_utc", "precip_in"]].copy())
             log.info("Loaded %s precip: %d rows, %d stations",
                      tag, len(df), df["station_id"].nunique())
         except Exception as e:
             log.warning("Could not load %s precip: %s", tag, e)
-
     if not frames:
-        return pd.DataFrame(), pd.DataFrame()
-
+        return pd.DataFrame()
     combined = pd.concat(frames, ignore_index=True)
     combined["datetime_utc"] = pd.to_datetime(combined["datetime_utc"], utc=True)
-
-    stations_meta = (
-        combined[["station_id", "latitude", "longitude"]]
-        .dropna(subset=["latitude", "longitude"])
-        .drop_duplicates(subset=["station_id"])
-        .reset_index(drop=True)
-    )
-    return combined[["station_id", "datetime_utc", "precip_in"]], stations_meta
+    return combined
 
 
 def assign_nearest_station(
@@ -639,14 +648,13 @@ def main() -> None:
             log.info("[%s][%d/%d] %s: %d combinations", source, i, n_mrms, site_no, len(records))
 
     # ── Station-based precipitation sources ──────────────────────────────────
-    log.info("Loading combined station precipitation (ISD + GHCNh)...")
-    precip_hourly, stations_meta = load_precip_stations_combined(bucket, prefix)
+    log.info("Loading station metadata (ISD + GHCNh) for assignment...")
+    stations_meta = load_station_meta(bucket, prefix)
 
-    if precip_hourly.empty or stations_meta.empty:
+    if stations_meta.empty:
         log.warning("No station precip data — skipping station_nearest and station_watershed.")
     else:
-        log.info("Station precip: %d rows, %d unique stations",
-                 len(precip_hourly), stations_meta["station_id"].nunique())
+        log.info("Station metadata: %d unique stations", len(stations_meta))
 
         log.info("Loading gauge locations for nearest-station assignment...")
         gauges = load_gauges(bucket, prefix)
@@ -659,6 +667,17 @@ def main() -> None:
             bucket, prefix, stations_station, stations_meta, nearest_assignments
         )
 
+        needed_ids = (
+            set(nearest_assignments.values())
+            | {sid for sids in watershed_masks.values() for sid in sids}
+        )
+        log.info("Loading precip time series for %d needed stations...", len(needed_ids))
+        precip_hourly = load_precip_for_stations(bucket, prefix, needed_ids)
+        if precip_hourly.empty:
+            log.warning("No station precip data — skipping station_nearest and station_watershed.")
+            stations_meta = pd.DataFrame()
+
+    if not stations_meta.empty:
         precip_end_by_sid   = precip_hourly.groupby("station_id")["datetime_utc"].max()
         precip_start_by_sid = precip_hourly.groupby("station_id")["datetime_utc"].min()
 
