@@ -51,7 +51,7 @@ log = logging.getLogger("03b_basin_char")
 
 NLDI_BASE      = "https://api.water.usgs.gov/nldi/linked-data/nwissite"
 EPQS_URL       = "https://epqs.nationalmap.gov/v1/json"
-STREAMCAT_BASE = "https://api.epa.gov/StreamCAT/metrics"
+STREAMCAT_BASE = "https://api.epa.gov/StreamCat/streams/metrics"
 
 # EPA StreamCat metric names (Ws suffix = total upstream watershed).
 # Urban (%U): NLCD 2019 developed low (22) / medium (23) / high intensity (24)
@@ -182,12 +182,13 @@ def fetch_land_cover(
         timeout=timeout,
     )
     r.raise_for_status()
-    items = r.json().get("Items") or r.json().get("items") or []
+    items = r.json().get("items") or r.json().get("Items") or []
     if not items:
         return None, None
     row = items[0]
-    pct_u = sum(row.get(f"{m}Ws") or 0.0 for m in _URBAN_METRICS)
-    pct_w = sum(row.get(f"{m}Ws") or 0.0 for m in _WATER_METRICS)
+    # StreamCat returns all field names in lowercase (e.g. "pcturblo2019ws")
+    pct_u = sum(row.get(f"{m.lower()}ws") or 0.0 for m in _URBAN_METRICS)
+    pct_w = sum(row.get(f"{m.lower()}ws") or 0.0 for m in _WATER_METRICS)
     return pct_u, pct_w
 
 
