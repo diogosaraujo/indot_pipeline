@@ -153,7 +153,7 @@ def _get_comid(site_no: str, timeout: int) -> str:
     if not features:
         raise ValueError(f"no upstream flowlines found for site {site_no}")
     props = features[0].get("properties", {})
-    comid = props.get("nhdpv2_COMID") or props.get("comid") or props.get("COMID")
+    comid = props.get("nhdplus_comid") or props.get("nhdpv2_COMID") or props.get("comid") or props.get("COMID")
     if not comid:
         raise ValueError(
             f"no ComID in flowline properties for site {site_no}; "
