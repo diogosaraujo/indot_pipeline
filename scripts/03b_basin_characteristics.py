@@ -18,11 +18,11 @@ tc_hr            Kirpich (1940) time of concentration (hours):
                  where L_ft   = stream_length_mi × 5280,
                        S_ftft = slope_ft_mi / 5280.
 pct_u            % urban land cover (NLCD 2019 developed low/medium/high
-                 intensity, classes 22+23+24, total watershed); from the NLDI
-                 total-watershed characteristics endpoint.
+                 intensity, classes 22+23+24, total watershed); from the EPA
+                 StreamCat API (api.epa.gov/StreamCAT/metrics) by ComID.
 pct_w            % water/wetland cover (NLCD 2019 open water + woody and
                  herbaceous wetlands, classes 11+90+95, total watershed); from
-                 the NLDI total-watershed characteristics endpoint.
+                 the EPA StreamCat API by ComID.
 
 Writes:
     s3://<bucket>/<prefix>watersheds/basin_characteristics.parquet
@@ -50,14 +50,14 @@ logging.basicConfig(
 log = logging.getLogger("03b_basin_char")
 
 NLDI_BASE      = "https://api.water.usgs.gov/nldi/linked-data/nwissite"
-NLDI_COMID_BASE = "https://api.water.usgs.gov/nldi/linked-data/comid"
 EPQS_URL       = "https://epqs.nationalmap.gov/v1/json"
+STREAMCAT_BASE = "https://api.epa.gov/StreamCAT/metrics"
 
-# NHDPlus v2.1 total-watershed characteristic IDs for NLCD 2019 land cover.
-# Urban (%U): developed low (22) / medium (23) / high intensity (24)
-_URBAN_IDS = ["TOT_NLCD2019_22", "TOT_NLCD2019_23", "TOT_NLCD2019_24"]
-# Water (%W): open water (11) / woody wetlands (90) / herbaceous wetlands (95)
-_WATER_IDS = ["TOT_NLCD2019_11", "TOT_NLCD2019_90", "TOT_NLCD2019_95"]
+# EPA StreamCat metric names (Ws suffix = total upstream watershed).
+# Urban (%U): NLCD 2019 developed low (22) / medium (23) / high intensity (24)
+_URBAN_METRICS = ["PctUrbLo2019", "PctUrbMd2019", "PctUrbHi2019"]
+# Water (%W): NLCD 2019 open water (11) / woody (90) / herbaceous wetlands (95)
+_WATER_METRICS = ["PctOw2019", "PctWdWet2019", "PctHbWet2019"]
 
 
 # ── Distance / elevation helpers ──────────────────────────────────────────────
@@ -163,39 +163,31 @@ def _get_comid(site_no: str, timeout: int) -> str:
 
 
 def fetch_land_cover(
-    site_no: str, timeout: int
+    comid: str, timeout: int
 ) -> tuple[Optional[float], Optional[float]]:
-    """Fetch total-watershed urban and water/wetland fractions from NLDI.
-
-    NLDI characteristics are stored by NHDPlus ComID, not by USGS site number.
-    This function first resolves the ComID for the site, then fetches the /tot
-    characteristics from the comid endpoint.
+    """Fetch total-watershed urban and water/wetland fractions from EPA StreamCat.
 
     Returns (pct_u, pct_w) as percentages (0–100), or (None, None) if the
-    response contains no matching characteristic IDs.
+    ComID is not found in the StreamCat dataset.
     Raises requests.RequestException on network failure (caller should retry).
     """
-    comid = _get_comid(site_no, timeout)
-    r = requests.get(f"{NLDI_COMID_BASE}/{comid}/tot", timeout=timeout)
+    all_metrics = _URBAN_METRICS + _WATER_METRICS
+    r = requests.get(
+        STREAMCAT_BASE,
+        params={
+            "name": ",".join(all_metrics),
+            "comid": comid,
+            "areaOfInterest": "watershed",
+        },
+        timeout=timeout,
+    )
     r.raise_for_status()
-    data = r.json()
-
-    char_vals: dict[str, float] = {}
-    items = data if isinstance(data, list) else data.get("characteristics", [])
-    for item in items:
-        cid = item.get("characteristic_id") or item.get("characteristicId") or ""
-        raw = item.get("characteristic_value") or item.get("value")
-        try:
-            char_vals[cid] = float(raw)
-        except (TypeError, ValueError):
-            pass
-
-    if not char_vals:
-        log.warning("%s: no characteristics returned by NLDI /tot", site_no)
+    items = r.json().get("Items") or r.json().get("items") or []
+    if not items:
         return None, None
-
-    pct_u = sum(char_vals.get(cid, 0.0) for cid in _URBAN_IDS)
-    pct_w = sum(char_vals.get(cid, 0.0) for cid in _WATER_IDS)
+    row = items[0]
+    pct_u = sum(row.get(f"{m}Ws") or 0.0 for m in _URBAN_METRICS)
+    pct_w = sum(row.get(f"{m}Ws") or 0.0 for m in _WATER_METRICS)
     return pct_u, pct_w
 
 
@@ -275,17 +267,29 @@ def process_site(
     if length_mi is not None and slope is not None:
         out["tc_hr"] = round(kirpich_tc_hr(length_mi, slope), 3)
 
-    # ── Land cover (pct_u, pct_w) ──────────────────────────────────────────
+    # ── ComID → needed for StreamCat land cover ────────────────────────────
+    comid: Optional[str] = None
     try:
-        pct_u, pct_w = with_retries(
-            lambda: fetch_land_cover(site_no, timeout),
+        comid = with_retries(
+            lambda: _get_comid(site_no, timeout),
             RetryPolicy(max_attempts=3, base_delay=3.0),
             exceptions=(requests.RequestException,),
         )
-        out["pct_u"] = round(pct_u, 2) if pct_u is not None else None
-        out["pct_w"] = round(pct_w, 2) if pct_w is not None else None
     except Exception as e:
-        log.warning("%s: land cover fetch failed (%s)", site_no, e)
+        log.warning("%s: comid lookup failed (%s) — land cover will be null", site_no, e)
+
+    # ── Land cover (pct_u, pct_w) ──────────────────────────────────────────
+    if comid is not None:
+        try:
+            pct_u, pct_w = with_retries(
+                lambda: fetch_land_cover(comid, timeout),
+                RetryPolicy(max_attempts=3, base_delay=3.0),
+                exceptions=(requests.RequestException,),
+            )
+            out["pct_u"] = round(pct_u, 2) if pct_u is not None else None
+            out["pct_w"] = round(pct_w, 2) if pct_w is not None else None
+        except Exception as e:
+            log.warning("%s: land cover fetch failed (%s)", site_no, e)
 
     log.debug(
         "%s: da=%.2f mi² len=%.2f mi slope=%.2f ft/mi tc=%.2f hr pct_u=%s pct_w=%s",
