@@ -140,17 +140,25 @@ def kirpich_tc_hr(length_mi: float, slope_ft_mi: float) -> float:
 def _get_comid(site_no: str, timeout: int) -> str:
     """Return the NHDPlus ComID for a USGS streamgage via NLDI.
 
-    NLDI characteristics are indexed by ComID, not by USGS site number, so
-    this lookup is required before fetching /tot characteristics.
-    Raises requests.RequestException on network failure or ValueError if the
-    response contains no comid field.
+    The /linked-data/nwissite feature endpoint does not consistently expose a
+    comid property, so we resolve it from the nearest upstream flowline, which
+    carries an nhdpv2_COMID property in all NLDI versions.
+    Raises requests.RequestException on network failure (caller should retry).
+    Raises ValueError if no flowlines are found or the ComID is absent.
     """
-    r = requests.get(f"{NLDI_BASE}/USGS-{site_no}", timeout=timeout)
+    url = f"{NLDI_BASE}/USGS-{site_no}/navigation/UM/flowlines?distance=10"
+    r = requests.get(url, timeout=timeout)
     r.raise_for_status()
-    props = r.json().get("properties", {})
-    comid = props.get("comid") or props.get("nhdpv2_COMID")
+    features = r.json().get("features", [])
+    if not features:
+        raise ValueError(f"no upstream flowlines found for site {site_no}")
+    props = features[0].get("properties", {})
+    comid = props.get("nhdpv2_COMID") or props.get("comid") or props.get("COMID")
     if not comid:
-        raise ValueError(f"no comid in NLDI response for site {site_no}")
+        raise ValueError(
+            f"no ComID in flowline properties for site {site_no}; "
+            f"available keys: {list(props.keys())}"
+        )
     return str(comid)
 
 
