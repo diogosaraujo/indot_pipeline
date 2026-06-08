@@ -49,8 +49,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("03b_basin_char")
 
-NLDI_BASE = "https://api.water.usgs.gov/nldi/linked-data/nwissite"
-EPQS_URL  = "https://epqs.nationalmap.gov/v1/json"
+NLDI_BASE      = "https://api.water.usgs.gov/nldi/linked-data/nwissite"
+NLDI_COMID_BASE = "https://api.water.usgs.gov/nldi/linked-data/comid"
+EPQS_URL       = "https://epqs.nationalmap.gov/v1/json"
 
 # NHDPlus v2.1 total-watershed characteristic IDs for NLCD 2019 land cover.
 # Urban (%U): developed low (22) / medium (23) / high intensity (24)
@@ -136,16 +137,38 @@ def kirpich_tc_hr(length_mi: float, slope_ft_mi: float) -> float:
 
 # ── Land cover characteristics ────────────────────────────────────────────────
 
+def _get_comid(site_no: str, timeout: int) -> str:
+    """Return the NHDPlus ComID for a USGS streamgage via NLDI.
+
+    NLDI characteristics are indexed by ComID, not by USGS site number, so
+    this lookup is required before fetching /tot characteristics.
+    Raises requests.RequestException on network failure or ValueError if the
+    response contains no comid field.
+    """
+    r = requests.get(f"{NLDI_BASE}/USGS-{site_no}", timeout=timeout)
+    r.raise_for_status()
+    props = r.json().get("properties", {})
+    comid = props.get("comid") or props.get("nhdpv2_COMID")
+    if not comid:
+        raise ValueError(f"no comid in NLDI response for site {site_no}")
+    return str(comid)
+
+
 def fetch_land_cover(
     site_no: str, timeout: int
 ) -> tuple[Optional[float], Optional[float]]:
     """Fetch total-watershed urban and water/wetland fractions from NLDI.
 
+    NLDI characteristics are stored by NHDPlus ComID, not by USGS site number.
+    This function first resolves the ComID for the site, then fetches the /tot
+    characteristics from the comid endpoint.
+
     Returns (pct_u, pct_w) as percentages (0–100), or (None, None) if the
     response contains no matching characteristic IDs.
     Raises requests.RequestException on network failure (caller should retry).
     """
-    r = requests.get(f"{NLDI_BASE}/USGS-{site_no}/tot", timeout=timeout)
+    comid = _get_comid(site_no, timeout)
+    r = requests.get(f"{NLDI_COMID_BASE}/{comid}/tot", timeout=timeout)
     r.raise_for_status()
     data = r.json()
 
