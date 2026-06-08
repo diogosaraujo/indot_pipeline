@@ -1,0 +1,355 @@
+"""03b_basin_characteristics.py
+
+Compute and store basin-level physical characteristics for every Indiana
+streamflow gauge.  Reads the station inventory (script 01) and the watershed
+polygons from S3 (script 03).
+
+Characteristics produced per gauge
+-----------------------------------
+drain_area_mi2   Drainage area (mi²); from NWIS drain_area_va, falling back to
+                 the geodesic area of the NLDI watershed polygon from script 03.
+stream_length_mi Length of the upstream main stem (mi); from the NLDI UM
+                 navigation endpoint (2000-mi cap).
+slope_ft_mi      10-85 main-channel slope (ft/mi); 3DEP elevation queried at
+                 the 10th and 85th percentile distance points along the main
+                 stem, divided by 75% of the total channel length.
+tc_hr            Kirpich (1940) time of concentration (hours):
+                     Tc (min) = 0.0078 × L_ft^0.77 × S_ftft^-0.385
+                 where L_ft   = stream_length_mi × 5280,
+                       S_ftft = slope_ft_mi / 5280.
+pct_u            % urban land cover (NLCD 2019 developed low/medium/high
+                 intensity, classes 22+23+24, total watershed); from the NLDI
+                 total-watershed characteristics endpoint.
+pct_w            % water/wetland cover (NLCD 2019 open water + woody and
+                 herbaceous wetlands, classes 11+90+95, total watershed); from
+                 the NLDI total-watershed characteristics endpoint.
+
+Writes:
+    s3://<bucket>/<prefix>watersheds/basin_characteristics.parquet
+"""
+from __future__ import annotations
+
+import io
+import logging
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+
+import geopandas as gpd
+import pandas as pd
+import pyarrow.parquet as pq
+import requests
+from pyproj import Geod
+
+from utils import RetryPolicy, load_config, s3_client, with_retries, write_parquet_to_s3
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s",
+)
+log = logging.getLogger("03b_basin_char")
+
+NLDI_BASE = "https://api.water.usgs.gov/nldi/linked-data/nwissite"
+EPQS_URL  = "https://epqs.nationalmap.gov/v1/json"
+
+# NHDPlus v2.1 total-watershed characteristic IDs for NLCD 2019 land cover.
+# Urban (%U): developed low (22) / medium (23) / high intensity (24)
+_URBAN_IDS = ["TOT_NLCD2019_22", "TOT_NLCD2019_23", "TOT_NLCD2019_24"]
+# Water (%W): open water (11) / woody wetlands (90) / herbaceous wetlands (95)
+_WATER_IDS = ["TOT_NLCD2019_11", "TOT_NLCD2019_90", "TOT_NLCD2019_95"]
+
+
+# ── Distance / elevation helpers ──────────────────────────────────────────────
+
+def _haversine_mi(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    R = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    a = (
+        math.sin((phi2 - phi1) / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin((lon2 - lon1) * math.pi / 360) ** 2
+    )
+    return R * 2 * math.asin(math.sqrt(max(0.0, min(1.0, a))))
+
+
+def _elevation_ft(lon: float, lat: float, timeout: int) -> float:
+    r = requests.get(
+        EPQS_URL,
+        params={"x": lon, "y": lat, "units": "Feet", "wkid": 4326, "includeDate": "false"},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return float(r.json()["value"])
+
+
+# ── Channel geometry ──────────────────────────────────────────────────────────
+
+def fetch_channel_geometry(
+    site_no: str, timeout: int
+) -> tuple[Optional[float], Optional[float]]:
+    """Return (stream_length_mi, slope_ft_mi) from the NLDI upstream main stem
+    and USGS 3DEP elevation at the 10th and 85th percentile distance points.
+
+    Returns (None, None) if the main stem cannot be fetched or is too short.
+    Raises requests.RequestException on network failure (caller should retry).
+    """
+    url = f"{NLDI_BASE}/USGS-{site_no}/navigation/UM/flowlines?distance=2000"
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    coords: list[tuple[float, float]] = []
+    for feat in r.json().get("features", []):
+        coords.extend(feat["geometry"]["coordinates"])
+    if len(coords) < 2:
+        return None, None
+
+    cum = [0.0]
+    for i in range(1, len(coords)):
+        cum.append(cum[-1] + _haversine_mi(*coords[i - 1], *coords[i]))
+    total_mi = cum[-1]
+    if total_mi <= 0:
+        return None, None
+
+    def _coord_at(frac: float) -> tuple[float, float]:
+        target = frac * total_mi
+        for i in range(1, len(cum)):
+            if cum[i] >= target:
+                return coords[i]
+        return coords[-1]
+
+    p10 = _coord_at(0.10)
+    p85 = _coord_at(0.85)
+    e10 = _elevation_ft(*p10, timeout)
+    e85 = _elevation_ft(*p85, timeout)
+
+    slope_ft_mi = abs(e85 - e10) / (0.75 * total_mi)
+    return total_mi, max(slope_ft_mi, 0.1)
+
+
+def kirpich_tc_hr(length_mi: float, slope_ft_mi: float) -> float:
+    """Kirpich (1940) time of concentration in hours.
+
+    Tc (min) = 0.0078 × L_ft^0.77 × S_ftft^-0.385
+    """
+    L_ft   = length_mi * 5280.0
+    S_ftft = slope_ft_mi / 5280.0
+    return 0.0078 * (L_ft ** 0.77) * (S_ftft ** -0.385) / 60.0
+
+
+# ── Land cover characteristics ────────────────────────────────────────────────
+
+def fetch_land_cover(
+    site_no: str, timeout: int
+) -> tuple[Optional[float], Optional[float]]:
+    """Fetch total-watershed urban and water/wetland fractions from NLDI.
+
+    Returns (pct_u, pct_w) as percentages (0–100), or (None, None) if the
+    response contains no matching characteristic IDs.
+    Raises requests.RequestException on network failure (caller should retry).
+    """
+    r = requests.get(f"{NLDI_BASE}/USGS-{site_no}/tot", timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+
+    char_vals: dict[str, float] = {}
+    items = data if isinstance(data, list) else data.get("characteristics", [])
+    for item in items:
+        cid = item.get("characteristic_id") or item.get("characteristicId") or ""
+        raw = item.get("characteristic_value") or item.get("value")
+        try:
+            char_vals[cid] = float(raw)
+        except (TypeError, ValueError):
+            pass
+
+    if not char_vals:
+        log.warning("%s: no characteristics returned by NLDI /tot", site_no)
+        return None, None
+
+    pct_u = sum(char_vals.get(cid, 0.0) for cid in _URBAN_IDS)
+    pct_w = sum(char_vals.get(cid, 0.0) for cid in _WATER_IDS)
+    return pct_u, pct_w
+
+
+# ── Drainage area ─────────────────────────────────────────────────────────────
+
+_M2_PER_MI2 = 2_589_988.1
+_GEOD = Geod(ellps="WGS84")
+
+
+def area_mi2_from_s3_geojson(site_no: str, bucket: str, prefix: str) -> Optional[float]:
+    key = f"{prefix}watersheds/per_gauge/{site_no}.geojson"
+    try:
+        obj = s3_client().get_object(Bucket=bucket, Key=key)
+        gdf = gpd.read_file(io.BytesIO(obj["Body"].read()))
+        if gdf.empty:
+            return None
+        total_m2 = sum(
+            abs(_GEOD.geometry_area_perimeter(geom)[0])
+            for geom in gdf.geometry
+            if geom is not None
+        )
+        return total_m2 / _M2_PER_MI2 if total_m2 > 0 else None
+    except Exception as e:
+        log.debug("%s: polygon area failed: %s", site_no, e)
+        return None
+
+
+# ── Per-station processor ─────────────────────────────────────────────────────
+
+def process_site(
+    site_no: str,
+    da_hint: Optional[float],
+    bucket: str,
+    prefix: str,
+    cfg: dict,
+) -> dict:
+    timeout = cfg["streamstats"]["request_timeout_sec"]
+    out: dict = {
+        "site_no":          site_no,
+        "drain_area_mi2":   None,
+        "stream_length_mi": None,
+        "slope_ft_mi":      None,
+        "tc_hr":            None,
+        "pct_u":            None,
+        "pct_w":            None,
+    }
+
+    # ── Drainage area ──────────────────────────────────────────────────────
+    da: Optional[float] = (
+        float(da_hint)
+        if (da_hint is not None and not pd.isna(da_hint) and float(da_hint) > 0)
+        else None
+    )
+    if da is None:
+        da = area_mi2_from_s3_geojson(site_no, bucket, prefix)
+        if da is not None:
+            log.debug("%s: drain area from S3 polygon = %.2f mi²", site_no, da)
+    if da is None:
+        log.warning("%s: no drainage area available", site_no)
+    out["drain_area_mi2"] = round(da, 4) if da is not None else None
+
+    # ── Channel geometry (length + 10-85 slope) ────────────────────────────
+    try:
+        length_mi, slope = with_retries(
+            lambda: fetch_channel_geometry(site_no, timeout),
+            RetryPolicy(max_attempts=3, base_delay=3.0),
+            exceptions=(requests.RequestException,),
+        )
+    except Exception as e:
+        log.warning("%s: channel geometry failed (%s)", site_no, e)
+        length_mi, slope = None, None
+
+    out["stream_length_mi"] = round(length_mi, 4) if length_mi is not None else None
+    out["slope_ft_mi"]      = round(slope, 3)      if slope      is not None else None
+
+    # ── Kirpich Tc ─────────────────────────────────────────────────────────
+    if length_mi is not None and slope is not None:
+        out["tc_hr"] = round(kirpich_tc_hr(length_mi, slope), 3)
+
+    # ── Land cover (pct_u, pct_w) ──────────────────────────────────────────
+    try:
+        pct_u, pct_w = with_retries(
+            lambda: fetch_land_cover(site_no, timeout),
+            RetryPolicy(max_attempts=3, base_delay=3.0),
+            exceptions=(requests.RequestException,),
+        )
+        out["pct_u"] = round(pct_u, 2) if pct_u is not None else None
+        out["pct_w"] = round(pct_w, 2) if pct_w is not None else None
+    except Exception as e:
+        log.warning("%s: land cover fetch failed (%s)", site_no, e)
+
+    log.debug(
+        "%s: da=%.2f mi² len=%.2f mi slope=%.2f ft/mi tc=%.2f hr pct_u=%s pct_w=%s",
+        site_no,
+        da or 0.0, length_mi or 0.0, slope or 0.0, out["tc_hr"] or 0.0,
+        out["pct_u"], out["pct_w"],
+    )
+    return out
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    cfg = load_config()
+    bucket = cfg["aws"]["output_bucket"]
+    prefix = cfg["aws"]["output_prefix"]
+    out_key = f"{prefix}watersheds/basin_characteristics.parquet"
+
+    obj = s3_client().get_object(
+        Bucket=bucket, Key=f"{prefix}stations/indiana_streamflow_sites.parquet"
+    )
+    inv = pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
+    inv["site_no"] = inv["site_no"].astype(str)
+    log.info("Loaded %d stations from inventory", len(inv))
+
+    # Skip stations that already have all fields populated
+    complete_sites: set[str] = set()
+    existing = pd.DataFrame()
+    try:
+        obj = s3_client().get_object(Bucket=bucket, Key=out_key)
+        existing = pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
+        existing["site_no"] = existing["site_no"].astype(str)
+        required = ["drain_area_mi2", "stream_length_mi", "slope_ft_mi", "tc_hr", "pct_u", "pct_w"]
+        complete_sites = set(existing.dropna(subset=required)["site_no"])
+        log.info(
+            "Existing output: %d rows, %d complete — skipping those",
+            len(existing), len(complete_sites),
+        )
+    except Exception:
+        log.info("No existing output — running fresh")
+
+    targets = inv[~inv["site_no"].isin(complete_sites)].copy()
+    log.info("Stations to process: %d", len(targets))
+    if targets.empty:
+        log.info("Nothing to do.")
+        return
+
+    max_workers = cfg["streamstats"].get("max_concurrent", 8)
+    results: list[dict] = []
+    n = len(targets)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {
+            ex.submit(
+                process_site,
+                str(row["site_no"]),
+                row.get("drain_area_va"),
+                bucket,
+                prefix,
+                cfg,
+            ): str(row["site_no"])
+            for _, row in targets.iterrows()
+        }
+        done = 0
+        for fut in as_completed(futs):
+            site = futs[fut]
+            done += 1
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                log.error("%s: unexpected error: %s", site, e)
+            if done % 25 == 0 or done == n:
+                log.info("[%d/%d]", done, n)
+
+    parts: list[pd.DataFrame] = []
+    if not existing.empty and complete_sites:
+        parts.append(existing[existing["site_no"].isin(complete_sites)])
+    if results:
+        parts.append(pd.DataFrame(results))
+    if not parts:
+        log.error("No results produced.")
+        return
+
+    out_df = (
+        pd.concat(parts, ignore_index=True)
+        .sort_values("site_no")
+        .reset_index(drop=True)
+    )
+    write_parquet_to_s3(out_df, bucket, out_key)
+    n_tc  = out_df["tc_hr"].notna().sum()
+    n_lc  = out_df["pct_u"].notna().sum()
+    log.info(
+        "Wrote basin_characteristics.parquet: %d stations, %d with Tc, %d with land cover",
+        len(out_df), n_tc, n_lc,
+    )
+
+
+if __name__ == "__main__":
+    main()
