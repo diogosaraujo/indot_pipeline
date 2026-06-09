@@ -255,7 +255,7 @@ def process_site(
         length_mi, slope = with_retries(
             lambda: fetch_channel_geometry(site_no, timeout),
             RetryPolicy(max_attempts=3, base_delay=3.0),
-            exceptions=(requests.ConnectionError, requests.Timeout),
+            exceptions=(requests.ConnectionError, requests.Timeout, requests.HTTPError),
         )
     except Exception as e:
         log.warning("%s: channel geometry failed (%s)", site_no, e)
@@ -274,7 +274,7 @@ def process_site(
         comid = with_retries(
             lambda: _get_comid(site_no, timeout),
             RetryPolicy(max_attempts=3, base_delay=3.0),
-            exceptions=(requests.ConnectionError, requests.Timeout),
+            exceptions=(requests.ConnectionError, requests.Timeout, requests.HTTPError),
         )
     except Exception as e:
         log.warning("%s: comid lookup failed (%s) — land cover will be null", site_no, e)
@@ -285,7 +285,7 @@ def process_site(
             pct_u, pct_w = with_retries(
                 lambda: fetch_land_cover(comid, timeout),
                 RetryPolicy(max_attempts=3, base_delay=3.0),
-                exceptions=(requests.ConnectionError, requests.Timeout),
+                exceptions=(requests.ConnectionError, requests.Timeout, requests.HTTPError),
             )
             out["pct_u"] = round(pct_u, 2) if pct_u is not None else None
             out["pct_w"] = round(pct_w, 2) if pct_w is not None else None
