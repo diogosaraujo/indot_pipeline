@@ -231,55 +231,55 @@ def _fetch_via_epa_rest() -> gpd.GeoDataFrame:
     return gdf
 
 
-def _fetch_via_nldi_stations() -> gpd.GeoDataFrame:
-    """NLDI upstream-tributaries navigation from gauges in the bbox.
+def _fetch_via_nldi_position() -> gpd.GeoDataFrame:
+    """Find the NHD reach nearest to the bbox centre, then navigate all
+    upstream tributaries within the bbox diagonal distance.
 
-    Falls back to NLDI which the pipeline already uses successfully from AWS.
-    Reads the station inventory from S3, finds gauges in the bbox, then
-    fetches upstream tributary flowlines for each.
+    Works from any location — does not require a gauge inside the bbox.
+    Uses api.water.usgs.gov/nldi which the pipeline already calls from AWS.
     """
-    NLDI = "https://api.water.usgs.gov/nldi/linked-data/nwissite"
-    inv = _read_pipeline_parquet(f"{PIPELINE_PREFIX}stations/indiana_streamflow_sites.parquet")
-    inv["site_no"] = inv["site_no"].astype(str)
-    local = inv[
-        inv["dec_lat_va"].between(LAT_MIN, LAT_MAX) &
-        inv["dec_long_va"].between(LON_MIN, LON_MAX)
-    ]
-    if local.empty:
-        # Expand search to a 0.2° buffer around the bbox centre
-        clat = (LAT_MIN + LAT_MAX) / 2
-        clon = (LON_MIN + LON_MAX) / 2
-        local = inv[
-            inv["dec_lat_va"].between(clat - 0.1, clat + 0.1) &
-            inv["dec_long_va"].between(clon - 0.1, clon + 0.1)
-        ]
-    if local.empty:
-        raise RuntimeError("No gauges found near the bbox to seed NLDI navigation.")
+    import math
+    centre_lon = (LON_MIN + LON_MAX) / 2
+    centre_lat = (LAT_MIN + LAT_MAX) / 2
 
-    print(f"  NLDI fallback: seeding from {len(local)} gauge(s): "
-          f"{local['site_no'].tolist()}")
-    frames: list[gpd.GeoDataFrame] = []
-    for site_no in local["site_no"]:
-        url = f"{NLDI}/USGS-{site_no}/navigation/UT/flowlines?distance=200"
-        try:
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
-            gdf = gpd.read_file(io.StringIO(r.text))
-            if not gdf.empty:
-                frames.append(gdf)
-        except Exception as e:
-            print(f"    NLDI {site_no}: {e}")
-    if not frames:
-        raise RuntimeError("NLDI returned no flowlines.")
-    combined = gpd.GeoDataFrame(
-        pd.concat(frames, ignore_index=True), crs="EPSG:4326"
+    # Step 1: nearest NHD COMID to bbox centre
+    r = requests.get(
+        "https://api.water.usgs.gov/nldi/linked-data/comid/position",
+        params={"coords": f"POINT({centre_lon} {centre_lat})"},
+        timeout=30,
     )
-    # nhdplus_comid is the field NLDI returns for the reach COMID
+    r.raise_for_status()
+    comid = r.json()["features"][0]["properties"]["identifier"]
+    print(f"  Nearest COMID to bbox centre: {comid}")
+
+    # Step 2: upstream tributaries — distance = 2× bbox diagonal
+    diag_km = math.sqrt(
+        ((LON_MAX - LON_MIN) * 111 * math.cos(math.radians(centre_lat))) ** 2
+        + ((LAT_MAX - LAT_MIN) * 111) ** 2
+    )
+    r2 = requests.get(
+        f"https://api.water.usgs.gov/nldi/linked-data/comid/{comid}"
+        f"/navigation/UT/flowlines",
+        params={"distance": max(50, int(diag_km * 2))},
+        timeout=60,
+    )
+    r2.raise_for_status()
+    gdf = gpd.read_file(io.StringIO(r2.text))
+    if gdf.empty:
+        raise RuntimeError("NLDI position navigation returned no flowlines.")
+
+    # Keep only reaches that intersect the bbox
+    from shapely.geometry import box as shapely_box
+    bbox_geom = shapely_box(LON_MIN, LAT_MIN, LON_MAX, LAT_MAX)
+    gdf = gdf[gdf.geometry.intersects(bbox_geom)].copy()
+    if gdf.empty:
+        raise RuntimeError("No NLDI flowlines intersect the bbox.")
+
     for candidate in ("nhdplus_comid", "comid", "COMID"):
-        if candidate in combined.columns:
-            combined = combined.rename(columns={candidate: "comid"})
+        if candidate in gdf.columns:
+            gdf = gdf.rename(columns={candidate: "comid"})
             break
-    return combined.drop_duplicates(subset=["comid"])
+    return gdf.drop_duplicates(subset=["comid"])
 
 
 def fetch_nhd_flowlines() -> gpd.GeoDataFrame:
@@ -292,8 +292,8 @@ def fetch_nhd_flowlines() -> gpd.GeoDataFrame:
     """
     print("\n── Fetching NHD flowlines ───────────────────────────────────────────────")
     for attempt, fetcher in [
-        ("EPA WATERS REST",  _fetch_via_epa_rest),
-        ("NLDI navigation",  _fetch_via_nldi_stations),
+        ("EPA WATERS REST",       _fetch_via_epa_rest),
+        ("NLDI position+UT",     _fetch_via_nldi_position),
     ]:
         try:
             print(f"  Trying {attempt}...")
@@ -412,7 +412,7 @@ def make_animation(
     norm_1h  = mcolors.Normalize(vmin=0.01, vmax=QPE_1H_VMAX)
     norm_3h  = mcolors.Normalize(vmin=0.01, vmax=QPE_3H_VMAX)
     norm_nwm = mcolors.LogNorm(vmin=NWM_Q_VMIN, vmax=NWM_Q_VMAX)
-    nwm_cmap = plt.get_cmap("Blues")
+    nwm_cmap = plt.get_cmap("plasma_r")   # dark-purple (low) → yellow (high); always visible
 
     # ── Figure layout ──────────────────────────────────────────────────────────
     fig, axes = plt.subplots(
@@ -526,8 +526,13 @@ def make_animation(
             q_vals = np.clip(q_vals, NWM_Q_VMIN, NWM_Q_VMAX)
             colors = nwm_cmap(norm_nwm(q_vals))
             lc.set_colors(colors)
+            # Scale linewidth: 2 px at vmin, up to 8 px at vmax
+            log_range = np.log10(NWM_Q_VMAX) - np.log10(NWM_Q_VMIN)
+            lw = 2.0 + 6.0 * (np.log10(q_vals) - np.log10(NWM_Q_VMIN)) / log_range
+            lc.set_linewidths(np.clip(lw, 2.0, 8.0))
         else:
-            lc.set_colors(["#aaaaaa"] * max(len(all_segs), 1))
+            lc.set_colors(["#555588"] * max(len(all_segs), 1))
+            lc.set_linewidths(2.0)
 
         # -- Timestamp: UTC + local (EDT = UTC-4) --
         utc_dt  = datetime(EVENT_DATE.year, EVENT_DATE.month, EVENT_DATE.day,
