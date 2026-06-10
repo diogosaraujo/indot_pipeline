@@ -16,7 +16,6 @@ Writes:
 from __future__ import annotations
 
 import ast
-import io
 import math
 import os
 import re
@@ -36,6 +35,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import requests
 import s3fs
+from pyproj import Geod
+from shapely.geometry import shape as shapely_shape
 
 sys.path.insert(0, str(Path(__file__).parent))
 from utils import apply_units, canonicalize_mrms_grid, decompress_gz, open_mrms_grib
@@ -109,6 +110,24 @@ def _apply_regression(region: int, rp: int, da: float, slope: float,
 
 # ── Basin characteristics for an arbitrary NHD COMID ─────────────────────────
 
+_GEOD       = Geod(ellps="WGS84")
+_M2_TO_MI2  = 2_589_988.1
+
+
+def _get_nldi_basin_area_mi2(comid: str, timeout: int = 30) -> Optional[float]:
+    """Compute watershed area (mi²) from the NLDI basin polygon for a COMID."""
+    r = requests.get(
+        f"https://api.water.usgs.gov/nldi/linked-data/comid/{comid}/basin",
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    total_m2 = 0.0
+    for feat in r.json().get("features", []):
+        geom = shapely_shape(feat["geometry"])
+        total_m2 += abs(_GEOD.geometry_area_perimeter(geom)[0])
+    return round(total_m2 / _M2_TO_MI2, 4) if total_m2 > 0 else None
+
+
 def get_point_comid(lat: float, lon: float) -> str:
     r = requests.get(
         "https://api.water.usgs.gov/nldi/linked-data/comid/position",
@@ -141,14 +160,21 @@ def get_basin_chars(comid: str) -> dict:
     """Drainage area (mi²), 10-85 slope (ft/mi), pct_u, pct_w for a COMID."""
     out = {"drain_area_mi2": None, "slope_ft_mi": 1.0, "pct_u": 0.0, "pct_w": 0.0}
 
-    # StreamCat: drainage area + land cover (same field names as 03b)
+    # Drainage area: NLDI basin polygon (geodesic area, same method as 03b fallback)
+    try:
+        out["drain_area_mi2"] = _get_nldi_basin_area_mi2(comid)
+        print(f"  DA from NLDI basin: {out['drain_area_mi2']:.2f} mi²")
+    except Exception as e:
+        print(f"  NLDI basin area failed: {e}")
+
+    # StreamCat: land cover only (same field names / Ws-suffix logic as 03b)
     _URBAN = ["PctUrbLo2019", "PctUrbMd2019", "PctUrbHi2019"]
     _WATER = ["PctOw2019", "PctWdWet2019", "PctHbWet2019"]
     try:
         r = requests.get(
             "https://api.epa.gov/StreamCat/streams/metrics",
             params={
-                "name": ",".join(["WsAreaSqKm"] + _URBAN + _WATER),
+                "name": ",".join(_URBAN + _WATER),
                 "comid": comid,
                 "areaOfInterest": "watershed",
             },
@@ -158,13 +184,10 @@ def get_basin_chars(comid: str) -> dict:
         items = r.json().get("items") or r.json().get("Items") or []
         if items:
             row = items[0]
-            ws_km2 = row.get("wsareasqkm")
-            if ws_km2:
-                out["drain_area_mi2"] = round(float(ws_km2) * KM2_TO_MI2, 4)
             out["pct_u"] = sum(row.get(f"{m.lower()}ws", 0.0) or 0.0 for m in _URBAN)
             out["pct_w"] = sum(row.get(f"{m.lower()}ws", 0.0) or 0.0 for m in _WATER)
     except Exception as e:
-        print(f"  StreamCat failed: {e}")
+        print(f"  StreamCat land cover failed: {e}")
 
     # Channel geometry: NLDI upstream main stem + 3DEP elevation (same method as 03b)
     try:
@@ -218,24 +241,53 @@ def compute_regression_q(lat: float, lon: float, basin: dict) -> dict[int, Optio
 
 # ── Atlas 14 ──────────────────────────────────────────────────────────────────
 
+def _extract_js_array(text: str, name: str) -> list:
+    """Parse a `name=[...]` JavaScript array literal using bracket counting.
+
+    The lazy-regex approach fails on nested arrays (matches the first inner `]`
+    instead of the outer one). Bracket counting is unambiguous.
+    """
+    m = re.search(rf'{re.escape(name)}\s*=\s*\[', text)
+    if not m:
+        raise ValueError(f"'{name}' not found in response")
+    start = m.end() - 1        # index of the opening '['
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+            if depth == 0:
+                return ast.literal_eval(text[start:i + 1])
+    raise ValueError(f"Unmatched bracket for '{name}'")
+
+
 def fetch_atlas14(lat: float, lon: float) -> dict[int, dict[int, Optional[float]]]:
     """Return {duration_h: {rp: depth_in}} from NOAA Atlas 14 PDS series.
 
     Durations: 3, 6, 12, 24, 48, 72 h  |  RPs: 10, 50, 100, 1000 yr
+    Returns empty (None values) on any failure so the rest of the plot renders.
     """
-    r = requests.get(
-        "https://hdsc.nws.noaa.gov/cgi-bin/hdsc/new/cgi_readH5.py",
-        params={"type": "pf", "units": "us", "series": "pds",
-                "lat": lat, "lon": lon},
-        timeout=30,
-    )
-    r.raise_for_status()
-    text = r.text
+    _empty = {d: {rp: None for rp in [10, 50, 100, 1000]} for d in DURATIONS}
 
-    m = re.search(r"quantiles\s*=\s*(\[[\s\S]*?\])\s*(?:upper|lower)", text)
-    if not m:
-        raise ValueError("Could not parse Atlas 14 quantiles")
-    quantiles: list[list[float]] = ast.literal_eval(m.group(1).strip())
+    try:
+        r = requests.get(
+            "https://hdsc.nws.noaa.gov/cgi-bin/hdsc/new/cgi_readH5.py",
+            params={"type": "pf", "units": "us", "series": "pds",
+                    "lat": lat, "lon": lon},
+            timeout=30,
+        )
+        r.raise_for_status()
+        text = r.text
+    except Exception as e:
+        print(f"  WARNING: Atlas 14 HTTP request failed: {e}")
+        return _empty
+
+    try:
+        quantiles = _extract_js_array(text, "quantiles")
+    except ValueError:
+        print(f"  WARNING: Atlas 14 parse failed — response preview:\n  {text[:400]!r}")
+        return _empty
 
     # PDS duration column indices (0-based):
     # 5m=0, 10m=1, 15m=2, 30m=3, 60m=4, 2h=5, 3h=6, 6h=7, 12h=8,
@@ -243,7 +295,7 @@ def fetch_atlas14(lat: float, lon: float) -> dict[int, dict[int, Optional[float]
     dur_col = {3: 6, 6: 7, 12: 8, 24: 9, 48: 10, 72: 11}
     # RP row indices (0-based): 1yr=0, 2yr=1, 5yr=2, 10yr=3, 25yr=4,
     # 50yr=5, 100yr=6, 200yr=7, 500yr=8, 1000yr=9
-    rp_row = {10: 3, 50: 5, 100: 6, 1000: 9}
+    rp_row  = {10: 3, 50: 5, 100: 6, 1000: 9}
 
     result: dict[int, dict[int, Optional[float]]] = {}
     for dur_h, ci in dur_col.items():
@@ -397,7 +449,7 @@ def make_figure(
         for rp in [10, 50, 100]:
             q_ref = reg_q.get(rp)
             if q_ref is not None:
-                color, lbl = _RP_STYLE[rp]
+                color = _RP_STYLE[rp][0]
                 ax1.axhline(q_ref, color=color, lw=1.3, ls="--", zorder=2,
                             label=f"Q{rp} = {q_ref:,.0f} cfs")
 
@@ -409,7 +461,7 @@ def make_figure(
         for rp in [10, 50, 100, 1000]:
             p_ref = atlas14.get(dur_h, {}).get(rp)
             if p_ref is not None:
-                color, lbl = _RP_STYLE[rp]
+                color = _RP_STYLE[rp][0]
                 ax2.axhline(p_ref, color=color, lw=1.0, ls=":", zorder=2,
                             label=f"P{rp} = {p_ref:.2f} in")
 

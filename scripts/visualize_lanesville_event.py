@@ -198,7 +198,7 @@ def compute_3h_rolling(frames_1h: list) -> list:
 
 def _parse_comid_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Normalise the COMID column name and cast to Int64."""
-    for candidate in ("comid", "COMID", "nhdplusid", "NHDPlusID"):
+    for candidate in ("comid", "COMID", "nhdplus_comid", "nhdplusid", "NHDPlusID"):
         if candidate in gdf.columns:
             if candidate != "comid":
                 gdf = gdf.rename(columns={candidate: "comid"})
