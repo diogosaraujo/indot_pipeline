@@ -168,32 +168,37 @@ def compute_3h_rolling(frames_1h: list) -> list:
 # ── Step 2: NHD flowlines ──────────────────────────────────────────────────────
 
 def fetch_nhd_flowlines() -> gpd.GeoDataFrame:
-    """Query USGS National Map ArcGIS REST for NHDPlus flowlines in the bbox."""
+    """Query USGS WaterData GeoServer for NHDPlus v2 flowlines in the bbox.
+
+    This service returns numeric COMIDs matching the NWM feature_id.
+    WFS 2.0 bbox order for EPSG:4326 is: lat_min,lon_min,lat_max,lon_max.
+    """
     print("\n── Fetching NHD flowlines ───────────────────────────────────────────────")
-    url = ("https://hydro.nationalmap.gov/arcgis/rest/services"
-           "/nhd/MapServer/6/query")
+    url = "https://labs.waterdata.usgs.gov/geoserver/wmadata/ows"
     params = {
-        "geometry":      f"{LON_MIN},{LAT_MIN},{LON_MAX},{LAT_MAX}",
-        "geometryType":  "esriGeometryEnvelope",
-        "inSR":          "4326",
-        "outSR":         "4326",
-        "spatialRel":    "esriSpatialRelIntersects",
-        "outFields":     "*",
-        "returnGeometry": "true",
-        "f":             "geojson",
+        "service":      "WFS",
+        "version":      "2.0.0",
+        "request":      "GetFeature",
+        "typeName":     "wmadata:nhdflowline_network",
+        "bbox":         f"{LAT_MIN},{LON_MIN},{LAT_MAX},{LON_MAX},"
+                        "urn:ogc:def:crs:EPSG::4326",
+        "outputFormat": "application/json",
+        "count":        "1000",
     }
     r = requests.get(url, params=params, timeout=60)
     r.raise_for_status()
     gdf = gpd.read_file(io.StringIO(r.text))
     if gdf.empty:
-        raise RuntimeError("NHD query returned no flowlines — check bbox or service.")
+        raise RuntimeError("NHDPlus WFS query returned no flowlines — check bbox.")
 
-    # Normalise COMID field (varies by service version)
     print(f"  Available fields: {list(gdf.columns)}")
-    for candidate in ("COMID", "comid", "NHDPlusID", "nhdplusid", "permanent_identifier", "PERMANENT_IDENTIFIER"):
+
+    # NHDPlus v2 WaterData service uses lowercase 'comid'
+    for candidate in ("comid", "COMID", "nhdplusid", "NHDPlusID"):
         if candidate in gdf.columns:
-            gdf = gdf.rename(columns={candidate: "comid"})
-            print(f"  Using '{candidate}' as COMID.")
+            if candidate != "comid":
+                gdf = gdf.rename(columns={candidate: "comid"})
+            print(f"  Using '{candidate}' as COMID — {gdf['comid'].notna().sum()} valid.")
             break
     if "comid" not in gdf.columns:
         print("  WARNING: no COMID field found; NWM matching will be skipped.")
