@@ -46,7 +46,7 @@ POINT_LAT     = 38.23955
 POINT_LON     = -85.98265
 EVENT_DATE    = date(2026, 6, 9)
 DISPLAY_HOURS = list(range(6, 23))          # 06–22 UTC on event day
-DURATIONS     = [3, 6, 12, 24, 48, 72]     # MRMS rolling windows (h)
+DURATIONS     = [3, 6, 12, 24]             # MRMS rolling windows (h)
 
 MRMS_BUCKET     = "noaa-mrms-pds"
 MRMS_1H_FOLDER  = "MultiSensor_QPE_01H_Pass2_00.00"
@@ -408,7 +408,7 @@ def load_nwm_at_comid(fs: s3fs.S3FileSystem,
                     _NWM_IDX = int(matches[0])
                     print(f"\n  NWM: COMID {comid} at array index {_NWM_IDX}")
                 q = float(hf["streamflow"][_NWM_IDX])
-                return q * M3S_TO_CFS if q >= 0 else None
+                return q if q >= 0 else None   # native m³/s — matches regression units after conversion
     except Exception as e:
         print(f"\n  NWM {dt:%H}z: {e}")
         return None
@@ -418,15 +418,20 @@ def load_nwm_at_comid(fs: s3fs.S3FileSystem,
 
 def make_figure(
     display_dts: list[datetime],
-    q_cfs: list[Optional[float]],
+    q_m3s: list[Optional[float]],
     precip_rolling: dict[int, list[float]],
     atlas14: dict[int, dict[int, Optional[float]]],
-    reg_q: dict[int, Optional[float]],
+    reg_q: dict[int, Optional[float]],   # regression values are in cfs; converted below
 ) -> None:
     edt_dts = [dt + EDT for dt in display_dts]
     bar_w   = timedelta(minutes=40)
 
-    fig, axes = plt.subplots(2, 3, figsize=(20, 11))
+    # Dense x-coords for Atlas 14 marker-X lines (needed so markevery spaces evenly)
+    n_pts   = 40
+    span    = edt_dts[-1] - edt_dts[0]
+    mark_xs = [edt_dts[0] + span * i / (n_pts - 1) for i in range(n_pts)]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
         f"Lanesville, IN Flash Flood — {EVENT_DATE:%B %-d, %Y}\n"
         f"NWM streamflow vs MRMS precipitation  |  "
@@ -434,24 +439,25 @@ def make_figure(
         fontsize=12, fontweight="bold", y=0.99,
     )
 
-    q_vals_plot = [v if v is not None else np.nan for v in q_cfs]
+    q_vals_plot = [v if v is not None else np.nan for v in q_m3s]
     q_max = np.nanmax(q_vals_plot) if not all(np.isnan(q_vals_plot)) else 1.0
 
     for panel_idx, (ax1, dur_h) in enumerate(zip(axes.flat, DURATIONS)):
         ax2 = ax1.twinx()
-        col = panel_idx % 3
-        row = panel_idx // 3
+        col = panel_idx % 2
+        row = panel_idx // 2
 
-        # ── Streamflow (left y / bottom x) ────────────────────────────────
+        # ── Streamflow (left y / bottom x) — all in m³/s ─────────────────
         ax1.plot(edt_dts, q_vals_plot, color="royalblue", lw=2.2,
-                 zorder=3, label="NWM Q (cfs)")
+                 zorder=3, label="NWM Q (m³/s)")
 
         for rp in [10, 50, 100]:
-            q_ref = reg_q.get(rp)
-            if q_ref is not None:
+            q_ref_cfs = reg_q.get(rp)
+            if q_ref_cfs is not None:
+                q_ref = q_ref_cfs / M3S_TO_CFS   # cfs → m³/s for consistent axis
                 color = _RP_STYLE[rp][0]
-                ax1.axhline(q_ref, color=color, lw=1.3, ls="--", zorder=2,
-                            label=f"Q{rp} = {q_ref:,.0f} cfs")
+                ax1.axhline(q_ref, color=color, lw=1.5, ls="--", zorder=2,
+                            label=f"Q{rp} = {q_ref:.1f} m³/s")
 
         # ── Precipitation (right y / top x, inverted) ──────────────────────
         prec_vals = precip_rolling[dur_h]
@@ -462,30 +468,33 @@ def make_figure(
             p_ref = atlas14.get(dur_h, {}).get(rp)
             if p_ref is not None:
                 color = _RP_STYLE[rp][0]
-                ax2.axhline(p_ref, color=color, lw=1.0, ls=":", zorder=2,
-                            label=f"P{rp} = {p_ref:.2f} in")
+                # --x--x-- style: dense line + evenly-spaced X markers
+                ax2.plot(mark_xs, [p_ref] * n_pts,
+                         color=color, lw=1.0, ls="--",
+                         marker="x", markevery=6, markersize=6, zorder=2,
+                         label=f"P{rp} = {p_ref:.2f} in")
 
         ax2.invert_yaxis()
 
-        # ── Top x-axis for precipitation ────────────────────────────────
+        # ── Top x-axis (precipitation time labels) ──────────────────────
         ax_top = ax1.secondary_xaxis("top")
         ax_top.xaxis.set_major_locator(mdates.HourLocator(interval=4))
         ax_top.xaxis.set_major_formatter(mdates.DateFormatter("%-I%p"))
         plt.setp(ax_top.get_xticklabels(), fontsize=7, rotation=45, ha="left")
 
-        # ── Bottom x-axis for streamflow ────────────────────────────────
+        # ── Bottom x-axis (streamflow time labels) ────────────────────────
         ax1.xaxis.set_major_locator(mdates.HourLocator(interval=4))
         ax1.xaxis.set_major_formatter(mdates.DateFormatter("%-I%p"))
         plt.setp(ax1.get_xticklabels(), fontsize=7, rotation=45, ha="right")
 
-        # ── Axis labels / title ──────────────────────────────────────────
+        # ── Axis labels / title ────────────────────────────────────────────
         ax1.set_title(f"{dur_h}h accumulation", fontsize=10)
         ax1.set_xlim(edt_dts[0] - timedelta(minutes=30),
                      edt_dts[-1] + timedelta(minutes=30))
 
         if col == 0:
-            ax1.set_ylabel("Streamflow (cfs)", color="royalblue", fontsize=9)
-        if col == 2:
+            ax1.set_ylabel("Streamflow (m³/s)", color="royalblue", fontsize=9)
+        if col == 1:
             ax2.set_ylabel("Precipitation (in)", color="steelblue", fontsize=9)
         if row == 1:
             ax1.set_xlabel("Time (EDT)", fontsize=8)
@@ -493,18 +502,16 @@ def make_figure(
         ax1.tick_params(axis="y", colors="royalblue", labelsize=8)
         ax2.tick_params(axis="y", colors="steelblue", labelsize=8)
 
-        # Ensure streamflow y-axis starts at 0 with 20% headroom
-        ax1.set_ylim(bottom=0, top=max(q_max * 1.2, 1.0))
+        ax1.set_ylim(bottom=0, top=max(q_max * 1.2, 0.1))
 
-        # Precip y-axis: invert so 0 is at top; set sensible max at bottom
         p_max = max((v for v in prec_vals if v is not None), default=0.01)
         p_ref_max = max(
             (atlas14.get(dur_h, {}).get(rp) or 0.0 for rp in [10, 50, 100, 1000]),
-            default=0.0
+            default=0.0,
         )
         ax2.set_ylim(top=0, bottom=max(p_max, p_ref_max) * 1.3)
 
-        # ── Legend ──────────────────────────────────────────────────────
+        # ── Legend ────────────────────────────────────────────────────────
         h1, l1 = ax1.get_legend_handles_labels()
         h2, l2 = ax2.get_legend_handles_labels()
         ax1.legend(h1 + h2, l1 + l2, fontsize=6.5, loc="upper left",
@@ -578,19 +585,19 @@ def main() -> None:
                    for h in DISPLAY_HOURS]
     precip_rolling = compute_rolling(hourly_precip, display_dts)
 
-    # 6. NWM streamflow
+    # 6. NWM streamflow (m³/s — no cfs conversion; regression Q converted at plot time)
     print("\n── NWM streamflow ───────────────────────────────────────────────────")
-    q_cfs: list[Optional[float]] = []
+    q_m3s: list[Optional[float]] = []
     for dt in display_dts:
         print(f"  {dt:%H}z...", end="\r")
-        q_cfs.append(load_nwm_at_comid(fs, dt, comid_int))
-    n_ok = sum(q is not None for q in q_cfs)
+        q_m3s.append(load_nwm_at_comid(fs, dt, comid_int))
+    n_ok = sum(q is not None for q in q_m3s)
     print(f"\n  {n_ok}/{len(display_dts)} hours loaded, "
-          f"peak={max((q for q in q_cfs if q), default=0):,.0f} cfs")
+          f"peak={max((q for q in q_m3s if q), default=0):.1f} m³/s")
 
     # 7. Plot + upload
     print("\n── Creating figure ──────────────────────────────────────────────────")
-    make_figure(display_dts, q_cfs, precip_rolling, atlas14, reg_q)
+    make_figure(display_dts, q_m3s, precip_rolling, atlas14, reg_q)
     upload_to_s3(OUT_PLOT)
     print("\nDone.")
 
