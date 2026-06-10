@@ -231,55 +231,77 @@ def _fetch_via_epa_rest() -> gpd.GeoDataFrame:
     return gdf
 
 
-def _fetch_via_nldi_position() -> gpd.GeoDataFrame:
-    """Find the NHD reach nearest to the bbox centre, then navigate all
-    upstream tributaries within the bbox diagonal distance.
+def _fetch_via_nldi_grid_sample() -> gpd.GeoDataFrame:
+    """Capture all NHD flowlines inside the bbox by sampling a 3×3 grid of
+    points, discovering every unique COMID, then navigating upstream
+    tributaries (UT) from each one.
 
-    Works from any location — does not require a gauge inside the bbox.
+    This handles bboxes that span multiple sub-watersheds — navigating from
+    a single centre COMID would miss streams draining to other outlets.
     Uses api.water.usgs.gov/nldi which the pipeline already calls from AWS.
     """
     import math
-    centre_lon = (LON_MIN + LON_MAX) / 2
+    from shapely.geometry import box as shapely_box
+
+    bbox_geom  = shapely_box(LON_MIN, LAT_MIN, LON_MAX, LAT_MAX)
     centre_lat = (LAT_MIN + LAT_MAX) / 2
-
-    # Step 1: nearest NHD COMID to bbox centre
-    r = requests.get(
-        "https://api.water.usgs.gov/nldi/linked-data/comid/position",
-        params={"coords": f"POINT({centre_lon} {centre_lat})"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    comid = r.json()["features"][0]["properties"]["identifier"]
-    print(f"  Nearest COMID to bbox centre: {comid}")
-
-    # Step 2: upstream tributaries — distance = 2× bbox diagonal
     diag_km = math.sqrt(
         ((LON_MAX - LON_MIN) * 111 * math.cos(math.radians(centre_lat))) ** 2
         + ((LAT_MAX - LAT_MIN) * 111) ** 2
     )
-    r2 = requests.get(
-        f"https://api.water.usgs.gov/nldi/linked-data/comid/{comid}"
-        f"/navigation/UT/flowlines",
-        params={"distance": max(50, int(diag_km * 2))},
-        timeout=60,
+    nav_dist = max(50, int(diag_km * 3))   # km upstream to search from each seed
+
+    # Step 1: find unique COMIDs at 9 interior sample points
+    seed_comids: set[str] = set()
+    for xf in (0.2, 0.5, 0.8):
+        for yf in (0.2, 0.5, 0.8):
+            lon = LON_MIN + (LON_MAX - LON_MIN) * xf
+            lat = LAT_MIN + (LAT_MAX - LAT_MIN) * yf
+            try:
+                r = requests.get(
+                    "https://api.water.usgs.gov/nldi/linked-data/comid/position",
+                    params={"coords": f"POINT({lon} {lat})"},
+                    timeout=20,
+                )
+                if r.ok:
+                    cid = r.json()["features"][0]["properties"]["identifier"]
+                    seed_comids.add(cid)
+            except Exception:
+                pass
+    print(f"  Grid sampling: {len(seed_comids)} unique seed COMIDs")
+
+    # Step 2: navigate UT from each seed, clip to bbox
+    all_gdfs: list[gpd.GeoDataFrame] = []
+    for comid in seed_comids:
+        try:
+            r = requests.get(
+                f"https://api.water.usgs.gov/nldi/linked-data/comid/{comid}"
+                f"/navigation/UT/flowlines",
+                params={"distance": nav_dist},
+                timeout=90,
+            )
+            if not r.ok:
+                continue
+            gdf = gpd.read_file(io.StringIO(r.text))
+            gdf = gdf[gdf.geometry.intersects(bbox_geom)].copy()
+            if not gdf.empty:
+                all_gdfs.append(gdf)
+        except Exception as e:
+            print(f"  UT nav from {comid} failed: {e}")
+
+    if not all_gdfs:
+        raise RuntimeError("No flowlines found via grid sampling.")
+
+    # Step 3: union and deduplicate by COMID
+    combined = pd.concat(all_gdfs, ignore_index=True)
+    comid_col = next(
+        (c for c in ("nhdplus_comid", "comid", "COMID") if c in combined.columns),
+        None,
     )
-    r2.raise_for_status()
-    gdf = gpd.read_file(io.StringIO(r2.text))
-    if gdf.empty:
-        raise RuntimeError("NLDI position navigation returned no flowlines.")
-
-    # Keep only reaches that intersect the bbox
-    from shapely.geometry import box as shapely_box
-    bbox_geom = shapely_box(LON_MIN, LAT_MIN, LON_MAX, LAT_MAX)
-    gdf = gdf[gdf.geometry.intersects(bbox_geom)].copy()
-    if gdf.empty:
-        raise RuntimeError("No NLDI flowlines intersect the bbox.")
-
-    for candidate in ("nhdplus_comid", "comid", "COMID"):
-        if candidate in gdf.columns:
-            gdf = gdf.rename(columns={candidate: "comid"})
-            break
-    return gdf.drop_duplicates(subset=["comid"])
+    if comid_col:
+        combined = combined.drop_duplicates(subset=[comid_col])
+    print(f"  {len(combined)} unique flowlines in bbox after union.")
+    return combined
 
 
 def fetch_nhd_flowlines() -> gpd.GeoDataFrame:
@@ -293,7 +315,7 @@ def fetch_nhd_flowlines() -> gpd.GeoDataFrame:
     print("\n── Fetching NHD flowlines ───────────────────────────────────────────────")
     for attempt, fetcher in [
         ("EPA WATERS REST",       _fetch_via_epa_rest),
-        ("NLDI position+UT",     _fetch_via_nldi_position),
+        ("NLDI grid-sample+UT",  _fetch_via_nldi_grid_sample),
     ]:
         try:
             print(f"  Trying {attempt}...")
@@ -471,11 +493,13 @@ def make_animation(
     fig.colorbar(im_3h, ax=axes[1], fraction=0.035, pad=0.08,
                  label="Rainfall (in)")
 
-    # NWM: LineCollection (segments pre-computed)
+    # NWM: LineCollection — attach cmap/norm so set_array() always uses the
+    # fixed LogNorm (avoids colour drift from frame-to-frame autoscaling).
     lc = LineCollection(
         all_segs if all_segs else [[[LON_MIN, LAT_MIN], [LON_MAX, LAT_MAX]]],
-        linewidths=4.0, zorder=3,
+        cmap=nwm_cmap, norm=norm_nwm, linewidths=4.0, zorder=3,
     )
+    lc.set_array(np.full(max(len(all_segs), 1), NWM_Q_VMIN))
     axes[2].add_collection(lc)
     sm_nwm = plt.cm.ScalarMappable(cmap=nwm_cmap, norm=norm_nwm)
     sm_nwm.set_array([])
@@ -524,14 +548,14 @@ def make_animation(
                 dtype=float,
             )
             q_vals = np.clip(q_vals, NWM_Q_VMIN, NWM_Q_VMAX)
-            colors = nwm_cmap(norm_nwm(q_vals))
-            lc.set_colors(colors)
-            # Scale linewidth: 2 px at vmin, up to 8 px at vmax
+            # set_array lets the collection apply its own fixed LogNorm —
+            # avoids the colour drift caused by set_colors() bypassing it.
+            lc.set_array(q_vals)
             log_range = np.log10(NWM_Q_VMAX) - np.log10(NWM_Q_VMIN)
             lw = 2.0 + 6.0 * (np.log10(q_vals) - np.log10(NWM_Q_VMIN)) / log_range
             lc.set_linewidths(np.clip(lw, 2.0, 8.0))
         else:
-            lc.set_colors(["#555588"] * max(len(all_segs), 1))
+            lc.set_array(np.full(max(len(all_segs), 1), NWM_Q_VMIN))
             lc.set_linewidths(2.0)
 
         # -- Timestamp: UTC + local (EDT = UTC-4) --
