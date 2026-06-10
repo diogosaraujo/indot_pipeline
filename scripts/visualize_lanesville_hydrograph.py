@@ -239,6 +239,98 @@ def compute_regression_q(lat: float, lon: float, basin: dict) -> dict[int, Optio
             for rp in [10, 50, 100]}
 
 
+# ── Nearest gauged station (preferred Q source) ───────────────────────────────
+
+def _get_gauge_comid(site_no: str, timeout: int = 30) -> Optional[int]:
+    """Return NHD COMID for a USGS gauge via NLDI upstream flowlines (same as 03b)."""
+    r = requests.get(
+        f"https://api.water.usgs.gov/nldi/linked-data/nwissite"
+        f"/USGS-{site_no}/navigation/UM/flowlines?distance=10",
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    features = r.json().get("features", [])
+    if not features:
+        return None
+    props = features[0].get("properties", {})
+    comid = (props.get("nhdplus_comid") or props.get("nhdpv2_COMID")
+             or props.get("comid") or props.get("COMID"))
+    return int(comid) if comid else None
+
+
+def get_nearest_gauge_q(lat: float, lon: float) -> dict:
+    """Find the nearest Indiana gauge with Q10/Q50/Q100 in the pipeline S3 parquet.
+
+    Returns dict: {site_no, dist_mi, comid, Q10, Q50, Q100} — Q values in cfs,
+    comid is the NHD COMID to use for NWM.  All values are None on failure.
+    """
+    import io as _io
+    import pandas as _pd
+    import pyarrow.parquet as _pq
+
+    out: dict = {"site_no": None, "dist_mi": None, "comid": None,
+                 "Q10": None, "Q50": None, "Q100": None}
+    try:
+        s3c = boto3.client("s3", region_name="us-east-1")
+
+        inv = _pq.read_table(
+            _io.BytesIO(
+                s3c.get_object(
+                    Bucket=PIPELINE_BUCKET,
+                    Key="v1/stations/indiana_streamflow_sites.parquet",
+                )["Body"].read()
+            )
+        ).to_pandas()
+        inv["site_no"] = inv["site_no"].astype(str)
+
+        fstats = _pq.read_table(
+            _io.BytesIO(
+                s3c.get_object(
+                    Bucket=PIPELINE_BUCKET,
+                    Key="v1/flow_stats/per_gauge_flow_stats.parquet",
+                )["Body"].read()
+            )
+        ).to_pandas()
+        fstats["site_no"] = fstats["site_no"].astype(str)
+
+        merged = (
+            inv[["site_no", "dec_lat_va", "dec_long_va"]]
+            .merge(fstats[["site_no", "Q10", "Q50", "Q100"]], on="site_no", how="inner")
+            .dropna(subset=["Q10", "Q100", "dec_lat_va", "dec_long_va"])
+        )
+        if merged.empty:
+            print("  WARNING: no gauges with Q10/Q100 found in pipeline S3")
+            return out
+
+        merged = merged.copy()
+        merged["_dist"] = merged.apply(
+            lambda r: _haversine_mi(
+                lon, lat, float(r["dec_long_va"]), float(r["dec_lat_va"])
+            ),
+            axis=1,
+        )
+        best = merged.loc[merged["_dist"].idxmin()]
+
+        site_no        = str(best["site_no"])
+        out["site_no"] = site_no
+        out["dist_mi"] = float(best["_dist"])
+        out["Q10"]     = float(best["Q10"])
+        out["Q50"]     = float(best["Q50"]) if _pd.notna(best.get("Q50")) else None
+        out["Q100"]    = float(best["Q100"])
+
+        q50_str = f"{out['Q50']:,.0f}" if out["Q50"] is not None else "None"
+        print(f"  Nearest gauge: USGS {site_no} ({out['dist_mi']:.1f} mi away)")
+        print(f"  Q10={out['Q10']:,.0f} cfs  Q50={q50_str} cfs  Q100={out['Q100']:,.0f} cfs")
+
+        out["comid"] = _get_gauge_comid(site_no)
+        print(f"  NHD COMID for NWM: {out['comid']}")
+
+    except Exception as e:
+        print(f"  WARNING: gauge Q lookup failed: {e}")
+
+    return out
+
+
 # ── Atlas 14 ──────────────────────────────────────────────────────────────────
 
 def _extract_js_array(text: str, name: str) -> list:
@@ -421,7 +513,6 @@ def make_figure(
     q_m3s: list[Optional[float]],
     precip_rolling: dict[int, list[float]],
     atlas14: dict[int, dict[int, Optional[float]]],
-    reg_q: dict[int, Optional[float]],   # regression values are in cfs; converted below
 ) -> None:
     edt_dts = [dt + EDT for dt in display_dts]
     bar_w   = timedelta(minutes=40)
@@ -447,17 +538,9 @@ def make_figure(
         col = panel_idx % 2
         row = panel_idx // 2
 
-        # ── Streamflow (left y / bottom x) — all in m³/s ─────────────────
+        # ── Streamflow (left y / bottom x) ────────────────────────────────
         ax1.plot(edt_dts, q_vals_plot, color="royalblue", lw=2.2,
                  zorder=3, label="NWM Q (m³/s)")
-
-        for rp in [10, 50, 100]:
-            q_ref_cfs = reg_q.get(rp)
-            if q_ref_cfs is not None:
-                q_ref = q_ref_cfs / M3S_TO_CFS   # cfs → m³/s for consistent axis
-                color = _RP_STYLE[rp][0]
-                ax1.axhline(q_ref, color=color, lw=1.5, ls="--", zorder=2,
-                            label=f"Q{rp} = {q_ref:.1f} m³/s")
 
         # ── Precipitation (right y / top x, inverted) ──────────────────────
         prec_vals = precip_rolling[dur_h]
@@ -547,16 +630,7 @@ def main() -> None:
     comid_int = int(comid_str)
     print(f"  COMID: {comid_int}")
 
-    # 2. Basin characteristics + regression Q
-    print("\n── Basin characteristics ────────────────────────────────────────────")
-    basin = get_basin_chars(comid_str)
-    print(f"  DA={basin['drain_area_mi2']} mi², slope={basin['slope_ft_mi']:.2f} ft/mi, "
-          f"pct_u={basin['pct_u']:.1f}%, pct_w={basin['pct_w']:.1f}%")
-    reg_q = compute_regression_q(POINT_LAT, POINT_LON, basin)
-    for rp, q in reg_q.items():
-        print(f"  Q{rp} = {q:,.0f} cfs" if q else f"  Q{rp} = None")
-
-    # 3. Atlas 14
+    # 2. Atlas 14
     print("\n── Atlas 14 ─────────────────────────────────────────────────────────")
     atlas14 = fetch_atlas14(POINT_LAT, POINT_LON)
     for dur_h in DURATIONS:
@@ -597,7 +671,7 @@ def main() -> None:
 
     # 7. Plot + upload
     print("\n── Creating figure ──────────────────────────────────────────────────")
-    make_figure(display_dts, q_m3s, precip_rolling, atlas14, reg_q)
+    make_figure(display_dts, q_m3s, precip_rolling, atlas14)
     upload_to_s3(OUT_PLOT)
     print("\nDone.")
 
