@@ -26,13 +26,16 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+import boto3
 import h5py
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import geopandas as gpd
+import pyarrow.parquet as pq
 import requests
 import s3fs
 from matplotlib.animation import FuncAnimation, PillowWriter
@@ -60,8 +63,14 @@ MRMS_BUCKET     = "noaa-mrms-pds"
 MRMS_1H_FOLDER  = "MultiSensor_QPE_01H_Pass2_00.00"
 NWM_BUCKET      = "noaa-nwm-pds"
 
+# Pipeline S3 bucket (output destination)
+PIPELINE_BUCKET  = "indot-bridge-pipeline"
+PIPELINE_PREFIX  = "v1/"
+S3_EVENT_FOLDER  = f"v1/events/lanesville_{EVENT_DATE:%m_%d_%Y}/"
+GIF_FNAME        = f"lanesville_{EVENT_DATE:%Y%m%d}.gif"
+
 OUT_DIR      = "results"
-OUT_GIF      = os.path.join(OUT_DIR, f"lanesville_{EVENT_DATE:%Y%m%d}.gif")
+OUT_GIF      = os.path.join(OUT_DIR, GIF_FNAME)
 FRAME_MS     = 600      # ms per frame in the GIF
 ALPHA_PRECIP = 0.55     # transparency of the MRMS overlay
 
@@ -80,6 +89,26 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 def _anon_fs() -> s3fs.S3FileSystem:
     return s3fs.S3FileSystem(anon=True)
+
+
+def upload_gif_to_s3(local_path: str) -> str:
+    """Upload the rendered GIF to the pipeline S3 bucket; return the s3:// URI."""
+    key = S3_EVENT_FOLDER + GIF_FNAME
+    s3 = boto3.client("s3", region_name="us-east-1")
+    print(f"Uploading to s3://{PIPELINE_BUCKET}/{key} ...")
+    s3.upload_file(local_path, PIPELINE_BUCKET, key,
+                   ExtraArgs={"ContentType": "image/gif"})
+    uri = f"s3://{PIPELINE_BUCKET}/{key}"
+    print(f"Saved to {uri}")
+    return uri
+
+
+def _read_pipeline_parquet(key: str) -> pd.DataFrame:
+    """Read a parquet from the pipeline bucket (uses IAM role credentials)."""
+    s3 = boto3.client("s3", region_name="us-east-1")
+    obj = s3.get_object(Bucket=PIPELINE_BUCKET, Key=key)
+    return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
+
 
 
 # ── Step 1: MRMS ───────────────────────────────────────────────────────────────
@@ -167,33 +196,8 @@ def compute_3h_rolling(frames_1h: list) -> list:
 
 # ── Step 2: NHD flowlines ──────────────────────────────────────────────────────
 
-def fetch_nhd_flowlines() -> gpd.GeoDataFrame:
-    """Query USGS WaterData GeoServer for NHDPlus v2 flowlines in the bbox.
-
-    This service returns numeric COMIDs matching the NWM feature_id.
-    WFS 2.0 bbox order for EPSG:4326 is: lat_min,lon_min,lat_max,lon_max.
-    """
-    print("\n── Fetching NHD flowlines ───────────────────────────────────────────────")
-    url = "https://labs.waterdata.usgs.gov/geoserver/wmadata/ows"
-    params = {
-        "service":      "WFS",
-        "version":      "2.0.0",
-        "request":      "GetFeature",
-        "typeName":     "wmadata:nhdflowline_network",
-        "bbox":         f"{LAT_MIN},{LON_MIN},{LAT_MAX},{LON_MAX},"
-                        "urn:ogc:def:crs:EPSG::4326",
-        "outputFormat": "application/json",
-        "count":        "1000",
-    }
-    r = requests.get(url, params=params, timeout=60)
-    r.raise_for_status()
-    gdf = gpd.read_file(io.StringIO(r.text))
-    if gdf.empty:
-        raise RuntimeError("NHDPlus WFS query returned no flowlines — check bbox.")
-
-    print(f"  Available fields: {list(gdf.columns)}")
-
-    # NHDPlus v2 WaterData service uses lowercase 'comid'
+def _parse_comid_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Normalise the COMID column name and cast to Int64."""
     for candidate in ("comid", "COMID", "nhdplusid", "NHDPlusID"):
         if candidate in gdf.columns:
             if candidate != "comid":
@@ -201,13 +205,106 @@ def fetch_nhd_flowlines() -> gpd.GeoDataFrame:
             print(f"  Using '{candidate}' as COMID — {gdf['comid'].notna().sum()} valid.")
             break
     if "comid" not in gdf.columns:
-        print("  WARNING: no COMID field found; NWM matching will be skipped.")
         gdf["comid"] = np.nan
-
     gdf["comid"] = gdf["comid"].astype("Int64")
-    gdf = gdf.to_crs(epsg=4326)
-    print(f"  {len(gdf)} flowline features retrieved.")
+    return gdf.to_crs(epsg=4326)
+
+
+def _fetch_via_epa_rest() -> gpd.GeoDataFrame:
+    """EPA WATERS NHDPlus v2 ArcGIS REST — different domain, not blocked by AWS."""
+    url = ("https://watersgeo.epa.gov/arcgis/rest/services"
+           "/NHDPlus_NP21/NHDSnapshot_NP21/MapServer/0/query")
+    r = requests.get(url, params={
+        "geometry":       f"{LON_MIN},{LAT_MIN},{LON_MAX},{LAT_MAX}",
+        "geometryType":   "esriGeometryEnvelope",
+        "inSR":           "4326",
+        "outSR":          "4326",
+        "spatialRel":     "esriSpatialRelIntersects",
+        "outFields":      "COMID,GNIS_Name,StreamOrde",
+        "returnGeometry": "true",
+        "f":              "geojson",
+    }, timeout=60)
+    r.raise_for_status()
+    gdf = gpd.read_file(io.StringIO(r.text))
+    if gdf.empty:
+        raise RuntimeError("EPA REST returned no features.")
     return gdf
+
+
+def _fetch_via_nldi_stations() -> gpd.GeoDataFrame:
+    """NLDI upstream-tributaries navigation from gauges in the bbox.
+
+    Falls back to NLDI which the pipeline already uses successfully from AWS.
+    Reads the station inventory from S3, finds gauges in the bbox, then
+    fetches upstream tributary flowlines for each.
+    """
+    NLDI = "https://api.water.usgs.gov/nldi/linked-data/nwissite"
+    inv = _read_pipeline_parquet(f"{PIPELINE_PREFIX}stations/indiana_streamflow_sites.parquet")
+    inv["site_no"] = inv["site_no"].astype(str)
+    local = inv[
+        inv["dec_lat_va"].between(LAT_MIN, LAT_MAX) &
+        inv["dec_long_va"].between(LON_MIN, LON_MAX)
+    ]
+    if local.empty:
+        # Expand search to a 0.2° buffer around the bbox centre
+        clat = (LAT_MIN + LAT_MAX) / 2
+        clon = (LON_MIN + LON_MAX) / 2
+        local = inv[
+            inv["dec_lat_va"].between(clat - 0.1, clat + 0.1) &
+            inv["dec_long_va"].between(clon - 0.1, clon + 0.1)
+        ]
+    if local.empty:
+        raise RuntimeError("No gauges found near the bbox to seed NLDI navigation.")
+
+    print(f"  NLDI fallback: seeding from {len(local)} gauge(s): "
+          f"{local['site_no'].tolist()}")
+    frames: list[gpd.GeoDataFrame] = []
+    for site_no in local["site_no"]:
+        url = f"{NLDI}/USGS-{site_no}/navigation/UT/flowlines?distance=200"
+        try:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            gdf = gpd.read_file(io.StringIO(r.text))
+            if not gdf.empty:
+                frames.append(gdf)
+        except Exception as e:
+            print(f"    NLDI {site_no}: {e}")
+    if not frames:
+        raise RuntimeError("NLDI returned no flowlines.")
+    combined = gpd.GeoDataFrame(
+        pd.concat(frames, ignore_index=True), crs="EPSG:4326"
+    )
+    # nhdplus_comid is the field NLDI returns for the reach COMID
+    for candidate in ("nhdplus_comid", "comid", "COMID"):
+        if candidate in combined.columns:
+            combined = combined.rename(columns={candidate: "comid"})
+            break
+    return combined.drop_duplicates(subset=["comid"])
+
+
+def fetch_nhd_flowlines() -> gpd.GeoDataFrame:
+    """Return NHDPlus v2 flowlines with numeric COMIDs for the event bbox.
+
+    Attempts three sources in order:
+      1. EPA WATERS ArcGIS REST  (NHDPlus_NP21 — not blocked from AWS)
+      2. NLDI upstream-tributaries navigation from gauges in the bbox
+      3. Raises RuntimeError (caller falls back to grey lines)
+    """
+    print("\n── Fetching NHD flowlines ───────────────────────────────────────────────")
+    for attempt, fetcher in [
+        ("EPA WATERS REST",  _fetch_via_epa_rest),
+        ("NLDI navigation",  _fetch_via_nldi_stations),
+    ]:
+        try:
+            print(f"  Trying {attempt}...")
+            gdf = fetcher()
+            gdf = _parse_comid_gdf(gdf)
+            print(f"  {len(gdf)} flowline features retrieved via {attempt}.")
+            return gdf
+        except Exception as e:
+            print(f"  {attempt} failed: {e}")
+
+    raise RuntimeError("All NHD sources failed.")
 
 
 def _geom_segments(geom) -> list:
@@ -436,11 +533,13 @@ def make_animation(
         blit=False,
     )
 
+    os.makedirs(OUT_DIR, exist_ok=True)
     print(f"\nRendering {len(HOURS)} frames → {OUT_GIF}")
     writer = PillowWriter(fps=int(1000 / FRAME_MS))
     anim.save(OUT_GIF, writer=writer, dpi=120)
     plt.close(fig)
-    print(f"Saved: {OUT_GIF}")
+    print(f"Saved locally: {OUT_GIF}")
+    upload_gif_to_s3(OUT_GIF)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
