@@ -189,9 +189,11 @@ def fetch_nhd_flowlines() -> gpd.GeoDataFrame:
         raise RuntimeError("NHD query returned no flowlines — check bbox or service.")
 
     # Normalise COMID field (varies by service version)
-    for candidate in ("COMID", "comid", "NHDPlusID", "nhdplusid"):
+    print(f"  Available fields: {list(gdf.columns)}")
+    for candidate in ("COMID", "comid", "NHDPlusID", "nhdplusid", "permanent_identifier", "PERMANENT_IDENTIFIER"):
         if candidate in gdf.columns:
             gdf = gdf.rename(columns={candidate: "comid"})
+            print(f"  Using '{candidate}' as COMID.")
             break
     if "comid" not in gdf.columns:
         print("  WARNING: no COMID field found; NWM matching will be skipped.")
@@ -220,13 +222,14 @@ def _geom_segments(geom) -> list:
 
 def build_line_collection_data(gdf: gpd.GeoDataFrame):
     """Pre-compute segment arrays and per-segment COMID mapping."""
+    import pandas as pd
     all_segs: list = []
     seg_comids: list = []
     row_seg_counts: list = []  # how many segments belong to each GDF row
     for _, row in gdf.iterrows():
         segs = _geom_segments(row.geometry)
         all_segs.extend(segs)
-        comid = int(row["comid"]) if not (row["comid"] is None or row["comid"] != row["comid"]) else -1
+        comid = int(row["comid"]) if pd.notna(row["comid"]) else -1
         seg_comids.extend([comid] * len(segs))
         row_seg_counts.append(len(segs))
     return all_segs, np.array(seg_comids), row_seg_counts
