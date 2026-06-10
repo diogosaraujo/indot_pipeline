@@ -57,7 +57,7 @@ except ImportError:
 EVENT_DATE   = date(2026, 6, 9)
 LON_MIN, LON_MAX = -86.06, -85.88
 LAT_MIN, LAT_MAX = 38.15, 38.31
-HOURS        = list(range(24))      # 00–23 UTC
+HOURS        = list(range(6, 23))   # 06–22 UTC (EDT = UTC-4, so 02:00–18:00 local)
 
 MRMS_BUCKET     = "noaa-mrms-pds"
 MRMS_1H_FOLDER  = "MultiSensor_QPE_01H_Pass2_00.00"
@@ -377,7 +377,7 @@ def load_all_nwm(
         print(f"  Loading hour {h:02d} UTC...", end="\r")
         frames.append(load_nwm_frame(fs, h, target_comids))
     n_ok = sum(len(f) > 0 for f in frames)
-    print(f"  Loaded {n_ok}/24 NWM frames with data.        ")
+    print(f"  Loaded {n_ok}/{len(HOURS)} NWM frames with data.        ")
     return frames
 
 
@@ -417,19 +417,20 @@ def make_animation(
     # ── Figure layout ──────────────────────────────────────────────────────────
     fig, axes = plt.subplots(
         1, 3,
-        figsize=(18, 7),
-        gridspec_kw={"wspace": 0.08},
+        figsize=(22, 7),
+        gridspec_kw={"wspace": 0.45},
     )
     titles = [
         "MRMS QPE — 1-h (in)",
         "MRMS QPE — 3-h rolling (in)",
         "NWM streamflow (m³/s)",
     ]
-    for ax, title in zip(axes, titles):
+    for i, (ax, title) in enumerate(zip(axes, titles)):
         ax.set_xlim(LON_MIN, LON_MAX)
         ax.set_ylim(LAT_MIN, LAT_MAX)
         ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
+        if i == 0:
+            ax.set_ylabel("Latitude")   # y-label only on leftmost panel
         ax.set_title(title, fontsize=11)
         ax.set_aspect("equal")
 
@@ -465,20 +466,20 @@ def make_animation(
     )
 
     # Colourbars for precipitation
-    fig.colorbar(im_1h, ax=axes[0], fraction=0.035, pad=0.02,
+    fig.colorbar(im_1h, ax=axes[0], fraction=0.035, pad=0.08,
                  label="Rainfall (in)")
-    fig.colorbar(im_3h, ax=axes[1], fraction=0.035, pad=0.02,
+    fig.colorbar(im_3h, ax=axes[1], fraction=0.035, pad=0.08,
                  label="Rainfall (in)")
 
     # NWM: LineCollection (segments pre-computed)
     lc = LineCollection(
         all_segs if all_segs else [[[LON_MIN, LAT_MIN], [LON_MAX, LAT_MAX]]],
-        linewidths=2.0, zorder=3,
+        linewidths=4.0, zorder=3,
     )
     axes[2].add_collection(lc)
     sm_nwm = plt.cm.ScalarMappable(cmap=nwm_cmap, norm=norm_nwm)
     sm_nwm.set_array([])
-    fig.colorbar(sm_nwm, ax=axes[2], fraction=0.035, pad=0.02,
+    fig.colorbar(sm_nwm, ax=axes[2], fraction=0.035, pad=0.08,
                  label="Streamflow (m³/s)")
 
     # Timestamp text (centred above all panels)
@@ -489,25 +490,33 @@ def make_animation(
     )
 
     # ── Update function ────────────────────────────────────────────────────────
-    def update(h: int):
-        # -- MRMS 1h --
-        f1 = frames_1h[h]
+    # FuncAnimation iterates over frame indices (0, 1, …); map to UTC hour via HOURS.
+    from datetime import datetime, timezone, timedelta
+    _EDT = timedelta(hours=-4)
+
+    def update(frame_idx: int):
+        h = HOURS[frame_idx]
+
+        # -- MRMS 1h (fixed colour scale: explicitly re-apply clim each frame) --
+        f1 = frames_1h[frame_idx]
         if f1 is not None:
             im_1h.set_data(f1)
             im_1h.set_extent(extent)
         else:
             im_1h.set_data(np.zeros((2, 2)))
+        im_1h.set_clim(0.01, QPE_1H_VMAX)
 
         # -- MRMS 3h rolling --
-        f3 = frames_3h[h]
+        f3 = frames_3h[frame_idx]
         if f3 is not None:
             im_3h.set_data(f3)
             im_3h.set_extent(extent)
         else:
             im_3h.set_data(np.zeros((2, 2)))
+        im_3h.set_clim(0.01, QPE_3H_VMAX)
 
         # -- NWM streamflow --
-        q_map = nwm_frames[h]
+        q_map = nwm_frames[frame_idx]
         if q_map and all_segs:
             q_vals = np.array(
                 [q_map.get(int(c), NWM_Q_VMIN) if c >= 0 else NWM_Q_VMIN
@@ -520,15 +529,20 @@ def make_animation(
         else:
             lc.set_colors(["#aaaaaa"] * max(len(all_segs), 1))
 
+        # -- Timestamp: UTC + local (EDT = UTC-4) --
+        utc_dt  = datetime(EVENT_DATE.year, EVENT_DATE.month, EVENT_DATE.day,
+                           h, 0, tzinfo=timezone.utc)
+        edt_dt  = utc_dt + _EDT
         time_text.set_text(
-            f"{EVENT_DATE:%Y-%m-%d}  {h:02d}:00 UTC"
+            f"{EVENT_DATE:%Y-%m-%d}  {h:02d}:00 UTC  "
+            f"({edt_dt:%I:%M %p} EDT)"
         )
         return [im_1h, im_3h, lc, time_text]
 
     # ── Render ─────────────────────────────────────────────────────────────────
     anim = FuncAnimation(
         fig, update,
-        frames=HOURS,
+        frames=range(len(HOURS)),
         interval=FRAME_MS,
         blit=False,
     )
