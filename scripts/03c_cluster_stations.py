@@ -1,4 +1,4 @@
-"""cluster_stations.py
+"""03c_cluster_stations.py
 
 Cluster Indiana USGS streamflow stations by basin characteristics and identify
 the most statistically viable number of clusters (k) for Q10, Q50, and Q100
@@ -18,17 +18,19 @@ Reads (S3 indot-bridge-pipeline/v1/):
     flow_stats/per_gauge_flow_stats.parquet
     streamflow/instantaneous/all_gauges_long.parquet
 
-Writes:
-    results/dendrogram.png
-    results/clusters_k{k}.csv
-    results/clusters_k{k}_stats.csv
-    results/clusters_Q{rp}_k{k}.png
+Writes (local results/ and s3://indot-bridge-pipeline/v1/clusters/):
+    dendrogram.png
+    clusters_k{k}.csv
+    clusters_k{k}_stats.csv
+    clusters_Q{rp}_k{k}.png
 """
 from __future__ import annotations
 
+import io
 import os
 import warnings
 
+import boto3
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -44,9 +46,10 @@ from sklearn.preprocessing import StandardScaler
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-BUCKET  = "indot-bridge-pipeline"
-PREFIX  = "v1/"
-OUT_DIR = "results"
+BUCKET     = "indot-bridge-pipeline"
+PREFIX     = "v1/"
+OUT_DIR    = "results"
+S3_OUT_PRE = "v1/clusters/"
 
 FEATURES     = ["drain_area_mi2", "slope_ft_mi", "tc_hr", "pct_u"]
 FEAT_LABELS  = ["Area (mi²)", "Slope (ft/mi)", "Tc (hr)", "Impervious (%)"]
@@ -77,6 +80,21 @@ def read_s3(key: str, columns: list[str] | None = None) -> pd.DataFrame:
     return pq.read_table(
         f"{BUCKET}/{PREFIX}{key}", filesystem=_s3(), columns=columns
     ).to_pandas()
+
+
+_s3_client = None
+
+
+def _upload(local_path: str, filename: str, content_type: str) -> None:
+    """Upload a local file to s3://BUCKET/S3_OUT_PRE/filename."""
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3")
+    key = S3_OUT_PRE + filename
+    _s3_client.upload_file(
+        local_path, BUCKET, key, ExtraArgs={"ContentType": content_type}
+    )
+    print(f"  → s3://{BUCKET}/{key}")
 
 
 # ── Step 1: Count exceedances ──────────────────────────────────────────────────
@@ -155,6 +173,7 @@ def plot_dendrogram(X_scaled: np.ndarray, out_path: str) -> None:
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"  Saved {out_path}")
+    _upload(out_path, os.path.basename(out_path), "image/png")
 
 
 # ── Step 3: K-means + silhouette ───────────────────────────────────────────────
@@ -272,12 +291,14 @@ def write_cluster_outputs(
         # Assignment CSV
         assign_path = os.path.join(OUT_DIR, f"clusters_k{k}.csv")
         df[["site_no", "cluster"]].to_csv(assign_path, index=False)
+        _upload(assign_path, f"clusters_k{k}.csv", "text/csv")
 
         # Statistics CSV: mean and std per cluster, plus centroids
         stats = df.groupby("cluster")[FEATURES].agg(["mean", "std"])
         stats.columns = ["_".join(c) for c in stats.columns]
         stats_path = os.path.join(OUT_DIR, f"clusters_k{k}_stats.csv")
         stats.to_csv(stats_path)
+        _upload(stats_path, f"clusters_k{k}_stats.csv", "text/csv")
 
         n_per_cluster = df["cluster"].value_counts().sort_index()
         print(f"\n  k={k}: {assign_path}, {stats_path}")
@@ -334,6 +355,7 @@ def plot_scatter(
         fig.savefig(path, dpi=150)
         plt.close(fig)
         print(f"  Saved {path}")
+        _upload(path, f"clusters_Q{rp}_k{k}.png", "image/png")
 
 
 # ── Recommendation summary ─────────────────────────────────────────────────────
