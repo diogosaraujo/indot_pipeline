@@ -62,6 +62,9 @@ K_RANGE              = range(3, 11)
 KMEANS_SEED          = 42
 KMEANS_NINIT         = 20
 
+PRECIP_DURATIONS_HR = [1, 3, 6, 12, 24]           # Atlas 14 durations to check
+MRMS_PRODUCT_KEY    = "QPE_01H_Pass2"
+
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
@@ -173,15 +176,119 @@ def print_exceedance_summary(
 
         src_str = ""
         if "source" in flow_stats.columns and col in flow_stats.columns:
-            valid  = flow_stats[flow_stats[col].notna()]
-            n_gage = int((valid["source"] == "gage_stats").sum())
-            n_regr = int((valid["source"] == "regression").sum())
-            src_str = f"  [gage_stats: {n_gage}, regression: {n_regr}]"
+            src_map   = flow_stats[flow_stats[col].notna()].set_index("site_no")["source"]
+            ev_df     = counts[rp].rename("n_events").reset_index()
+            ev_df["source"] = ev_df["site_no"].map(src_map)
+            n_ev_gage = int(ev_df.loc[ev_df["source"] == "gage_stats", "n_events"].sum())
+            n_ev_regr = int(ev_df.loc[ev_df["source"] == "regression", "n_events"].sum())
+            src_str   = f"  [gage_stats: {n_ev_gage} ev, regression: {n_ev_regr} ev]"
 
         print(
             f"  Q{rp:3d}: {total:5d} events  "
             f"({n_sta} stations with ≥1 event){src_str}  →  max_k = {max_k}"
         )
+
+
+# ── Step 1b: Precipitation exceedances ────────────────────────────────────────
+
+def count_precip_exceedances() -> tuple[dict[int, pd.Series], pd.Timestamp, pd.Timestamp]:
+    """Count distinct precipitation exceedance events per station (MRMS + Atlas 14).
+
+    For each return period an event is counted whenever the rolling accumulation
+    for ANY duration in PRECIP_DURATIONS_HR exceeds the Atlas 14 threshold.
+    Two above-threshold periods separated by ≤24 h are merged into one event;
+    a gap >24 h starts a new one — same rule as the streamflow analysis.
+
+    Returns (counts_dict, mrms_start, mrms_end).
+    """
+    print("\nLoading MRMS nearest-pixel precipitation...")
+    mrms = read_s3(
+        f"mrms/{MRMS_PRODUCT_KEY}/nearest_pixel.parquet",
+        columns=["site_no", "datetime_utc", "value"],
+    )
+    mrms["datetime_utc"] = pd.to_datetime(mrms["datetime_utc"], utc=True)
+    mrms = mrms.rename(columns={"value": "precip_in"})
+    mrms["site_no"] = mrms["site_no"].astype(str)
+
+    print("Loading Atlas 14 precipitation frequency...")
+    atlas14 = read_s3("atlas14/precipitation_frequency.parquet")
+    atlas14["site_no"] = atlas14["site_no"].astype(str)
+
+    mrms_start = mrms["datetime_utc"].min()
+    mrms_end   = mrms["datetime_utc"].max()
+    n_yrs = (mrms_end - mrms_start).days / 365.25
+    print(f"  MRMS period: {mrms_start.date()} → {mrms_end.date()} ({n_yrs:.1f} yr)")
+
+    sites = sorted(set(mrms["site_no"]) & set(atlas14["site_no"]))
+    print(f"  Stations with MRMS + Atlas 14 data: {len(sites)}")
+
+    # Pre-group for efficiency
+    mrms_by_site   = {s: g.set_index("datetime_utc")["precip_in"].sort_index()
+                      for s, g in mrms.groupby("site_no")}
+    atlas14_by_site = {s: g for s, g in atlas14.groupby("site_no")}
+
+    site_records: list[dict] = []
+
+    for site_no in sites:
+        precip = mrms_by_site[site_no]
+        # Fill to a complete hourly grid (missing hours = no rain)
+        full_idx = pd.date_range(precip.index.min(), precip.index.max(),
+                                 freq="1h", tz="UTC")
+        precip = precip.reindex(full_idx, fill_value=0.0)
+
+        a14 = atlas14_by_site.get(site_no, pd.DataFrame())
+        if a14.empty:
+            continue
+
+        for rp in RETURN_PERIODS:
+            any_above = pd.Series(False, index=precip.index)
+            for dur_h in PRECIP_DURATIONS_HR:
+                row = a14[
+                    (a14["duration_hr"] == dur_h) &
+                    (a14["return_period_yr"] == rp)
+                ]
+                if row.empty:
+                    continue
+                threshold = float(row["depth_in"].iloc[0])
+                rolling   = precip.rolling(dur_h, min_periods=dur_h).sum()
+                any_above = any_above | (rolling >= threshold)
+
+            above_ts = any_above[any_above].index
+            if len(above_ts) == 0:
+                continue
+
+            gaps_hr  = pd.Series(above_ts).diff().dt.total_seconds().div(3600)
+            n_events = 1 + int((gaps_hr > 24).sum())
+            site_records.append({"site_no": site_no, "rp": rp, "n_events": n_events})
+
+    df = pd.DataFrame(site_records) if site_records else pd.DataFrame(
+        columns=["site_no", "rp", "n_events"]
+    )
+
+    result: dict[int, pd.Series] = {}
+    for rp in RETURN_PERIODS:
+        sub = df[df["rp"] == rp].set_index("site_no")["n_events"] if not df.empty else pd.Series(dtype=int)
+        result[rp] = sub[sub > 0] if not sub.empty else sub
+
+    return result, mrms_start, mrms_end
+
+
+def print_precip_summary(
+    counts: dict[int, pd.Series],
+    mrms_start: pd.Timestamp,
+    mrms_end: pd.Timestamp,
+) -> None:
+    yrs = (mrms_end - mrms_start).days / 365.25
+    print(
+        f"\n── Step 1b: Precipitation exceedances  "
+        f"(MRMS {mrms_start.date()} → {mrms_end.date()}, {yrs:.1f} yr) "
+        f"─────────────────────────────────────────"
+    )
+    print(f"  Durations: {PRECIP_DURATIONS_HR} h  |  any-duration exceedance, >24 h gap separates events")
+    for rp in RETURN_PERIODS:
+        total = int(counts[rp].sum()) if not counts[rp].empty else 0
+        n_sta = counts[rp].shape[0]
+        print(f"  P{rp:3d}: {total:5d} events  ({n_sta} stations with ≥1 event)")
 
 
 # ── Step 2: Dendrogram ─────────────────────────────────────────────────────────
@@ -449,6 +556,13 @@ def main() -> None:
     # Step 1
     counts = count_exceedances(flow_stats)
     print_exceedance_summary(counts, flow_stats)
+
+    # Step 1b
+    try:
+        precip_counts, mrms_start, mrms_end = count_precip_exceedances()
+        print_precip_summary(precip_counts, mrms_start, mrms_end)
+    except Exception as e:
+        print(f"\n  WARNING: precipitation exceedance count failed: {e}")
 
     # Step 2
     plot_dendrogram(X_scaled, os.path.join(OUT_DIR, "dendrogram.png"))
