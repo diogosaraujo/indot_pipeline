@@ -102,10 +102,11 @@ def _upload(local_path: str, filename: str, content_type: str) -> None:
 def count_exceedances(
     flow_stats: pd.DataFrame,
 ) -> dict[int, pd.Series]:
-    """Return {rp: Series[site_no → n_days_exceeding_Qrp]} for 2002-2022.
+    """Return {rp: Series[site_no → n_distinct_events]} using 15-min IV data.
 
-    Resamples the IV record to daily max before counting so that a multi-hour
-    flood peak counts as one event per day rather than once per reading.
+    Two above-threshold segments are merged into one event when the wall-clock
+    gap between them is ≤24 h; a gap >24 h starts a new event.  This is
+    determined directly from IV timestamps — no daily resampling.
     """
     print("\nLoading streamflow time series (may take a minute)...")
     sf = read_s3(
@@ -122,15 +123,6 @@ def count_exceedances(
     ]
     print(f"  {len(sf):,} IV records in analysis window across {sf['site_no'].nunique()} stations")
 
-    # Daily maximum per station
-    daily = (
-        sf.set_index("datetime")
-        .groupby("site_no")["value_cfs"]
-        .resample("1D")
-        .max()
-        .reset_index()
-    )
-
     counts: dict[int, pd.Series] = {}
     for rp in RETURN_PERIODS:
         col = f"Q{rp}"
@@ -139,23 +131,56 @@ def count_exceedances(
             .dropna()
             .rename("threshold")
         )
-        merged  = daily.merge(thresholds, on="site_no", how="inner")
-        exceed  = merged[merged["value_cfs"] >= merged["threshold"]]
-        series  = exceed.groupby("site_no").size().rename(f"events_Q{rp}")
-        counts[rp] = series
+        merged = sf.merge(thresholds, on="site_no", how="inner")
+
+        # Keep only above-threshold readings, sorted by station then time
+        exceed = (
+            merged[merged["value_cfs"] >= merged["threshold"]]
+            .sort_values(["site_no", "datetime"])
+            .copy()
+        )
+
+        # Wall-clock gap between consecutive above-threshold readings (same station)
+        exceed["prev_dt"] = exceed.groupby("site_no")["datetime"].shift(1)
+        exceed["gap_hr"]  = (
+            (exceed["datetime"] - exceed["prev_dt"])
+            .dt.total_seconds()
+            .div(3600)
+        )
+
+        # New event: first reading for this station, or gap to previous > 24 h
+        exceed["new_event"] = exceed["prev_dt"].isna() | (exceed["gap_hr"] > 24)
+
+        series = (
+            exceed.groupby("site_no")["new_event"]
+            .sum()
+            .rename(f"events_Q{rp}")
+        )
+        counts[rp] = series[series > 0]
 
     return counts
 
 
-def print_exceedance_summary(counts: dict[int, pd.Series]) -> None:
+def print_exceedance_summary(
+    counts: dict[int, pd.Series], flow_stats: pd.DataFrame
+) -> None:
     print("\n── Step 1: Exceedance counts (2002–2022) ─────────────────────────────")
     for rp in RETURN_PERIODS:
+        col   = f"Q{rp}"
         total = int(counts[rp].sum())
         n_sta = counts[rp].shape[0]
         max_k = total // MIN_CLUSTER_EVENTS
+
+        src_str = ""
+        if "source" in flow_stats.columns and col in flow_stats.columns:
+            valid  = flow_stats[flow_stats[col].notna()]
+            n_gage = int((valid["source"] == "gage_stats").sum())
+            n_regr = int((valid["source"] == "regression").sum())
+            src_str = f"  [gage_stats: {n_gage}, regression: {n_regr}]"
+
         print(
-            f"  Q{rp:3d}: {total:6d} total exceedances  "
-            f"({n_sta} stations with ≥1 event)  →  max_k = {max_k}"
+            f"  Q{rp:3d}: {total:5d} events  "
+            f"({n_sta} stations with ≥1 event){src_str}  →  max_k = {max_k}"
         )
 
 
@@ -423,7 +448,7 @@ def main() -> None:
 
     # Step 1
     counts = count_exceedances(flow_stats)
-    print_exceedance_summary(counts)
+    print_exceedance_summary(counts, flow_stats)
 
     # Step 2
     plot_dendrogram(X_scaled, os.path.join(OUT_DIR, "dendrogram.png"))
