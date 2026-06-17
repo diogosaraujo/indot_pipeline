@@ -104,12 +104,16 @@ def _upload(local_path: str, filename: str, content_type: str) -> None:
 
 def count_exceedances(
     flow_stats: pd.DataFrame,
-) -> dict[int, pd.Series]:
-    """Return {rp: Series[site_no → n_distinct_events]} using 15-min IV data.
+) -> tuple[dict[int, pd.Series], set[str]]:
+    """Return ({rp: Series[site_no → n_distinct_events]}, excluded_sites).
 
     Two above-threshold segments are merged into one event when the wall-clock
     gap between them is ≤24 h; a gap >24 h starts a new event.  This is
     determined directly from IV timestamps — no daily resampling.
+
+    Applies the same QC as script 08: stations where Q10 < median observed flow
+    are excluded from all return periods.  These have regression-derived
+    thresholds so low they are exceeded nearly every year.
     """
     print("\nLoading streamflow time series (may take a minute)...")
     sf = read_s3(
@@ -126,11 +130,33 @@ def count_exceedances(
     ]
     print(f"  {len(sf):,} IV records in analysis window across {sf['site_no'].nunique()} stations")
 
+    # QC: exclude stations where Q10 < median observed flow (same filter as script 08).
+    # Flood-frequency Q10 is an annual-maximum return period — it should greatly
+    # exceed the typical daily flow.  When Q10 < median the threshold is
+    # unrealistically low (regression underestimate) and produces near-annual events.
+    pos_medians = (
+        sf[sf["value_cfs"] >= 0]
+        .groupby("site_no")["value_cfs"]
+        .median()
+    )
+    neg_sites = set(sf.loc[sf["value_cfs"] < 0, "site_no"])
+    q10_df = flow_stats[flow_stats["Q10"].notna()].copy()
+    q10_df["_med"] = q10_df["site_no"].map(pos_medians)
+    bad_q10 = set(q10_df.loc[q10_df["_med"] > q10_df["Q10"], "site_no"])
+    excluded = neg_sites | bad_q10
+    if excluded:
+        print(
+            f"  QC: excluding {len(excluded)} stations "
+            f"(Q10 < median observed flow: {len(bad_q10)}, "
+            f"negative readings: {len(neg_sites)})"
+        )
+    fs_valid = flow_stats[~flow_stats["site_no"].isin(excluded)].copy()
+
     counts: dict[int, pd.Series] = {}
     for rp in RETURN_PERIODS:
         col = f"Q{rp}"
         thresholds = (
-            flow_stats.set_index("site_no")[col]
+            fs_valid.set_index("site_no")[col]
             .dropna()
             .rename("threshold")
         )
@@ -161,13 +187,23 @@ def count_exceedances(
         )
         counts[rp] = series[series > 0]
 
-    return counts
+    return counts, excluded
 
 
 def print_exceedance_summary(
-    counts: dict[int, pd.Series], flow_stats: pd.DataFrame
+    counts: dict[int, pd.Series],
+    flow_stats: pd.DataFrame,
+    excluded: set[str],
 ) -> None:
     print("\n── Step 1: Exceedance counts (2002–2022) ─────────────────────────────")
+    if excluded:
+        src_col = flow_stats.set_index("site_no").get("source", pd.Series(dtype=str))
+        n_excl_gage = int((flow_stats[flow_stats["site_no"].isin(excluded)]["source"] == "gage_stats").sum()) if "source" in flow_stats.columns else 0
+        n_excl_regr = int((flow_stats[flow_stats["site_no"].isin(excluded)]["source"] == "regression").sum()) if "source" in flow_stats.columns else 0
+        print(
+            f"  (QC removed {len(excluded)} stations: "
+            f"gage_stats={n_excl_gage}, regression={n_excl_regr})"
+        )
     for rp in RETURN_PERIODS:
         col   = f"Q{rp}"
         total = int(counts[rp].sum())
@@ -176,7 +212,8 @@ def print_exceedance_summary(
 
         src_str = ""
         if "source" in flow_stats.columns and col in flow_stats.columns:
-            src_map   = flow_stats[flow_stats[col].notna()].set_index("site_no")["source"]
+            fs_kept = flow_stats[~flow_stats["site_no"].isin(excluded)]
+            src_map   = fs_kept[fs_kept[col].notna()].set_index("site_no")["source"]
             ev_df     = counts[rp].rename("n_events").reset_index()
             ev_df["source"] = ev_df["site_no"].map(src_map)
             n_ev_gage = int(ev_df.loc[ev_df["source"] == "gage_stats", "n_events"].sum())
@@ -554,8 +591,8 @@ def main() -> None:
     X_scaled = scaler.fit_transform(X_orig)
 
     # Step 1
-    counts = count_exceedances(flow_stats)
-    print_exceedance_summary(counts, flow_stats)
+    counts, excluded_sites = count_exceedances(flow_stats)
+    print_exceedance_summary(counts, flow_stats, excluded_sites)
 
     # Step 1b
     try:
