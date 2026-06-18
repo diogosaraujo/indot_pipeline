@@ -361,7 +361,7 @@ def label_clusters(
     km_per_px  = ((BBOX["lat_max"] - BBOX["lat_min"]) * 111.0) / len(lats)
     radius_px  = max(1, int(round(DILATION_KM / km_per_px)))
     struct8    = generate_binary_structure(2, 2)
-    dilated    = binary_dilation(binary, footprint=disk(radius_px)).astype(np.uint8)
+    dilated    = binary_dilation(binary, structure=disk(radius_px)).astype(np.uint8)
     labeled_d, _ = ndlabel(dilated, structure=struct8)
     return np.where(binary > 0, labeled_d, 0).astype(np.int32)
 
