@@ -580,7 +580,7 @@ def save_day_checkpoint(
     _put_bytes(pickle.dumps(state), f"{S3_CHECKPOINT}{day:%Y%m%d}_state.pkl")
 
     # Append completed events (merge with existing)
-    existing = _get_parquet(S3_EVENTS_KEY) or pd.DataFrame()
+    _tmp = _get_parquet(S3_EVENTS_KEY); existing = _tmp if _tmp is not None else pd.DataFrame()
     new_rows  = pd.DataFrame(completed_events)
     if not new_rows.empty:
         combined = pd.concat([existing, new_rows], ignore_index=True) \
@@ -678,7 +678,7 @@ def main() -> None:
     ).days / 365.25
 
     if args.aggregate_only:
-        events = _get_parquet(S3_EVENTS_KEY) or pd.DataFrame()
+        _tmp = _get_parquet(S3_EVENTS_KEY); events = _tmp if _tmp is not None else pd.DataFrame()
         if events.empty:
             log.error("No storm_events.parquet found — run processing first.")
             return
