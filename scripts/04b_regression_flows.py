@@ -259,11 +259,14 @@ def ema_fit(
         sigma_new = float(np.sqrt(max(var_new, 1e-12)))
 
         # EMA skew: ĝ = n/((n−1)(n−2)) · (Σᵤ Zᵢ³ + n_c · E[Z³ | Y<T])
-        e3         = _truncated_central_moment(3, threshold, mu_new, gamma, mu, sigma)
-        sum_z3_u   = float(np.sum(((uncensored - mu_new) / sigma_new) ** 3))
-        gamma_new  = (n / ((n - 1.0) * (n - 2.0))) * (
-            sum_z3_u + n_c * e3 / sigma_new ** 3
-        )
+        if sigma_new > 1e-6:
+            e3        = _truncated_central_moment(3, threshold, mu_new, gamma, mu, sigma)
+            sum_z3_u  = float(np.sum(((uncensored - mu_new) / sigma_new) ** 3))
+            gamma_new = (n / ((n - 1.0) * (n - 2.0))) * (
+                sum_z3_u + n_c * e3 / sigma_new ** 3
+            )
+        else:
+            gamma_new = gamma   # degenerate variance — hold skew fixed
 
         delta = abs(mu_new - mu) + abs(sigma_new - sigma) + abs(gamma_new - gamma)
         mu, sigma, gamma = mu_new, sigma_new, gamma_new
