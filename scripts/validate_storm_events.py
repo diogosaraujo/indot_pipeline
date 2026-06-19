@@ -783,13 +783,43 @@ def main() -> None:
         log.info("  rate: %.1f days/hr  |  ETA: %.1f hr",
                  rate, remaining / rate if rate > 0 else float("inf"))
 
+    # Close any storms still active at the end of the data record
+    if active_storms:
+        log.info("Closing %d storms still active at end of record.", len(active_storms))
+        tail_events: list[dict] = []
+        for event_id, storm in list(active_storms.items()):
+            rp = classify_storm_rp(storm, atlas14_grids)
+            if storm.footprint is not None and grid_lats is not None:
+                r_idx, c_idx = np.where(storm.footprint)
+                centroid_lat = float(grid_lats[r_idx].mean()) if len(r_idx) > 0 else float("nan")
+                centroid_lon = float(grid_lons[c_idx].mean()) if len(c_idx) > 0 else float("nan")
+                n_pixels = int(storm.footprint.sum())
+            else:
+                centroid_lat = centroid_lon = float("nan")
+                n_pixels = 0
+            tail_events.append({
+                "event_id":     event_id,
+                "start_dt":     storm.start_dt,
+                "end_dt":       storm.last_active_dt,
+                "duration_hr":  max(1, int((storm.last_active_dt - storm.start_dt).total_seconds() / 3600) + 1),
+                "centroid_lat": round(centroid_lat, 4),
+                "centroid_lon": round(centroid_lon, 4),
+                "n_pixels_max": n_pixels,
+                "assigned_rp":  rp,
+            })
+        _tmp = _get_parquet(S3_EVENTS_KEY)
+        existing = _tmp if _tmp is not None else pd.DataFrame()
+        new_rows = pd.DataFrame(tail_events)
+        combined = pd.concat([existing, new_rows], ignore_index=True).drop_duplicates("event_id")
+        _put_parquet(combined, S3_EVENTS_KEY)
+
     # Final aggregation
     log.info("Processing complete — building summary.")
-    events  = _get_parquet(S3_EVENTS_KEY) or pd.DataFrame()
+    _tmp = _get_parquet(S3_EVENTS_KEY); events = _tmp if _tmp is not None else pd.DataFrame()
     summary = build_summary(events, n_years)
     log.info("\n%s", summary.to_string(index=False))
-    _put_csv(summary,  S3_OUT + "indiana_storm_summary.csv")
-    _put_csv(events,   S3_OUT + "indiana_storm_events.csv")
+    _put_csv(summary, S3_OUT + "indiana_storm_summary.csv")
+    _put_csv(events,  S3_OUT + "indiana_storm_events.csv")
     plot_storm_map(events)
 
 
