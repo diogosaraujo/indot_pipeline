@@ -196,21 +196,37 @@ def _truncated_central_moment(
     loc: float,
     scale: float,
 ) -> float:
-    """E[(Y - center)^k | Y < threshold] for Pearson3(gamma, loc, scale)."""
+    """E[(Y - center)^k | Y < threshold] for Pearson3(gamma, loc, scale).
+
+    Returns NaN if the integration is numerically unstable; the caller treats a
+    non-finite result as an EMA failure and falls back to method of moments.
+    """
+    if not (np.isfinite(loc) and np.isfinite(scale) and scale > 1e-9
+            and np.isfinite(gamma)):
+        return float("nan")
+
     dist = stats.pearson3(gamma, loc=loc, scale=scale)
     F_T  = float(dist.cdf(threshold))
-    if F_T < 1e-12:
-        return 0.0
+    if not np.isfinite(F_T) or F_T < 1e-12:
+        return float("nan")
+
     lower = float(dist.ppf(max(1e-9, F_T * 1e-6)))
-    val, _ = integrate.quad(
-        lambda y: float((y - center) ** k * dist.pdf(y)),
-        lower,
-        threshold,
-        limit=200,
-        epsabs=1e-9,
-        epsrel=1e-7,
-    )
-    return val / F_T
+    if not np.isfinite(lower):
+        return float("nan")
+
+    try:
+        val, _ = integrate.quad(
+            lambda y: float((y - center) ** k * dist.pdf(y)),
+            lower,
+            threshold,
+            limit=200,
+            epsabs=1e-9,
+            epsrel=1e-7,
+        )
+    except Exception:
+        return float("nan")
+
+    return val / F_T if np.isfinite(val) else float("nan")
 
 
 def ema_fit(
@@ -246,6 +262,7 @@ def ema_fit(
     gamma = float(stats.skew(uncensored, bias=False))
 
     converged = False
+    failed    = False
     n_iter    = 0
 
     for n_iter in range(1, max_iter + 1):
@@ -268,6 +285,12 @@ def ema_fit(
         else:
             gamma_new = gamma   # degenerate variance — hold skew fixed
 
+        # Abort if any truncated moment was numerically unstable
+        if not (np.isfinite(mu_new) and np.isfinite(sigma_new)
+                and np.isfinite(gamma_new)):
+            failed = True
+            break
+
         delta = abs(mu_new - mu) + abs(sigma_new - sigma) + abs(gamma_new - gamma)
         mu, sigma, gamma = mu_new, sigma_new, gamma_new
 
@@ -275,11 +298,18 @@ def ema_fit(
             converged = True
             break
 
+    # Fall back to full-sample method of moments if EMA was unstable
+    if failed:
+        mu    = float(np.mean(log_q))
+        sigma = float(np.std(log_q, ddof=1))
+        gamma = float(stats.skew(log_q, bias=False))
+
     return mu, sigma, gamma, {
         "n_censored":    n_c,
         "n_uncensored":  n_u,
         "threshold_log": threshold,
         "converged":     converged,
+        "ema_failed":    failed,
         "iterations":    n_iter,
     }
 
@@ -295,7 +325,7 @@ def fit_lp3(log_q: np.ndarray, lat: float) -> dict:
     # Step 2: Moment estimation
     if n_censor > 0:
         mean_y, std_y, skew_site, ema_info = ema_fit(log_q, threshold)
-        fitting_method = "EMA"
+        fitting_method = "MOM (EMA unstable)" if ema_info.get("ema_failed") else "EMA"
     else:
         mean_y    = float(np.mean(log_q))
         std_y     = float(np.std(log_q, ddof=1))
