@@ -59,9 +59,9 @@ FEAT_LABELS  = ["Area (mi²)", "Slope (ft/mi)", "Impervious (%)"]
 RETURN_PERIODS       = [10, 50, 100]
 START_DATE           = "2002-01-01"
 END_DATE             = "2022-12-31"
-MIN_SILHOUETTE       = 0.50   # below this (for every k) → treat as one big group
 MIN_CLUSTER_EVENTS   = 30     # each cluster needs ≥ this many events; total needs ≥ 2×
 K_RANGE              = range(2, 11)
+LOG_FEATURES         = ["drain_area_mi2", "slope_ft_mi"]  # log-transform before scaling
 KMEANS_SEED          = 42
 KMEANS_NINIT         = 20
 
@@ -392,7 +392,6 @@ def recommend_k(results: list[dict], counts: dict[int, pd.Series]) -> dict[int, 
       • total < 2×MIN_CLUSTER_EVENTS (60)  → 1 group (too few events to split).
       • otherwise choose the k with the HIGHEST silhouette among all k that satisfy:
             k ≤ total // MIN_CLUSTER_EVENTS         (event budget)
-            silhouette ≥ MIN_SILHOUETTE (0.50)      (real cluster structure)
             min cluster events ≥ MIN_CLUSTER_EVENTS (every group is usable)
         If none qualify → 1 group.
 
@@ -410,7 +409,6 @@ def recommend_k(results: list[dict], counts: dict[int, pd.Series]) -> dict[int, 
         cands = [
             r for r in results
             if r["k"] <= k_budget
-            and r["silhouette"] >= MIN_SILHOUETTE
             and r[f"min_events_Q{rp}"] >= MIN_CLUSTER_EVENTS
         ]
         if cands:
@@ -419,8 +417,8 @@ def recommend_k(results: list[dict], counts: dict[int, pd.Series]) -> dict[int, 
                        "min_events": best[f"min_events_Q{rp}"], "reason": "ok"}
         else:
             rec[rp] = {"k": 1, "silhouette": None, "min_events": total,
-                       "reason": f"no k≤{k_budget} with sil≥{MIN_SILHOUETTE} "
-                                 f"and min events≥{MIN_CLUSTER_EVENTS}"}
+                       "reason": f"no k≤{k_budget} with every cluster ≥ "
+                                 f"{MIN_CLUSTER_EVENTS} events"}
     return rec
 
 
@@ -429,8 +427,8 @@ def print_recommendation_table(
     rec: dict[int, dict],
     counts: dict[int, pd.Series],
 ) -> None:
-    print(f"\n── Step 4: k evaluation (sil ≥ {MIN_SILHOUETTE}, every cluster ≥ "
-          f"{MIN_CLUSTER_EVENTS} events, total ≥ {2*MIN_CLUSTER_EVENTS}) ──")
+    print(f"\n── Step 4: k evaluation (best silhouette with every cluster ≥ "
+          f"{MIN_CLUSTER_EVENTS} events; total ≥ {2*MIN_CLUSTER_EVENTS} to split) ──")
     header = f"  {'k':>3}  {'Silhouette':>10}  " + "  ".join(
         f"{'minEv_Q'+str(rp):>11}" for rp in RETURN_PERIODS
     )
@@ -598,9 +596,16 @@ def main() -> None:
         f"{len(stations)} of {len(fitted_sites)} fitted"
     )
 
-    X_orig   = stations[FEATURES].values.astype(float)
+    # Log-transform the heavy-tailed geomorphic features (area, slope span
+    # orders of magnitude) so a handful of giant basins don't dominate the
+    # Euclidean distance and peel off as singleton outlier clusters.  This also
+    # matches the log axes used in the scatter plots.  Imperviousness is bounded
+    # [0,100] and includes zeros, so it stays linear.
+    feat = stations[FEATURES].astype(float).copy()
+    for col in LOG_FEATURES:
+        feat[col] = np.log10(feat[col].clip(lower=1e-6))
     scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X_orig)
+    X_scaled = scaler.fit_transform(feat.values)
 
     # Step 1
     counts, excluded_sites = count_exceedances(flow_stats)
