@@ -101,12 +101,16 @@ def main() -> None:
     fully_unreg = per_site_all[per_site_all["n_regulated"] == 0]
     keep_B = fully_unreg[fully_unreg["n_clean"] >= 10]
 
-    log.info("Station eligibility (>=10 instantaneous peaks):")
+    n_any_reg     = int((per_site_all["n_regulated"] > 0).sum())
+    n_fully_unreg = len(fully_unreg)
+    log.info("Station eligibility:")
     log.info("  total sites with peaks                         : %d", n_total_sites)
-    log.info("  sites with ANY regulated peak                  : %d",
-             int((per_site_all["n_regulated"] > 0).sum()))
-    log.info("  Rule A (drop regulated peaks, keep station)    : %d sites", len(keep_A))
-    log.info("  Rule B (drop entire regulated stations)        : %d sites", len(keep_B))
+    log.info("  sites with ANY regulated peak                  : %d", n_any_reg)
+    log.info("  fully unregulated sites                        : %d  (%d - %d)",
+             n_fully_unreg, n_total_sites, n_any_reg)
+    log.info("  -- applying the >=10 instantaneous-peak record filter --")
+    log.info("  Rule A (drop reg. peaks; keep station >=10)    : %d sites", len(keep_A))
+    log.info("  Rule B (fully unregulated AND >=10 peaks)      : %d sites", len(keep_B))
 
     # Apply exclusion for the comparison itself: instantaneous + unregulated peaks
     n_drop = int((~peaks["is_clean"]).sum())

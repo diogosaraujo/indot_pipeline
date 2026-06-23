@@ -1,29 +1,29 @@
 """04b_regression_flows.py  — at-site LP3 flood frequency analysis
 
-Fits a Log-Pearson Type III (LP3) distribution to observed annual maximum
-instantaneous discharge for Indiana gauges that lack USGS StreamStats estimates.
+Fits a Log-Pearson Type III (LP3) distribution to the USGS annual PEAK-FLOW
+series (from 04a_get_annual_peak_flow.py) for every Indiana gauge.  The annual
+peak record is the authoritative, full-length basis for flood frequency — it is
+the same instantaneous quantity as our IV annual maxima (validated:
+median peak/IV ratio = 1.00, R²=0.99) but extends decades earlier.
 
-Methodology: Bulletin 17C (USGS TM 4-B5, 2019), Chapter 3 — Method of Moments
-with weighted skew (Section 3.3):
+Methodology: Bulletin 17C (USGS TM 4-B5, 2019):
+    • Multiple Grubbs-Beck low-outlier test (Section 4.3)
+    • EMA fitting with the censored low outliers (Section 3.2)
+    • Method of Moments with weighted skew (Section 3.3):
+          Ĝ = w₁·G + w₂·Ḡ,   w₁ = MSE(Ḡ)/(MSE(G)+MSE(Ḡ))
+      where Ḡ is the Weaver & Vogel (2010) generalized skew, MSE(Ḡ)=0.302.
 
-    Ĝ = w₁·G + w₂·Ḡ
-    w₁ = MSE(Ḡ) / (MSE(G) + MSE(Ḡ))   [weight on at-site]
-    w₂ = MSE(G)  / (MSE(G) + MSE(Ḡ))   [weight on regional]
-
-where:
-    G    = at-site skew (from station record)
-    Ḡ    = generalized regional skew (Weaver & Vogel 2010, spatially varying)
-    MSE(G)  = at-site skew variance — B17C Appendix 3: 6(1 + 6·G²)/n
-    MSE(Ḡ) = 0.302 (Weaver & Vogel 2010, national MSE of generalized skew map)
-
-Station eligibility
-───────────────────
-  source == 'gage_stats'   → untouched (StreamStats values kept as-is)
-  record < 10 water-years  → source set to 'insufficient_record'; Q values null;
-                              downstream scripts should exclude these stations
-  record ≥ 10 water-years  → LP3 fitted; source set to 'lp3_at_site'
-
-A water year (Oct 1 – Sep 30) is counted if it contains ≥ 100 valid IV readings.
+Peak filtering / station eligibility
+────────────────────────────────────
+  • Daily-average peaks (peak_cd contains '1') are dropped — not instantaneous.
+  • REGULATED / diverted streams (peak_cd contains '5' or '6') are excluded
+    ENTIRELY (Rule B): their peaks reflect dam/reservoir operation, not the
+    rainfall-runoff response, so the whole station is set to insufficient_record.
+  • A station is LP3-fitted only if it retains ≥ 10 clean annual peaks
+    → source = 'lp3_peak_series'.
+  • Every other station (no peak record, < 10 clean peaks, or regulated) is set
+    to 'insufficient_record' with ALL Q values nulled — no StreamStats fallback,
+    so the resulting table is single-method and internally consistent.
 
 Outputs
 ───────
@@ -54,11 +54,19 @@ logging.basicConfig(
 log = logging.getLogger("04b_lp3")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-MIN_YEARS        = 10     # minimum complete water years required
-MIN_OBS_PER_YEAR = 100    # IV readings needed to count a water year as complete
+MIN_YEARS        = 10     # minimum clean annual peaks required for an LP3 fit
+PEAKS_KEY        = "streamflow/annual_peaks/usgs_annual_peaks.parquet"
+S3_PLOTS_PREFIX  = "analysis/lp3_frequency_curves/"
+
+# Design return periods highlighted on plots and in the summary CSV.
 RETURN_PERIODS   = [10, 25, 50, 100]
 Q_COLS           = {10: "Q10", 25: "Q25", 50: "Q50", 100: "Q100"}
-S3_PLOTS_PREFIX  = "analysis/lp3_frequency_curves/"
+
+# Full set of return periods populated in the flow-stats table (LP3 gives any
+# quantile, so we fill every standard column that exists and null it elsewhere —
+# keeps each row single-method and internally consistent).
+ALL_RETURN_PERIODS = [2, 5, 10, 25, 50, 100, 200, 500]
+ALL_Q_COLS         = {rp: f"Q{rp}" for rp in ALL_RETURN_PERIODS}
 
 # Regional skew constants (Weaver & Vogel 2010 / B17C Section 3.3)
 # MSE of the national generalized skew map — fixed at 0.302 per B17C.
@@ -356,25 +364,28 @@ def fit_lp3(log_q: np.ndarray, lat: float) -> dict:
     }
 
 
-# ── Annual maximum extraction ─────────────────────────────────────────────────
+# ── Annual peak extraction (USGS peak-flow series) ────────────────────────────
 
-def _water_year(dt: pd.Timestamp) -> int:
-    return dt.year + 1 if dt.month >= 10 else dt.year
+def clean_peaks_for_site(site_peaks: pd.DataFrame) -> tuple[pd.Series, bool]:
+    """Clean annual peaks for one station, and whether it is regulated.
 
-
-def extract_annual_maxima(site_ts: pd.DataFrame) -> pd.Series:
-    """Annual maximum instantaneous discharge indexed by water year.
-
-    Excludes water years with fewer than MIN_OBS_PER_YEAR valid readings.
+    Excludes daily-average peaks (peak_cd contains '1') — those are not
+    instantaneous.  Returns:
+        peaks        : Series of instantaneous peak_va indexed by water_year
+        is_regulated : True if ANY peak carries a regulation/diversion flag
+                       (peak_cd contains '5' or '6') → Rule B drops the station.
     """
-    ts = site_ts[site_ts["value_cfs"] > 0].copy()
-    if ts.empty:
-        return pd.Series(dtype=float)
-    ts["wy"]  = ts["datetime"].apply(_water_year)
-    counts    = ts.groupby("wy")["value_cfs"].count()
-    maxima    = ts.groupby("wy")["value_cfs"].max()
-    valid_wy  = counts[counts >= MIN_OBS_PER_YEAR].index
-    return maxima.loc[valid_wy].dropna()
+    cd           = site_peaks["peak_cd"].fillna("").astype(str)
+    is_daily     = cd.str.contains("1")
+    is_regulated = bool((cd.str.contains("5") | cd.str.contains("6")).any())
+
+    clean = site_peaks[~is_daily.values]
+    s = (clean.dropna(subset=["peak_va", "water_year"])
+              .drop_duplicates(subset=["water_year"], keep="first")
+              .set_index("water_year")["peak_va"]
+              .sort_index())
+    s = s[s > 0]
+    return s, is_regulated
 
 
 # ── Goodness-of-fit ───────────────────────────────────────────────────────────
@@ -563,109 +574,100 @@ def _upload_csv(df: pd.DataFrame, bucket: str, key: str) -> None:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def _mark_insufficient(flow_stats: pd.DataFrame, site_no: str, q_cols: list[str]) -> None:
+    """Set a station to insufficient_record and null ALL its Q columns."""
+    flow_stats.at[site_no, "source"] = "insufficient_record"
+    for col in q_cols:
+        flow_stats.at[site_no, col] = np.nan
+
+
 def main() -> None:
     cfg    = load_config()
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
 
-    # Load current flow stats
+    # Load current flow stats (defines the full station list and gets written back)
     flow_stats = _read_parquet_s3(bucket, f"{prefix}flow_stats/per_gauge_flow_stats.parquet")
     flow_stats["site_no"] = flow_stats["site_no"].astype(str)
+    q_cols_present = [c for c in ALL_Q_COLS.values() if c in flow_stats.columns]
 
-    # Stations to (re)fit with LP3:
-    #   • every non-gage_stats station (as before), plus
-    #   • gage_stats stations with an incomplete Q set (Q10/Q25/Q50/Q100) —
-    #     these had gaps the old regression filled; refit entirely with LP3 so
-    #     a single, internally consistent method drives all return periods.
-    # gage_stats stations with a COMPLETE Q set are left untouched (authoritative).
-    core_q   = [c for c in Q_COLS.values() if c in flow_stats.columns]
-    is_gage  = flow_stats["source"] == "gage_stats"
-    has_gap  = flow_stats[core_q].isna().any(axis=1)
+    # Load USGS annual peaks (04a output) and group by site
+    log.info("Loading USGS annual peaks...")
+    peaks = _read_parquet_s3(bucket, f"{prefix}{PEAKS_KEY}")
+    peaks["site_no"] = peaks["site_no"].astype(str)
+    peaks_by_site = {s: g for s, g in peaks.groupby("site_no")}
 
-    needs_lp3      = flow_stats[(~is_gage) | (is_gage & has_gap)]["site_no"].tolist()
-    gage_gap_sites = set(flow_stats[is_gage & has_gap]["site_no"])
-
-    n_gage_complete = int((is_gage & ~has_gap).sum())
-    log.info("Stations to evaluate: %d (incl. %d gage_stats with gaps to refit) "
-             "| complete gage_stats kept: %d",
-             len(needs_lp3), len(gage_gap_sites), n_gage_complete)
-
-    if not needs_lp3:
-        log.info("All stations have a complete gage_stats Q set — nothing to do.")
-        return
-
-    # Load station coordinates (needed for regional skew lookup)
+    # Station coordinates for the regional-skew lookup
     inv = _read_parquet_s3(bucket, f"{prefix}stations/indiana_streamflow_sites.parquet",
                            columns=["site_no", "dec_lat_va"])
     inv["site_no"] = inv["site_no"].astype(str)
     lat_map = inv.set_index("site_no")["dec_lat_va"].to_dict()
 
-    # Load IV streamflow for target stations only
-    log.info("Loading IV streamflow data...")
-    sf_all = _read_parquet_s3(
-        bucket,
-        f"{prefix}streamflow/instantaneous/all_gauges_long.parquet",
-        columns=["site_no", "datetime", "value_cfs"],
-    )
-    sf_all["site_no"]   = sf_all["site_no"].astype(str)
-    sf_all["datetime"]  = pd.to_datetime(sf_all["datetime"], utc=True)
-    sf_all["value_cfs"] = pd.to_numeric(sf_all["value_cfs"], errors="coerce")
-    sf_sub = sf_all[sf_all["site_no"].isin(set(needs_lp3))].copy()
-    log.info("IV records loaded: {:,}".format(len(sf_sub)))
-
-    # Process stations
-    summary_rows: list[dict] = []
     flow_stats = flow_stats.set_index("site_no")
+    sites      = flow_stats.index.tolist()
+    n_total    = len(sites)
+    log.info("Evaluating %d stations against the peak-flow series...", n_total)
 
-    n_total = len(needs_lp3)
-    for i, site_no in enumerate(needs_lp3, 1):
-        ts      = sf_sub[sf_sub["site_no"] == site_no]
-        ann_max = extract_annual_maxima(ts)
-        n_years = len(ann_max)
+    summary_rows: list[dict] = []
+    counts = {"lp3": 0, "regulated": 0, "short": 0, "no_peaks": 0}
 
-        log.info("[%d/%d] %s — %d water-years", i, n_total, site_no, n_years)
+    for i, site_no in enumerate(sites, 1):
+        site_peaks = peaks_by_site.get(site_no)
 
-        if n_years < MIN_YEARS:
-            # A gage_stats-with-gaps station too short for LP3: keep its existing
-            # published StreamStats values rather than wiping good data.
-            if site_no in gage_gap_sites:
-                log.info("    gage_stats with gaps but < %d yr — keeping published values",
-                         MIN_YEARS)
-                summary_rows.append({
-                    "site_no": site_no, "n_years": n_years,
-                    "status": "gage_stats_gaps_kept",
-                })
-                continue
-
-            flow_stats.at[site_no, "source"] = "insufficient_record"
-            for col in Q_COLS.values():
-                if col in flow_stats.columns:
-                    flow_stats.at[site_no, col] = np.nan
-            summary_rows.append({
-                "site_no": site_no, "n_years": n_years,
-                "status": "insufficient_record",
-            })
+        # No published peak record → insufficient
+        if site_peaks is None or site_peaks.empty:
+            _mark_insufficient(flow_stats, site_no, q_cols_present)
+            summary_rows.append({"site_no": site_no, "status": "no_peak_record"})
+            counts["no_peaks"] += 1
             continue
 
-        lat    = float(lat_map.get(site_no, 39.8))  # fallback to Indiana centroid
-        log_q  = np.log10(ann_max.values)
+        peaks_s, is_regulated = clean_peaks_for_site(site_peaks)
+
+        # Rule B: any regulation/diversion flag → drop the whole station
+        if is_regulated:
+            _mark_insufficient(flow_stats, site_no, q_cols_present)
+            summary_rows.append({"site_no": site_no, "status": "regulated_excluded",
+                                 "n_peaks": int(len(peaks_s))})
+            counts["regulated"] += 1
+            continue
+
+        n_peaks = len(peaks_s)
+        if n_peaks < MIN_YEARS:
+            _mark_insufficient(flow_stats, site_no, q_cols_present)
+            summary_rows.append({"site_no": site_no, "status": "insufficient_record",
+                                 "n_peaks": int(n_peaks)})
+            counts["short"] += 1
+            continue
+
+        # ── Fit LP3 on the clean annual peak series ───────────────────────────
+        lat    = float(lat_map.get(site_no, 39.8))   # Indiana centroid fallback
+        log_q  = np.log10(peaks_s.values)
         params = fit_lp3(log_q, lat)
         gof    = compute_gof(log_q, params)
+        log.info("[%d/%d] %s — %d peaks (%d–%d) — %s",
+                 i, n_total, site_no, n_peaks,
+                 int(peaks_s.index.min()), int(peaks_s.index.max()),
+                 params.get("fitting_method", "MOM"))
 
-        q_estimates: dict[int, float] = {}
-        for rp in RETURN_PERIODS:
-            q_t = lp3_quantile(rp, params["mean_log"], params["std_log"], params["skew"])
-            q_estimates[rp] = round(q_t, 1)
-            if Q_COLS[rp] in flow_stats.columns:
-                flow_stats.at[site_no, Q_COLS[rp]] = q_t
+        # Populate every standard return-period column that exists
+        q_design: dict[int, float] = {}
+        for rp in ALL_RETURN_PERIODS:
+            col = ALL_Q_COLS[rp]
+            if col in flow_stats.columns:
+                q_t = lp3_quantile(rp, params["mean_log"], params["std_log"], params["skew"])
+                flow_stats.at[site_no, col] = q_t
+                if rp in RETURN_PERIODS:
+                    q_design[rp] = round(q_t, 1)
 
-        flow_stats.at[site_no, "source"] = "lp3_at_site"
+        flow_stats.at[site_no, "source"] = "lp3_peak_series"
+        counts["lp3"] += 1
 
         summary_rows.append({
             "site_no":          site_no,
-            "n_years":          n_years,
-            "status":           "lp3_refit_from_gage" if site_no in gage_gap_sites
-                                else "lp3_fitted",
+            "n_peaks":          n_peaks,
+            "wy_start":         int(peaks_s.index.min()),
+            "wy_end":           int(peaks_s.index.max()),
+            "status":           "lp3_peak_series",
             "fitting_method":   params.get("fitting_method", "MOM"),
             "n_censored":       params.get("n_censored", 0),
             "threshold_cfs":    (
@@ -679,12 +681,12 @@ def main() -> None:
             "weight_at_site":   params["weight_at_site"],
             "weight_regional":  params["weight_regional"],
             "skew_weighted":    round(params["skew"],          4),
-            **{f"Q{rp}": q_estimates.get(rp) for rp in RETURN_PERIODS},
+            **{f"Q{rp}": q_design.get(rp) for rp in RETURN_PERIODS},
             **gof,
         })
 
         try:
-            fig = plot_frequency_curve(site_no, ann_max, params, q_estimates, gof)
+            fig = plot_frequency_curve(site_no, peaks_s, params, q_design, gof)
             _upload_png(fig, bucket,
                         f"{prefix}{S3_PLOTS_PREFIX}{site_no}_lp3.png")
             plt.close(fig)
@@ -698,16 +700,12 @@ def main() -> None:
 
     # Save summary
     summary_df = pd.DataFrame(summary_rows)
-    _upload_csv(summary_df, bucket,
-                f"{prefix}{S3_PLOTS_PREFIX}lp3_summary.csv")
+    _upload_csv(summary_df, bucket, f"{prefix}{S3_PLOTS_PREFIX}lp3_summary.csv")
 
-    n_fitted       = int((summary_df["status"] == "lp3_fitted").sum())
-    n_refit_gage   = int((summary_df["status"] == "lp3_refit_from_gage").sum())
-    n_gage_kept    = int((summary_df["status"] == "gage_stats_gaps_kept").sum())
-    n_insufficient = int((summary_df["status"] == "insufficient_record").sum())
-    log.info("LP3 fitted: %d  |  LP3 refit from gage gaps: %d  |  "
-             "gage gaps kept (< %d yr): %d  |  Insufficient record: %d  |  Total: %d",
-             n_fitted, n_refit_gage, MIN_YEARS, n_gage_kept, n_insufficient, n_total)
+    log.info("LP3 fitted (peak series): %d  |  Regulated excluded: %d  |  "
+             "< %d clean peaks: %d  |  No peak record: %d  |  Total: %d",
+             counts["lp3"], counts["regulated"], MIN_YEARS, counts["short"],
+             counts["no_peaks"], n_total)
     log.info("Source counts: %s",
              flow_stats["source"].value_counts(dropna=False).to_dict())
 
