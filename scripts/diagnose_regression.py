@@ -81,10 +81,14 @@ def upload_csv(df: pd.DataFrame, filename: str) -> None:
 
 
 # ── Event counting (no QC filter — intentionally exposing bad thresholds) ──────
-def count_q10_events(sf: pd.DataFrame, flow_stats: pd.DataFrame) -> pd.Series:
-    """Return Series[site_no → n_Q10_events], unfiltered."""
+def count_events(sf: pd.DataFrame, flow_stats: pd.DataFrame, q_col: str) -> pd.Series:
+    """Return Series[site_no → n_events] exceeding ``q_col``, unfiltered.
+
+    Events are declustered by a 24-hour gap: consecutive exceedances within
+    24 h count as a single event.
+    """
     thresholds = (
-        flow_stats.set_index("site_no")["Q10"]
+        flow_stats.set_index("site_no")[q_col]
         .dropna()
         .rename("threshold")
     )
@@ -99,13 +103,13 @@ def count_q10_events(sf: pd.DataFrame, flow_stats: pd.DataFrame) -> pd.Series:
         (exceed["datetime"] - exceed["prev_dt"]).dt.total_seconds() / 3600
     )
     exceed["new_event"] = exceed["prev_dt"].isna() | (exceed["gap_hr"] > 24)
-    return exceed.groupby("site_no")["new_event"].sum().sort_values(ascending=False)
+    return exceed.groupby("site_no")["new_event"].sum()
 
 
 # ── Per-station plot ───────────────────────────────────────────────────────────
 def plot_station(
     site_no: str,
-    n_events: int,
+    n_events: dict[str, int],
     site_ts: pd.DataFrame,
     row: pd.Series,
 ) -> plt.Figure:
@@ -135,7 +139,8 @@ def plot_station(
 
     ax.set_title(
         f"Station {site_no}  |  source={row['source']}  |  "
-        f"{n_events} Q10 events (2002–2022)\n"
+        f"{n_events['Q10']} Q10 / {n_events['Q50']} Q50 / {n_events['Q100']} Q100 "
+        f"events (2002–2022)\n"
         f"Q10={row['Q10']:.0f}  Q50={row['Q50']:.0f}  "
         f"Q100={row['Q100']:.0f}  Median={median_q:.0f}  cfs"
     )
@@ -172,39 +177,48 @@ def main() -> None:
     ]
     print(f"  {len(sf):,} IV records across {sf['site_no'].nunique()} stations")
 
-    print("\nCounting Q10 events per station (no QC filter)...")
-    event_counts = count_q10_events(sf, flow_stats)
+    print("\nCounting Q10 / Q50 / Q100 events per station (no QC filter)...")
+    counts = {
+        rp: count_events(sf, flow_stats, rp) for rp in ("Q10", "Q50", "Q100")
+    }
 
-    # Build summary table
+    # Build summary table — ranked by Q10 events (descending)
     summary = (
-        event_counts
-        .rename("n_q10_events")
+        counts["Q10"].rename("n_q10_events")
         .reset_index()
         .merge(flow_stats, on="site_no", how="left")
     )
+    summary["n_q50_events"]  = summary["site_no"].map(counts["Q50"]).fillna(0).astype(int)
+    summary["n_q100_events"] = summary["site_no"].map(counts["Q100"]).fillna(0).astype(int)
     summary["median_cfs"] = summary["site_no"].map(
         sf[sf["value_cfs"] >= 0].groupby("site_no")["value_cfs"].median()
     )
     summary["q10_vs_median"] = (summary["Q10"] / summary["median_cfs"]).round(2)
+    summary = summary.sort_values("n_q10_events", ascending=False).reset_index(drop=True)
+
+    cols = ["site_no", "n_q10_events", "n_q50_events", "n_q100_events",
+            "source", "Q10", "Q50", "Q100", "median_cfs", "q10_vs_median"]
 
     print("\nTop 10 stations by Q10 events:")
-    print(
-        summary.head(10)[
-            ["site_no", "n_q10_events", "source", "Q10", "Q50", "Q100", "median_cfs", "q10_vs_median"]
-        ].to_string(index=False)
-    )
+    print(summary.head(10)[cols].to_string(index=False))
 
     print(f"\nSaving summary CSV...")
-    upload_csv(summary, "station_q10_event_ranking.csv")
+    upload_csv(summary[cols], "station_q10_event_ranking.csv")
 
     print(f"\nPlotting top {TOP_N} stations...")
     for rank, row_s in enumerate(summary.head(TOP_N).itertuples(), start=1):
-        site_no  = row_s.site_no
-        n_events = row_s.n_q10_events
-        fs_row   = flow_stats[flow_stats["site_no"] == site_no].iloc[0]
-        site_ts  = sf[sf["site_no"] == site_no].sort_values("datetime")
+        site_no   = row_s.site_no
+        n_events  = {
+            "Q10":  row_s.n_q10_events,
+            "Q50":  row_s.n_q50_events,
+            "Q100": row_s.n_q100_events,
+        }
+        fs_row    = flow_stats[flow_stats["site_no"] == site_no].iloc[0]
+        site_ts   = sf[sf["site_no"] == site_no].sort_values("datetime")
 
-        print(f"  [{rank}/{TOP_N}] {site_no}  ({n_events} events, source={fs_row['source']})")
+        print(f"  [{rank}/{TOP_N}] {site_no}  "
+              f"(Q10={n_events['Q10']} / Q50={n_events['Q50']} / Q100={n_events['Q100']} "
+              f"events, source={fs_row['source']})")
         fig = plot_station(site_no, n_events, site_ts, fs_row)
         upload_png(fig, f"rank{rank:02d}_{site_no}.png")
         plt.close(fig)
