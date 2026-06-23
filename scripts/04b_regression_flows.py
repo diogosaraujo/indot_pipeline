@@ -572,14 +572,26 @@ def main() -> None:
     flow_stats = _read_parquet_s3(bucket, f"{prefix}flow_stats/per_gauge_flow_stats.parquet")
     flow_stats["site_no"] = flow_stats["site_no"].astype(str)
 
-    # Stations not already covered by StreamStats
-    needs_lp3 = flow_stats[flow_stats["source"] != "gage_stats"]["site_no"].tolist()
-    log.info("Stations to evaluate: %d (gage_stats kept: %d)",
-             len(needs_lp3),
-             int((flow_stats["source"] == "gage_stats").sum()))
+    # Stations to (re)fit with LP3:
+    #   • every non-gage_stats station (as before), plus
+    #   • gage_stats stations with an incomplete Q set (Q10/Q25/Q50/Q100) —
+    #     these had gaps the old regression filled; refit entirely with LP3 so
+    #     a single, internally consistent method drives all return periods.
+    # gage_stats stations with a COMPLETE Q set are left untouched (authoritative).
+    core_q   = [c for c in Q_COLS.values() if c in flow_stats.columns]
+    is_gage  = flow_stats["source"] == "gage_stats"
+    has_gap  = flow_stats[core_q].isna().any(axis=1)
+
+    needs_lp3      = flow_stats[(~is_gage) | (is_gage & has_gap)]["site_no"].tolist()
+    gage_gap_sites = set(flow_stats[is_gage & has_gap]["site_no"])
+
+    n_gage_complete = int((is_gage & ~has_gap).sum())
+    log.info("Stations to evaluate: %d (incl. %d gage_stats with gaps to refit) "
+             "| complete gage_stats kept: %d",
+             len(needs_lp3), len(gage_gap_sites), n_gage_complete)
 
     if not needs_lp3:
-        log.info("All stations have gage_stats — nothing to do.")
+        log.info("All stations have a complete gage_stats Q set — nothing to do.")
         return
 
     # Load station coordinates (needed for regional skew lookup)
@@ -614,6 +626,17 @@ def main() -> None:
         log.info("[%d/%d] %s — %d water-years", i, n_total, site_no, n_years)
 
         if n_years < MIN_YEARS:
+            # A gage_stats-with-gaps station too short for LP3: keep its existing
+            # published StreamStats values rather than wiping good data.
+            if site_no in gage_gap_sites:
+                log.info("    gage_stats with gaps but < %d yr — keeping published values",
+                         MIN_YEARS)
+                summary_rows.append({
+                    "site_no": site_no, "n_years": n_years,
+                    "status": "gage_stats_gaps_kept",
+                })
+                continue
+
             flow_stats.at[site_no, "source"] = "insufficient_record"
             for col in Q_COLS.values():
                 if col in flow_stats.columns:
@@ -641,7 +664,8 @@ def main() -> None:
         summary_rows.append({
             "site_no":          site_no,
             "n_years":          n_years,
-            "status":           "lp3_fitted",
+            "status":           "lp3_refit_from_gage" if site_no in gage_gap_sites
+                                else "lp3_fitted",
             "fitting_method":   params.get("fitting_method", "MOM"),
             "n_censored":       params.get("n_censored", 0),
             "threshold_cfs":    (
@@ -678,9 +702,12 @@ def main() -> None:
                 f"{prefix}{S3_PLOTS_PREFIX}lp3_summary.csv")
 
     n_fitted       = int((summary_df["status"] == "lp3_fitted").sum())
+    n_refit_gage   = int((summary_df["status"] == "lp3_refit_from_gage").sum())
+    n_gage_kept    = int((summary_df["status"] == "gage_stats_gaps_kept").sum())
     n_insufficient = int((summary_df["status"] == "insufficient_record").sum())
-    log.info("LP3 fitted: %d  |  Insufficient record (< %d yr): %d  |  Total evaluated: %d",
-             n_fitted, MIN_YEARS, n_insufficient, n_total)
+    log.info("LP3 fitted: %d  |  LP3 refit from gage gaps: %d  |  "
+             "gage gaps kept (< %d yr): %d  |  Insufficient record: %d  |  Total: %d",
+             n_fitted, n_refit_gage, MIN_YEARS, n_gage_kept, n_insufficient, n_total)
     log.info("Source counts: %s",
              flow_stats["source"].value_counts(dropna=False).to_dict())
 

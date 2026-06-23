@@ -159,7 +159,7 @@ def main() -> None:
     print("Loading flow statistics...")
     flow_stats = read_s3(
         "flow_stats/per_gauge_flow_stats.parquet",
-        columns=["site_no", "source", "Q10", "Q50", "Q100"],
+        columns=["site_no", "source", "Q10", "Q25", "Q50", "Q100"],
     )
     flow_stats["site_no"] = flow_stats["site_no"].astype(str)
 
@@ -222,6 +222,51 @@ def main() -> None:
         fig = plot_station(site_no, n_events, site_ts, fs_row)
         upload_png(fig, f"rank{rank:02d}_{site_no}.png")
         plt.close(fig)
+
+    # ── Diagnostic 1: non-monotonic frequency curves ──────────────────────────
+    # A valid LP3/flood-frequency curve must satisfy Q10 ≤ Q25 ≤ Q50 ≤ Q100.
+    # Any violation means the quantiles are physically impossible.
+    fs = flow_stats
+    mono_cols = ["Q10", "Q25", "Q50", "Q100"]
+    have_all  = fs[mono_cols].notna().all(axis=1)
+    violation = (
+        (fs["Q50"]  < fs["Q10"])
+        | (fs["Q100"] < fs["Q50"])
+        | (fs["Q100"] < fs["Q10"])
+        | (fs["Q25"]  < fs["Q10"])
+        | (fs["Q50"]  < fs["Q25"])
+        | (fs["Q100"] < fs["Q25"])
+    )
+    non_mono = fs[have_all & violation].copy()
+
+    print(f"\n{'='*70}")
+    print(f"Non-monotonic frequency curves (Q10≤Q25≤Q50≤Q100 violated): "
+          f"{len(non_mono)} stations")
+    print(f"{'='*70}")
+    if len(non_mono):
+        print(non_mono[["site_no", "source"] + mono_cols].to_string(index=False))
+        upload_csv(non_mono[["site_no", "source"] + mono_cols],
+                   "non_monotonic_frequency_curves.csv")
+    else:
+        print("  None — all stations with a full Q set are monotonic.")
+
+    # ── Diagnostic 2: gage_stats stations with gaps (possible stale fills) ─────
+    # The new 04b skips every source=='gage_stats' station, so any gap that was
+    # filled by the OLD regression was NOT overwritten with LP3.  Flag them.
+    gage = fs[fs["source"] == "gage_stats"].copy()
+    gage_gaps = gage[gage[mono_cols].isna().any(axis=1)]
+
+    print(f"\n{'='*70}")
+    print(f"gage_stats stations missing one or more of {mono_cols}: "
+          f"{len(gage_gaps)} stations")
+    print(f"(these were NOT reprocessed by 04b — gaps retain old values or null)")
+    print(f"{'='*70}")
+    if len(gage_gaps):
+        print(gage_gaps[["site_no", "source"] + mono_cols].to_string(index=False))
+        upload_csv(gage_gaps[["site_no", "source"] + mono_cols],
+                   "gage_stats_with_gaps.csv")
+    else:
+        print("  None — all gage_stats stations have a complete Q set.")
 
     print("\nDone.")
 
