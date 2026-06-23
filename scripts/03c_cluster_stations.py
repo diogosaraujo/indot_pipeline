@@ -51,14 +51,17 @@ PREFIX     = "v1/"
 OUT_DIR    = "results"
 S3_OUT_PRE = "v1/clusters/"
 
-FEATURES     = ["drain_area_mi2", "slope_ft_mi", "tc_hr", "pct_u"]
-FEAT_LABELS  = ["Area (mi²)", "Slope (ft/mi)", "Tc (hr)", "Impervious (%)"]
+# Three weakly-correlated basin axes: size, steepness, imperviousness.
+# tc_hr is intentionally excluded — Kirpich derives it from slope and channel
+# length (which tracks area), so it double-counts the size/slope signal.
+FEATURES     = ["drain_area_mi2", "slope_ft_mi", "pct_u"]
+FEAT_LABELS  = ["Area (mi²)", "Slope (ft/mi)", "Impervious (%)"]
 RETURN_PERIODS       = [10, 50, 100]
 START_DATE           = "2002-01-01"
 END_DATE             = "2022-12-31"
-MIN_SILHOUETTE       = 0.40
-MIN_CLUSTER_EVENTS   = 30
-K_RANGE              = range(3, 11)
+MIN_SILHOUETTE       = 0.50   # below this (for every k) → treat as one big group
+MIN_CLUSTER_EVENTS   = 30     # each cluster needs ≥ this many events; total needs ≥ 2×
+K_RANGE              = range(2, 11)
 KMEANS_SEED          = 42
 KMEANS_NINIT         = 20
 
@@ -337,7 +340,7 @@ def run_kmeans(
     exceedances: dict[int, pd.Series],
 ) -> list[dict]:
     """Run k-means for each k; return list of result dicts (one per k)."""
-    print("\n── Step 3: K-means evaluation (k = 3 .. 10) ─────────────────────────")
+    print("\n── Step 3: K-means evaluation (k = 2 .. 10) ─────────────────────────")
     print(
         f"  {'k':>3}  {'Silhouette':>10}  "
         + "  ".join(f"{'Q'+str(rp)+' [min-max]':>14}" for rp in RETURN_PERIODS)
@@ -379,67 +382,104 @@ def run_kmeans(
     return results
 
 
-# ── Step 4: Viable k ───────────────────────────────────────────────────────────
+# ── Step 4: Recommend k per return period (hybrid rule) ───────────────────────
 
-def find_viable(results: list[dict]) -> dict[int, list[dict]]:
-    """Return {rp: [rows sorted by silhouette desc]} where k passes both filters."""
-    viable: dict[int, list[dict]] = {}
+def recommend_k(results: list[dict], counts: dict[int, pd.Series]) -> dict[int, dict]:
+    """Choose the number of clusters per return period.
+
+    Rule (per RP):
+      total = Σ exceedance events.
+      • total < 2×MIN_CLUSTER_EVENTS (60)  → 1 group (too few events to split).
+      • otherwise choose the k with the HIGHEST silhouette among all k that satisfy:
+            k ≤ total // MIN_CLUSTER_EVENTS         (event budget)
+            silhouette ≥ MIN_SILHOUETTE (0.50)      (real cluster structure)
+            min cluster events ≥ MIN_CLUSTER_EVENTS (every group is usable)
+        If none qualify → 1 group.
+
+    Returns {rp: {"k", "silhouette", "min_events", "reason"}}.
+    """
+    rec: dict[int, dict] = {}
     for rp in RETURN_PERIODS:
-        candidates = [
+        total    = int(counts[rp].sum())
+        k_budget = total // MIN_CLUSTER_EVENTS
+        if k_budget < 2:
+            rec[rp] = {"k": 1, "silhouette": None, "min_events": total,
+                       "reason": f"only {total} events (< {2*MIN_CLUSTER_EVENTS})"}
+            continue
+
+        cands = [
             r for r in results
-            if r["silhouette"] > MIN_SILHOUETTE
+            if r["k"] <= k_budget
+            and r["silhouette"] >= MIN_SILHOUETTE
             and r[f"min_events_Q{rp}"] >= MIN_CLUSTER_EVENTS
         ]
-        viable[rp] = sorted(candidates, key=lambda x: x["silhouette"], reverse=True)
-    return viable
+        if cands:
+            best = max(cands, key=lambda r: r["silhouette"])
+            rec[rp] = {"k": best["k"], "silhouette": best["silhouette"],
+                       "min_events": best[f"min_events_Q{rp}"], "reason": "ok"}
+        else:
+            rec[rp] = {"k": 1, "silhouette": None, "min_events": total,
+                       "reason": f"no k≤{k_budget} with sil≥{MIN_SILHOUETTE} "
+                                 f"and min events≥{MIN_CLUSTER_EVENTS}"}
+    return rec
 
 
-def print_viable_table(results: list[dict], viable: dict[int, list[dict]]) -> None:
-    print("\n── Step 4: Viable k table (silhouette > 0.40 AND min events ≥ 30) ────")
+def print_recommendation_table(
+    results: list[dict],
+    rec: dict[int, dict],
+    counts: dict[int, pd.Series],
+) -> None:
+    print(f"\n── Step 4: k evaluation (sil ≥ {MIN_SILHOUETTE}, every cluster ≥ "
+          f"{MIN_CLUSTER_EVENTS} events, total ≥ {2*MIN_CLUSTER_EVENTS}) ──")
     header = f"  {'k':>3}  {'Silhouette':>10}  " + "  ".join(
         f"{'minEv_Q'+str(rp):>11}" for rp in RETURN_PERIODS
-    ) + "  viable_for"
+    )
     print(header)
     print("  " + "-" * (len(header) - 2))
-
     for r in sorted(results, key=lambda x: x["k"]):
-        flags = "/".join(
-            f"Q{rp}" for rp in RETURN_PERIODS
-            if any(v["k"] == r["k"] for v in viable[rp])
-        )
-        recommended = any(
-            viable[rp] and viable[rp][0]["k"] == r["k"]
-            for rp in RETURN_PERIODS
-        )
-        tag = " ← RECOMMENDED" if recommended else ""
         print(
             f"  {r['k']:>3}  {r['silhouette']:>10.4f}  "
             + "  ".join(f"{r[f'min_events_Q{rp}']:>11}" for rp in RETURN_PERIODS)
-            + f"  {flags or '—'}{tag}"
         )
+
+    print("\n  Recommended k per return period:")
+    for rp in RETURN_PERIODS:
+        d = rec[rp]
+        total = int(counts[rp].sum())
+        if d["k"] == 1:
+            print(f"    Q{rp:3d} ({total:5d} events): 1 group  — {d['reason']}")
+        else:
+            print(f"    Q{rp:3d} ({total:5d} events): k={d['k']}  "
+                  f"(silhouette={d['silhouette']:.4f}, min cluster events={d['min_events']})")
 
 
 # ── Step 5: Write cluster CSVs + stats ────────────────────────────────────────
 
+def _labels_for_k(k: int, results: list[dict], n: int) -> np.ndarray:
+    """Return cluster labels for a given k (k=1 → all stations in group 0)."""
+    if k == 1:
+        return np.zeros(n, dtype=int)
+    for r in results:
+        if r["k"] == k:
+            return r["labels"]
+    return np.zeros(n, dtype=int)
+
+
 def write_cluster_outputs(
     stations: pd.DataFrame,
     results: list[dict],
-    viable: dict[int, list[dict]],
+    rec: dict[int, dict],
 ) -> None:
-    """Write clusters_k{k}.csv and clusters_k{k}_stats.csv for each viable k."""
-    viable_ks = {r["k"] for rp_list in viable.values() for r in rp_list}
-    if not viable_ks:
-        print("\n  No viable k values — skipping CSV outputs.")
-        return
+    """Write clusters_k{k}.csv and clusters_k{k}_stats.csv for each recommended k."""
+    rec_ks = sorted({d["k"] for d in rec.values()})
 
     print("\n── Step 5: Cluster CSV outputs ────────────────────────────────────────")
-    for r in sorted(results, key=lambda x: x["k"]):
-        k = r["k"]
-        if k not in viable_ks:
-            continue
+    n = len(stations)
+    for k in rec_ks:
+        labels = _labels_for_k(k, results, n)
 
         df = stations[["site_no"] + FEATURES].copy()
-        df["cluster"] = r["labels"]
+        df["cluster"] = labels
 
         # Assignment CSV
         assign_path = os.path.join(OUT_DIR, f"clusters_k{k}.csv")
@@ -464,95 +504,73 @@ def write_cluster_outputs(
 
 # ── Step 6: Scatter plots ──────────────────────────────────────────────────────
 
+# Pairwise feature combinations to plot (all three pairs of the 3 features).
+_PAIRS = [
+    ("drain_area_mi2", "slope_ft_mi"),
+    ("drain_area_mi2", "pct_u"),
+    ("slope_ft_mi",    "pct_u"),
+]
+_LOG_FEATURES = {"drain_area_mi2", "slope_ft_mi"}   # span orders of magnitude → log
+_AXIS_LABEL   = dict(zip(FEATURES, FEAT_LABELS))
+_TAG          = {"drain_area_mi2": "area", "slope_ft_mi": "slope", "pct_u": "imperv"}
+
+
 def plot_scatter(
     stations: pd.DataFrame,
-    viable: dict[int, list[dict]],
+    results: list[dict],
+    rec: dict[int, dict],
 ) -> None:
-    """Area vs Slope scatter coloured by cluster for each recommended (best) k."""
+    """Three pairwise cluster scatters per RP whose recommended k > 1.
+
+    Single-group (k=1) recommendations are skipped — there is no clustering to
+    show.  '%' imperviousness includes zeros, so that axis is linear; area and
+    slope use log scales.
+    """
     print("\n── Step 6: Scatter plots ──────────────────────────────────────────────")
+    n = len(stations)
+    cmap = plt.get_cmap("tab10")
     for rp in RETURN_PERIODS:
-        if not viable[rp]:
-            print(f"  Q{rp}: no viable k — skipping")
+        d = rec[rp]
+        k = d["k"]
+        if k == 1:
+            print(f"  Q{rp}: single group — no scatter ({d['reason']})")
             continue
+        labels = _labels_for_k(k, results, n)
 
-        best   = viable[rp][0]
-        k      = best["k"]
-        labels = best["labels"]
-
-        fig, ax = plt.subplots(figsize=(8, 6))
-        cmap = plt.get_cmap("tab10")
-        for c in range(k):
-            mask = labels == c
-            ax.scatter(
-                stations.loc[mask, "drain_area_mi2"],
-                stations.loc[mask, "slope_ft_mi"],
-                color=cmap(c),
-                label=f"Cluster {c}  (n={mask.sum()})",
-                alpha=0.75,
-                s=55,
-                edgecolors="white",
-                linewidths=0.4,
-            )
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("Drainage Area (mi²)")
-        ax.set_ylabel("Channel Slope (ft/mi)")
-        ax.set_title(
-            f"Q{rp} — k={k} clusters\n"
-            f"Silhouette = {best['silhouette']:.3f}  |  "
-            f"min cluster events = {best[f'min_events_Q{rp}']}"
-        )
-        ax.legend(loc="best", fontsize=9)
-        fig.tight_layout()
-        path = os.path.join(OUT_DIR, f"clusters_Q{rp}_k{k}.png")
-        fig.savefig(path, dpi=150)
-        plt.close(fig)
-        print(f"  Saved {path}")
-        _upload(path, f"clusters_Q{rp}_k{k}.png", "image/png")
-
-
-# ── Recommendation summary ─────────────────────────────────────────────────────
-
-def print_recommendation_summary(
-    counts: dict[int, pd.Series],
-    viable: dict[int, list[dict]],
-) -> None:
-    print("\n── Recommendation summary ─────────────────────────────────────────────")
-    print("Recommended k values:")
-    for rp in RETURN_PERIODS:
-        total = int(counts[rp].sum())
-        if viable[rp]:
-            best = viable[rp][0]
-            line = f"  Q{rp:3d} ({total:6d} events): k={best['k']} (Silhouette={best['silhouette']:.4f})"
-            if len(viable[rp]) > 1:
-                top3 = ", ".join(
-                    f"k={v['k']} (sil={v['silhouette']:.4f}, minEv={v[f'min_events_Q{rp}']})"
-                    for v in viable[rp][:3]
+        for xcol, ycol in _PAIRS:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            for c in range(k):
+                mask = labels == c
+                ax.scatter(
+                    stations.loc[mask, xcol],
+                    stations.loc[mask, ycol],
+                    color=cmap(c),
+                    label=f"Cluster {c}  (n={mask.sum()})",
+                    alpha=0.75, s=55, edgecolors="white", linewidths=0.4,
                 )
-                line += f"\n    Top 3 candidates: {top3}"
-        else:
-            # No viable k — report best available for guidance
-            best_avail = sorted(results_global, key=lambda x: x["silhouette"], reverse=True)[:3]
-            candidates = ", ".join(
-                f"k={r['k']} (sil={r['silhouette']:.4f}, minEv={r[f'min_events_Q{rp}']})"
-                for r in best_avail
+            if xcol in _LOG_FEATURES:
+                ax.set_xscale("log")
+            if ycol in _LOG_FEATURES:
+                ax.set_yscale("log")
+            ax.set_xlabel(_AXIS_LABEL[xcol])
+            ax.set_ylabel(_AXIS_LABEL[ycol])
+            ax.set_title(
+                f"Q{rp} — k={k} clusters  "
+                f"(silhouette={d['silhouette']:.3f}, min cluster events={d['min_events']})"
             )
-            line = (
-                f"  Q{rp:3d} ({total:6d} events): no viable k "
-                f"(criteria: sil>{MIN_SILHOUETTE}, minEv≥{MIN_CLUSTER_EVENTS})\n"
-                f"    Best available: {candidates}"
-            )
-        print(line)
+            ax.legend(loc="best", fontsize=9)
+            fig.tight_layout()
+            fname = f"clusters_Q{rp}_k{k}_{_TAG[xcol]}_vs_{_TAG[ycol]}.png"
+            path  = os.path.join(OUT_DIR, fname)
+            fig.savefig(path, dpi=150)
+            plt.close(fig)
+            print(f"  Saved {path}")
+            _upload(path, fname, "image/png")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-results_global: list[dict] = []  # used by recommendation summary
-
-
 def main() -> None:
-    global results_global
-
     # Load data
     print("Loading basin characteristics...")
     basin = read_s3("watersheds/basin_characteristics.parquet")
@@ -600,20 +618,16 @@ def main() -> None:
 
     # Step 3
     results = run_kmeans(X_scaled, stations["site_no"], counts)
-    results_global = results
 
     # Step 4
-    viable = find_viable(results)
-    print_viable_table(results, viable)
+    rec = recommend_k(results, counts)
+    print_recommendation_table(results, rec, counts)
 
     # Step 5
-    write_cluster_outputs(stations, results, viable)
+    write_cluster_outputs(stations, results, rec)
 
     # Step 6
-    plot_scatter(stations, viable)
-
-    # Summary
-    print_recommendation_summary(counts, viable)
+    plot_scatter(stations, results, rec)
 
 
 if __name__ == "__main__":
