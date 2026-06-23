@@ -111,9 +111,10 @@ def count_exceedances(
     gap between them is ≤24 h; a gap >24 h starts a new event.  This is
     determined directly from IV timestamps — no daily resampling.
 
-    Applies the same QC as script 08: stations where Q10 < median observed flow
-    are excluded from all return periods.  These have regression-derived
-    thresholds so low they are exceeded nearly every year.
+    QC safety net: stations where Q10 < median observed flow (physically
+    impossible for a real 10-yr flood) or with negative readings are excluded.
+    With the LP3 peak-series thresholds this should catch ~nothing, but it
+    guards against pathological fits.
     """
     print("\nLoading streamflow time series (may take a minute)...")
     sf = read_s3(
@@ -133,7 +134,7 @@ def count_exceedances(
     # QC: exclude stations where Q10 < median observed flow (same filter as script 08).
     # Flood-frequency Q10 is an annual-maximum return period — it should greatly
     # exceed the typical daily flow.  When Q10 < median the threshold is
-    # unrealistically low (regression underestimate) and produces near-annual events.
+    # unrealistically low and would produce near-annual events.
     pos_medians = (
         sf[sf["value_cfs"] >= 0]
         .groupby("site_no")["value_cfs"]
@@ -196,33 +197,16 @@ def print_exceedance_summary(
     excluded: set[str],
 ) -> None:
     print("\n── Step 1: Exceedance counts (2002–2022) ─────────────────────────────")
+    print("  (thresholds: LP3 peak-series Q values, source=lp3_peak_series)")
     if excluded:
-        src_col = flow_stats.set_index("site_no").get("source", pd.Series(dtype=str))
-        n_excl_gage = int((flow_stats[flow_stats["site_no"].isin(excluded)]["source"] == "gage_stats").sum()) if "source" in flow_stats.columns else 0
-        n_excl_regr = int((flow_stats[flow_stats["site_no"].isin(excluded)]["source"] == "regression").sum()) if "source" in flow_stats.columns else 0
-        print(
-            f"  (QC removed {len(excluded)} stations: "
-            f"gage_stats={n_excl_gage}, regression={n_excl_regr})"
-        )
+        print(f"  QC removed {len(excluded)} stations (Q10 < median or negative readings)")
     for rp in RETURN_PERIODS:
-        col   = f"Q{rp}"
         total = int(counts[rp].sum())
         n_sta = counts[rp].shape[0]
         max_k = total // MIN_CLUSTER_EVENTS
-
-        src_str = ""
-        if "source" in flow_stats.columns and col in flow_stats.columns:
-            fs_kept = flow_stats[~flow_stats["site_no"].isin(excluded)]
-            src_map   = fs_kept[fs_kept[col].notna()].set_index("site_no")["source"]
-            ev_df     = counts[rp].rename("n_events").reset_index()
-            ev_df["source"] = ev_df["site_no"].map(src_map)
-            n_ev_gage = int(ev_df.loc[ev_df["source"] == "gage_stats", "n_events"].sum())
-            n_ev_regr = int(ev_df.loc[ev_df["source"] == "regression", "n_events"].sum())
-            src_str   = f"  [gage_stats: {n_ev_gage} ev, regression: {n_ev_regr} ev]"
-
         print(
             f"  Q{rp:3d}: {total:5d} events  "
-            f"({n_sta} stations with ≥1 event){src_str}  →  max_k = {max_k}"
+            f"({n_sta} stations with ≥1 event)  →  max_k = {max_k}"
         )
 
 
@@ -578,12 +562,22 @@ def main() -> None:
     flow_stats = read_s3("flow_stats/per_gauge_flow_stats.parquet")
     flow_stats["site_no"] = flow_stats["site_no"].astype(str)
 
+    # Cluster ONLY stations with a valid peak-series LP3 fit.  Regulated and
+    # insufficient-record stations (source != 'lp3_peak_series', null Q) are
+    # excluded entirely — their flood frequency is undefined, so they should
+    # neither shape the clusters nor inherit a regional Q from one.
+    fitted_sites = set(flow_stats.loc[flow_stats["source"] == "lp3_peak_series", "site_no"])
+    print(f"LP3-fitted stations (source=lp3_peak_series): {len(fitted_sites)}")
+
     # Drop stations missing any feature (can't cluster without complete inputs)
-    stations = basin.dropna(subset=FEATURES).reset_index(drop=True)
-    n_dropped = len(basin) - len(stations)
+    stations = (
+        basin[basin["site_no"].isin(fitted_sites)]
+        .dropna(subset=FEATURES)
+        .reset_index(drop=True)
+    )
     print(
-        f"Stations with complete basin characteristics: "
-        f"{len(stations)} / {len(basin)}  ({n_dropped} dropped)"
+        f"Clusterable stations (fitted AND complete basin characteristics): "
+        f"{len(stations)} of {len(fitted_sites)} fitted"
     )
 
     X_orig   = stations[FEATURES].values.astype(float)
