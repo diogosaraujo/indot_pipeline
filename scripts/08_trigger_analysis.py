@@ -241,42 +241,113 @@ def count_dry_periods(
     return tn
 
 
+def merge_spans(
+    spans: list[tuple[pd.Timestamp, pd.Timestamp]]
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Union of (start, end) intervals, merging any that touch or overlap."""
+    if not spans:
+        return []
+    spans = sorted(spans)
+    out = [list(spans[0])]
+    for s, e in spans[1:]:
+        if s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(s, e) for s, e in out]
+
+
+def build_episodes(
+    precip_events: list[tuple[pd.Timestamp, pd.Timestamp]],
+    flow_events: list[tuple[pd.Timestamp, pd.Timestamp]],
+) -> list[dict]:
+    """Merge overlapping precip & flow events into classified episodes.
+
+    A precip event [ps,pe] and a flow event [qs,qe] are LINKED when they overlap
+    with precipitation allowed to lead the flood by up to LEAD_HOURS:
+
+        ps <= qe   AND   pe + LEAD_HOURS >= qs
+
+    The two boundary cases that still link (→ one TP):
+      • last P exactly LEAD_HOURS before first Q   (pe + lead == qs)
+      • first P exactly at last Q                  (ps == qe)
+
+    Linked events are unioned into episodes (a shared precip can pull several
+    floods into one episode).  Each episode spans first-wet → last-wet and is:
+        TP  contains ≥1 precip AND ≥1 flow event
+        FN  contains only flow events (flood with no qualifying precip)
+        FP  contains only precip events (rain with no following flood)
+    """
+    lead = pd.Timedelta(hours=LEAD_HOURS)
+    nP, nF = len(precip_events), len(flow_events)
+    parent = list(range(nP + nF))           # 0..nP-1 precip, nP..nP+nF-1 flow
+
+    def find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i, (ps, pe) in enumerate(precip_events):
+        for j, (qs, qe) in enumerate(flow_events):
+            if ps <= qe and pe + lead >= qs:
+                union(i, nP + j)
+
+    comp: dict[int, dict] = {}
+
+    def add(root: int, kind: str, s: pd.Timestamp, e: pd.Timestamp) -> None:
+        c = comp.get(root)
+        if c is None:
+            comp[root] = {"P": 0, "F": 0, "start": s, "end": e}
+            c = comp[root]
+        c[kind] += 1
+        c["start"] = min(c["start"], s)
+        c["end"]   = max(c["end"], e)
+
+    for i, (ps, pe) in enumerate(precip_events):
+        add(find(i), "P", ps, pe)
+    for j, (qs, qe) in enumerate(flow_events):
+        add(find(nP + j), "F", qs, qe)
+
+    episodes = []
+    for c in comp.values():
+        if c["P"] and c["F"]:
+            # TP spans first-wet → last-wet (precip→flood already merged)
+            klass, start, end = "TP", c["start"], c["end"]
+        elif c["F"]:
+            # FN owns the 24h look-back window (where qualifying precip was absent):
+            # from 24h before the first Q>threshold to the last Q>threshold.
+            klass, start, end = "FN", c["start"] - lead, c["end"]
+        else:
+            # FP owns the 24h look-forward window (where no flood followed):
+            # from the first P>threshold to 24h after the last P>threshold.
+            klass, start, end = "FP", c["start"], c["end"] + lead
+        episodes.append({"start": start, "end": end, "klass": klass,
+                         "n_precip": c["P"], "n_flow": c["F"]})
+    episodes.sort(key=lambda d: d["start"])
+    return episodes
+
+
 def classify_overlap(
-    precip_wet: pd.Series,
-    flow_wet: pd.Series,
     precip_events: list[tuple[pd.Timestamp, pd.Timestamp]],
     flow_events: list[tuple[pd.Timestamp, pd.Timestamp]],
     grid_start: pd.Timestamp,
     grid_end: pd.Timestamp,
 ) -> tuple[int, int, int, int]:
-    """Return (tp, fp, fn, tn) for one combination.
-
-    A precip event leads a flood by ≤ LEAD_HOURS (or is simultaneous):
-      TP/FN  per flood event — does any precip event overlap [flood_start−lead,
-             flood_end]?
-      FP     per precip event — is there NO flood event in [precip_start,
-             precip_end+lead]?
-      TN     every dry stretch (leading, interior, trailing) between combined
-             (precip|flow) wet events — see count_dry_periods.
-    """
-    lead = pd.Timedelta(hours=LEAD_HOURS)
-
-    tp = fn = 0
-    for qs, qe in flow_events:
-        lo = qs - lead
-        if any(ps <= qe and pe >= lo for ps, pe in precip_events):
-            tp += 1
-        else:
-            fn += 1
-
-    fp = 0
-    for ps, pe in precip_events:
-        hi = pe + lead
-        if not any(qs <= hi and qe >= ps for qs, qe in flow_events):
-            fp += 1
-
-    combined = group_wet_events(precip_wet | flow_wet)
-    tn = count_dry_periods(combined, grid_start, grid_end)
+    """(tp, fp, fn, tn): episodes classified, TN = edge-inclusive dry gaps."""
+    eps = build_episodes(precip_events, flow_events)
+    tp = sum(e["klass"] == "TP" for e in eps)
+    fn = sum(e["klass"] == "FN" for e in eps)
+    fp = sum(e["klass"] == "FP" for e in eps)
+    spans = merge_spans([(e["start"], e["end"]) for e in eps])
+    tn = count_dry_periods(spans, grid_start, grid_end)
     return tp, fp, fn, tn
 
 
@@ -331,9 +402,9 @@ def analyse_station(
             precip_wet = (rolling >= precip_thr).fillna(False)
             precip_events = group_wet_events(precip_wet)
 
-            for flow_rp, flow_wet in flow_wet_by_rp.items():
+            for flow_rp in flow_wet_by_rp:
                 tp, fp, fn, tn = classify_overlap(
-                    precip_wet, flow_wet, precip_events, flow_events_by_rp[flow_rp],
+                    precip_events, flow_events_by_rp[flow_rp],
                     common_start, common_end,
                 )
                 records.append({
@@ -435,11 +506,7 @@ def plot_station_diagnostic(
     precip_events = group_wet_events(precip_wet)
     flow_events   = group_wet_events(flow_wet)
 
-    lead = pd.Timedelta(hours=LEAD_HOURS)
-    flow_cls = [(qs, qe, "TP" if any(ps <= qe and pe >= qs - lead for ps, pe in precip_events)
-                 else "FN") for qs, qe in flow_events]
-    precip_cls = [(ps, pe, "matched" if any(qs <= pe + lead and qe >= ps for qs, qe in flow_events)
-                   else "FP") for ps, pe in precip_events]
+    eps = build_episodes(precip_events, flow_events)
 
     # Auto-zoom to the calendar year with the most flood-wet hours (legibility)
     if start is None:
@@ -474,23 +541,20 @@ def plot_station_diagnostic(
     ax2.invert_yaxis()
     ax2.tick_params(axis="y", labelcolor="teal")
 
-    # Classification shading
+    # Classification shading — one span per merged episode
     span_colors = {"TP": "green", "FN": "red", "FP": "orange"}
-    for qs, qe, c in flow_cls:
-        ax1.axvspan(qs, qe, color=span_colors[c], alpha=0.30, zorder=1)
-    for ps, pe, c in precip_cls:
-        if c == "FP":
-            ax1.axvspan(ps, pe, color=span_colors["FP"], alpha=0.20, zorder=1)
+    for e in eps:
+        ax1.axvspan(e["start"], e["end"], color=span_colors[e["klass"]], alpha=0.28, zorder=1)
 
-    tp = sum(c == "TP" for *_, c in flow_cls)
-    fn = sum(c == "FN" for *_, c in flow_cls)
-    fp = sum(c == "FP" for *_, c in precip_cls)
-    tn = count_dry_periods(group_wet_events(precip_wet | flow_wet), cs, ce)
+    tp = sum(e["klass"] == "TP" for e in eps)
+    fn = sum(e["klass"] == "FN" for e in eps)
+    fp = sum(e["klass"] == "FP" for e in eps)
+    tn = count_dry_periods(merge_spans([(e["start"], e["end"]) for e in eps]), cs, ce)
 
     legend = [
         Patch(facecolor="green",  alpha=.45, label="TP — flood with precip ≤24h prior"),
-        Patch(facecolor="red",    alpha=.45, label="FN — flood, no precip"),
-        Patch(facecolor="orange", alpha=.45, label="FP — precip, no flood ≤24h after"),
+        Patch(facecolor="red",    alpha=.45, label="FN — flood, no precip (+24h look-back)"),
+        Patch(facecolor="orange", alpha=.45, label="FP — precip, no flood (+24h look-ahead)"),
     ]
     h1, _ = ax1.get_legend_handles_labels()
     ax1.legend(handles=h1 + legend, loc="upper left", fontsize=8, framealpha=0.9)
@@ -521,14 +585,16 @@ def plot_station_diagnostic(
     def _epoch(idx) -> "np.ndarray":
         return (pd.DatetimeIndex(idx).view("int64") // 10**9).astype("float64")
 
-    def _events_to_arrays(evs):
+    def _ev_epoch(evs):
         if not evs:
-            return np.array([]), np.array([]), np.array([], dtype=object)
-        return (_epoch([e[0] for e in evs]), _epoch([e[1] for e in evs]),
-                np.array([e[2] for e in evs], dtype=object))
+            return np.array([]), np.array([])
+        return _epoch([e[0] for e in evs]), _epoch([e[1] for e in evs])
 
-    f_s, f_e, f_c = _events_to_arrays(flow_cls)
-    p_s, p_e, p_c = _events_to_arrays(precip_cls)
+    ep_s = _epoch([e["start"] for e in eps]) if eps else np.array([])
+    ep_e = _epoch([e["end"]   for e in eps]) if eps else np.array([])
+    ep_c = np.array([e["klass"] for e in eps], dtype=object) if eps else np.array([], dtype=object)
+    pf_s, pf_e = _ev_epoch(precip_events)
+    qf_s, qf_e = _ev_epoch(flow_events)
     mat = {
         "site_no": site_no, "source": source,
         "duration_hr": duration_hr, "precip_rp": precip_rp, "flow_rp": flow_rp,
@@ -537,11 +603,13 @@ def plot_station_diagnostic(
         "precip_accum_in":    accum.to_numpy(dtype="float64"),
         "q_threshold_cfs":    q_thr,
         "p_threshold_in":     precip_thr,
-        "flow_event_start_s": f_s, "flow_event_end_s": f_e, "flow_event_class": f_c,
-        "precip_event_start_s": p_s, "precip_event_end_s": p_e, "precip_event_class": p_c,
+        "episode_start_s": ep_s, "episode_end_s": ep_e, "episode_class": ep_c,
+        "precip_event_start_s": pf_s, "precip_event_end_s": pf_e,
+        "flow_event_start_s":   qf_s, "flow_event_end_s":   qf_e,
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-        "readme": ("time_unix_s is UTC seconds. In MATLAB:  "
-                   "t = datetime(time_unix_s,'ConvertFrom','posixtime','TimeZone','UTC');"),
+        "readme": ("time_unix_s is UTC seconds. In MATLAB: "
+                   "t = datetime(time_unix_s,'ConvertFrom','posixtime','TimeZone','UTC'). "
+                   "episode_class is TP/FN/FP; shade each [episode_start_s, episode_end_s]."),
     }
     mbuf = io.BytesIO()
     savemat(mbuf, mat)
