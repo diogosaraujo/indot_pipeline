@@ -502,15 +502,54 @@ def plot_station_diagnostic(
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
     fig.tight_layout()
 
-    fname = f"{site_no}_{source}_d{duration_hr}_P{precip_rp}_Q{flow_rp}.png"
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=140)
-    buf.seek(0)
-    s3_client().put_object(Bucket=bucket,
-                           Key=f"{prefix}analysis/event_diagnostics/{fname}",
-                           Body=buf, ContentType="image/png")
+    base = f"{site_no}_{source}_d{duration_hr}_P{precip_rp}_Q{flow_rp}"
+    out_prefix = f"{prefix}analysis/event_diagnostics/"
+
+    # PNG (raster) + SVG (vector, infinite zoom in any viewer)
+    for ext, ctype in (("png", "image/png"), ("svg", "image/svg+xml")):
+        buf = io.BytesIO()
+        fig.savefig(buf, format=ext, dpi=140)
+        buf.seek(0)
+        s3_client().put_object(Bucket=bucket, Key=f"{out_prefix}{base}.{ext}",
+                               Body=buf, ContentType=ctype)
     plt.close(fig)
-    log.info("Diagnostic → s3://%s/%sanalysis/event_diagnostics/%s", bucket, prefix, fname)
+
+    # MATLAB data export (.mat): rebuild / zoom natively in MATLAB
+    import numpy as np
+    from scipy.io import savemat
+
+    def _epoch(idx) -> "np.ndarray":
+        return (pd.DatetimeIndex(idx).view("int64") // 10**9).astype("float64")
+
+    def _events_to_arrays(evs):
+        if not evs:
+            return np.array([]), np.array([]), np.array([], dtype=object)
+        return (_epoch([e[0] for e in evs]), _epoch([e[1] for e in evs]),
+                np.array([e[2] for e in evs], dtype=object))
+
+    f_s, f_e, f_c = _events_to_arrays(flow_cls)
+    p_s, p_e, p_c = _events_to_arrays(precip_cls)
+    mat = {
+        "site_no": site_no, "source": source,
+        "duration_hr": duration_hr, "precip_rp": precip_rp, "flow_rp": flow_rp,
+        "time_unix_s":        _epoch(grid),
+        "streamflow_cfs":     flow.to_numpy(dtype="float64"),
+        "precip_accum_in":    accum.to_numpy(dtype="float64"),
+        "q_threshold_cfs":    q_thr,
+        "p_threshold_in":     precip_thr,
+        "flow_event_start_s": f_s, "flow_event_end_s": f_e, "flow_event_class": f_c,
+        "precip_event_start_s": p_s, "precip_event_end_s": p_e, "precip_event_class": p_c,
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "readme": ("time_unix_s is UTC seconds. In MATLAB:  "
+                   "t = datetime(time_unix_s,'ConvertFrom','posixtime','TimeZone','UTC');"),
+    }
+    mbuf = io.BytesIO()
+    savemat(mbuf, mat)
+    mbuf.seek(0)
+    s3_client().put_object(Bucket=bucket, Key=f"{out_prefix}{base}.mat",
+                           Body=mbuf, ContentType="application/octet-stream")
+
+    log.info("Diagnostic → s3://%s/%s{%s.png,.svg,.mat}", bucket, out_prefix, base)
 
 
 # ---------- Main ----------
