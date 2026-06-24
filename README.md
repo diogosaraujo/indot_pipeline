@@ -239,7 +239,20 @@ bash setup_ec2.sh
 `setup_ec2.sh` installs conda/mamba but does not modify your shell's startup file. After it finishes, run the following commands to activate the environment:
 
 ```bash
-ca
+# Make conda available in the current shell
+source ~/miniforge3/etc/profile.d/conda.sh
+
+# Initialize conda for bash (one-time per instance — writes to ~/.bashrc)
+~/miniforge3/bin/conda init bash
+
+# Initialize mamba for bash (one-time per instance — required before mamba activate works)
+mamba shell init --shell bash --root-prefix=~/miniforge3
+
+# Reload shell to apply the initialization
+source ~/.bashrc
+
+# Activate the project environment
+mamba activate indot
 ```
 
 On future reconnections, `mamba activate indot` is all you need — the shell init only needs to run once per instance.
