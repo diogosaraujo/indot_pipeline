@@ -1,11 +1,11 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: ─── CONFIGURATION ────────────────────────────────────────────────
+:: --- CONFIGURATION ------------------------------------------------
 set ROLE_NAME=EC2-INDOT-Pipeline
 set BUCKET_NAME=indot-bridge-pipeline-YOUR-ID
 :: Set BUCKET_NAME to the same value used in create-s3-bucket.bat
-:: ──────────────────────────────────────────────────────────────────
+:: ------------------------------------------------------------------
 
 set TRUST_FILE=%TEMP%\indot-trust-policy.json
 set POLICY_FILE=%TEMP%\indot-s3-policy.json
@@ -30,7 +30,7 @@ echo Creating IAM role: !ROLE_NAME!...
 aws iam create-role ^
     --role-name !ROLE_NAME! ^
     --assume-role-policy-document file://"!TRUST_FILE!" ^
-    --description "EC2 role for INDOT pipeline — scoped S3 read/write access"
+    --description "EC2 role for INDOT pipeline - scoped S3 read/write access"
 if errorlevel 1 (
     echo WARNING: Role may already exist. Continuing to policy attachment...
 )

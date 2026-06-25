@@ -1,13 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: ─── CONFIGURATION ────────────────────────────────────────────────
+:: --- CONFIGURATION ------------------------------------------------
 set REGION=us-east-1
 set BUCKET_NAME=indot-bridge-pipeline-YOUR-ID
 :: Replace YOUR-ID with your initials or another unique suffix.
 :: Bucket names must be globally unique across all AWS accounts.
 :: Use only lowercase letters, numbers, and hyphens.
-:: ──────────────────────────────────────────────────────────────────
+:: ------------------------------------------------------------------
 
 :: Create the bucket
 echo Creating S3 bucket: !BUCKET_NAME! in !REGION!...

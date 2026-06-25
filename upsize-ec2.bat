@@ -1,12 +1,12 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: ─── CONFIGURATION ────────────────────────────────────────────────
+:: --- CONFIGURATION ------------------------------------------------
 set REGION=us-east-1
 set TARGET_TYPE=r5.2xlarge
 set INSTANCE_NAME=indot-pipeline
 set KEY_NAME=indot-pipeline-key
-:: ──────────────────────────────────────────────────────────────────
+:: ------------------------------------------------------------------
 
 echo Looking up instance ID for "%INSTANCE_NAME%"...
 for /f %%i in ('aws ec2 describe-instances --region %REGION% --filters "Name=tag:Name,Values=%INSTANCE_NAME%" "Name=instance-state-name,Values=running,stopped" --query "Reservations[0].Instances[0].InstanceId" --output text') do set INSTANCE_ID=%%i

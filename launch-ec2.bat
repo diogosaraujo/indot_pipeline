@@ -1,13 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: ─── CONFIGURATION ────────────────────────────────────────────────
+:: --- CONFIGURATION ------------------------------------------------
 set REGION=us-east-1
 set INSTANCE_TYPE=m5.2xlarge
 set IAM_ROLE=EC2-INDOT-Pipeline
 set KEY_NAME=indot-pipeline-key
 set SG_NAME=indot-pipeline-sg
-:: ──────────────────────────────────────────────────────────────────
+:: ------------------------------------------------------------------
 
 :: Step 1: Get your public IP
 echo Fetching your public IP...
