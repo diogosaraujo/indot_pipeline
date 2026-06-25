@@ -1,27 +1,31 @@
 """09_figures.py
 
-Generate summary figures from the trigger analysis results produced by
-script 08.  All figures are produced separately for each MRMS source
-(nearest_pixel, watershed_mean).  Figures are written as PNG files to:
+Generate summary figures from the event-overlap confusion matrix produced by
+script 08 (analysis/event_confusion_matrix.parquet).  Figures are written to:
 
     s3://<bucket>/<prefix>analysis/figures/
     s3://<bucket>/<prefix>analysis/figures/stations/   (per-gauge)
 
-Figures produced (suffix = nearest_pixel or watershed_mean)
-------------------------------------------------------------
-Aggregate:
-    csi_heatmap_Q{rp}_{suffix}.png         Pooled CSI by duration × precip_rp
-    pod_heatmap_Q{rp}_{suffix}.png         Pooled POD by duration × precip_rp
-    far_heatmap_Q{rp}_{suffix}.png         Pooled FAR by duration × precip_rp
-    pod_vs_far_Q{rp}_{suffix}.png          POD vs FAR scatter (colour = duration)
-    best_csi_per_station_{suffix}.png      Best achievable CSI bar chart
-    best_combo_per_station_{suffix}.png    Best (duration, precip_rp) combo
-    map_csi_{suffix}.png                   Map: best CSI per station
-    map_pod_{suffix}.png                   Map: POD at best-CSI trigger
-    map_far_{suffix}.png                   Map: FAR at best-CSI trigger
+Metrics: POD = TP/(TP+FN), FAR = FP/(TP+FP), CSI = TP/(TP+FP+FN), pooled from
+raw counts.  Sources (suffix): nearest (MRMS pixel), station_nearest (gauge).
+
+Cross-source (one figure):
+    metric_comparison_boxplot.png          POD/FAR/CSI spread across all
+                                           duration×precip combos: Q10/Q50/Q100
+                                           groups, Station vs MRMS boxes
+
+Per source × flow target Q{rp}:
+    {csi,pod,far}_heatmap_Q{rp}_{sfx}.png          pooled metric, duration × precip_rp
+    pod_vs_far_Q{rp}_{sfx}.png                      POD vs FAR (colour = duration)
+    precision_recall_Q{rp}_{sfx}.png               PR curves, one per duration
+    {csi,pod,far}_heatmap_Q{rp}_byCluster_{sfx}.png  pooled metric per basin cluster
+    pod_vs_far_Q{rp}_byCluster_{sfx}.png             POD vs FAR coloured by cluster
+    best_csi_per_station_Q{rp}_{sfx}.png             best achievable CSI bar chart
+    best_combo_per_station_Q{rp}_{sfx}.png           best (duration, precip_rp) combo
+    map_{csi,pod,far}_Q{rp}_{sfx}.png                station maps at best-CSI trigger
 
 Per gauge (figures/stations/):
-    {site_no}_{suffix}.png                 CSI, POD, FAR heatmaps (Q10 and Q50)
+    {site_no}_{sfx}.png                    CSI, POD, FAR heatmaps × flow targets
 """
 from __future__ import annotations
 
@@ -66,6 +70,12 @@ SOURCE_LABELS = {
     "station_watershed": "Station Watershed Mean",
 }
 
+# Short group label for cross-source comparisons (boxplots).
+SOURCE_GROUP = {
+    "nearest":         "MRMS",
+    "station_nearest": "Station",
+}
+
 
 # ---------- I/O helpers ----------
 
@@ -75,7 +85,7 @@ def _read_parquet_s3(bucket: str, key: str) -> pd.DataFrame:
 
 
 def load_trigger_analysis(bucket: str, prefix: str) -> pd.DataFrame:
-    return _read_parquet_s3(bucket, f"{prefix}analysis/trigger_analysis.parquet")
+    return _read_parquet_s3(bucket, f"{prefix}analysis/event_confusion_matrix.parquet")
 
 
 def load_stations(bucket: str, prefix: str) -> pd.DataFrame:
@@ -329,6 +339,138 @@ def map_metric_at_best_csi_fig(
     return fig
 
 
+# ---------- Cluster-pooled figures ----------
+
+def cluster_heatmap_fig(df: pd.DataFrame, metric: str, flow_rp: int, src_label: str) -> plt.Figure:
+    """One pooled metric heatmap (duration × precip_rp) per basin cluster, side by side."""
+    sub = df[df["flow_rp_yr"] == flow_rp]
+    clusters = sorted(int(c) for c in sub["cluster"].dropna().unique())
+    cmap = METRIC_CMAP.get(metric, "YlOrRd")
+
+    fig, axes = plt.subplots(1, len(clusters), figsize=(6 * len(clusters), 5), squeeze=False)
+    for ci, c in enumerate(clusters):
+        ax = axes[0, ci]
+        cdf = sub[sub["cluster"] == c]
+        pooled = _pool_metrics(cdf, ["duration_hr", "precip_rp_yr"])
+        pivot = pooled.pivot(index="duration_hr", columns="precip_rp_yr", values=metric)
+        pivot.index = _duration_tick_labels(pivot.index)
+        sns.heatmap(pivot, annot=True, fmt=".2f", cmap=cmap, vmin=0.0, vmax=1.0,
+                    linewidths=0.4, ax=ax, cbar=(ci == len(clusters) - 1))
+        ax.set_title(f"Cluster {c}  (n={cdf['site_no'].nunique()} gauges)", fontsize=10)
+        ax.set_xlabel("Precip Return Period (yr)", fontsize=8)
+        ax.set_ylabel("Duration" if ci == 0 else "", fontsize=8)
+        ax.tick_params(axis="x", rotation=0, labelsize=7)
+        ax.tick_params(axis="y", rotation=0, labelsize=7)
+    fig.suptitle(f"{metric} by basin cluster (pooled counts) — Q{flow_rp}  |  {src_label}",
+                 fontsize=12, y=1.02)
+    fig.tight_layout()
+    return fig
+
+
+def cluster_pod_vs_far_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.Figure:
+    """POD-vs-FAR scatter (each point = one duration×precip_rp combo), coloured by cluster."""
+    sub = df[df["flow_rp_yr"] == flow_rp]
+    clusters = sorted(int(c) for c in sub["cluster"].dropna().unique())
+    cmap = plt.get_cmap("tab10")
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for c in clusters:
+        cdf = sub[sub["cluster"] == c]
+        agg = _pool_metrics(cdf, ["duration_hr", "precip_rp_yr"])
+        ax.scatter(agg["FAR"], agg["POD"], color=cmap(c % 10), s=40, alpha=0.7,
+                   edgecolors="white", linewidths=0.3,
+                   label=f"Cluster {c} (n={cdf['site_no'].nunique()})")
+    ax.plot([0, 1], [0, 1], "k--", alpha=0.25, linewidth=1)
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("False Alarm Ratio (FAR)", fontsize=10)
+    ax.set_ylabel("Probability of Detection (POD)", fontsize=10)
+    ax.set_title(f"POD vs FAR by basin cluster — Q{flow_rp}  |  {src_label}", fontsize=11)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    return fig
+
+
+# ---------- Precision-recall ----------
+
+def precision_recall_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.Figure:
+    """Precision-recall curves: one curve per accumulation duration, traced over precip RPs.
+
+    Recall = POD = TP/(TP+FN);  Precision = TP/(TP+FP) = 1 - FAR.
+    Each curve fixes a duration and connects its points as the precip threshold varies.
+    """
+    sub = df[df["flow_rp_yr"] == flow_rp]
+    pooled = _pool_metrics(sub, ["duration_hr", "precip_rp_yr"])
+    pooled["precision"] = pooled["tp"] / (pooled["tp"] + pooled["fp"] + EPS)
+    pooled["recall"]    = pooled["tp"] / (pooled["tp"] + pooled["fn"] + EPS)
+
+    durations = sorted(pooled["duration_hr"].unique())
+    norm = plt.Normalize(vmin=np.log2(min(durations)), vmax=np.log2(max(durations)))
+    cmap = plt.get_cmap("viridis")
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for d in durations:
+        dd = pooled[pooled["duration_hr"] == d].sort_values("recall")
+        ax.plot(dd["recall"], dd["precision"], "-o", ms=3, lw=1.0,
+                color=cmap(norm(np.log2(d))), alpha=0.85)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+    cbar.set_ticks([np.log2(d) for d in durations])
+    cbar.set_ticklabels([DURATION_LABELS.get(d, str(d)) for d in durations])
+    cbar.set_label("Accumulation Duration", fontsize=9)
+
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("Recall  (POD = TP / (TP+FN))", fontsize=10)
+    ax.set_ylabel("Precision  (TP / (TP+FP) = 1 - FAR)", fontsize=10)
+    ax.set_title(f"Precision-Recall — Q{flow_rp} target  |  {src_label}\n"
+                 "(one curve per duration; points = precip return periods)", fontsize=11)
+    ax.grid(True, alpha=0.3)
+    return fig
+
+
+# ---------- Cross-source comparison ----------
+
+def metric_comparison_boxplot_fig(df_all: pd.DataFrame) -> plt.Figure:
+    """Boxplots of POD/FAR/CSI over all (duration × precip_rp) combos.
+
+    x = flow target (Q10/Q50/Q100); two boxes per group = Station vs MRMS.
+    Each box's distribution is the pooled metric across every trigger configuration.
+    """
+    rows = []
+    for src in df_all["source"].unique():
+        grp = SOURCE_GROUP.get(src)
+        if grp is None:
+            continue
+        for flow_rp in sorted(df_all["flow_rp_yr"].unique()):
+            sub = df_all[(df_all["source"] == src) & (df_all["flow_rp_yr"] == flow_rp)]
+            pooled = _pool_metrics(sub, ["duration_hr", "precip_rp_yr"])
+            for _, r in pooled.iterrows():
+                rows.append({"target": f"Q{int(flow_rp)}", "group": grp,
+                             "POD": r["POD"], "FAR": r["FAR"], "CSI": r["CSI"]})
+    box = pd.DataFrame(rows)
+    order = [f"Q{rp}" for rp in sorted(df_all["flow_rp_yr"].unique())]
+
+    metrics = ["POD", "FAR", "CSI"]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    for ax, m in zip(axes, metrics):
+        sns.boxplot(data=box, x="target", y=m, hue="group", order=order,
+                    hue_order=["MRMS", "Station"],
+                    palette={"MRMS": "#4c72b0", "Station": "#dd8452"}, ax=ax)
+        ax.set_title(m, fontsize=12)
+        ax.set_xlabel("Flow target", fontsize=10)
+        ax.set_ylabel(m, fontsize=10)
+        ax.set_ylim(-0.02, 1.02)
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend(title="Source", fontsize=8)
+    fig.suptitle("Skill distribution across all (duration × precip-RP) combinations",
+                 fontsize=13, y=1.02)
+    fig.tight_layout()
+    return fig
+
+
 # ---------- Per-station figures ----------
 
 def station_metrics_fig(
@@ -399,7 +541,7 @@ def main() -> None:
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
 
-    log.info("Loading trigger_analysis.parquet from S3...")
+    log.info("Loading event_confusion_matrix.parquet from S3...")
     df_all = load_trigger_analysis(bucket, prefix)
     df_all = add_metrics(df_all)
     log.info("Loaded %d rows, %d stations", len(df_all), df_all["site_no"].nunique())
@@ -422,11 +564,19 @@ def main() -> None:
     log.info("Loading station coordinates from S3...")
     stations = load_stations(bucket, prefix)
 
-    sources = sorted(df_all["mrms_source"].unique())
-    log.info("MRMS sources found: %s", sources)
+    sources = sorted(df_all["source"].unique())
+    log.info("Sources found: %s", sources)
+
+    # Cross-source comparison (uses both Station and MRMS) — one figure overall.
+    if len(set(df_all["source"]) & set(SOURCE_GROUP)) >= 1:
+        log.info("Station-vs-MRMS comparison boxplot...")
+        fig = metric_comparison_boxplot_fig(df_all)
+        save_figure(fig, bucket, f"{prefix}{FIGURES_PREFIX}metric_comparison_boxplot.png")
+
+    has_cluster = "cluster" in df_all.columns
 
     for src_key in sources:
-        df = df_all[df_all["mrms_source"] == src_key].copy()
+        df = df_all[df_all["source"] == src_key].copy()
         src_label = SOURCE_LABELS.get(src_key, src_key.replace("_", " ").title())
         sfx = src_key  # file suffix, e.g. "nearest_pixel"
         log.info("── Generating figures for MRMS source: %s (%d rows) ──", src_label, len(df))
@@ -457,6 +607,21 @@ def main() -> None:
                 fig = map_metric_at_best_csi_fig(df, stations, metric, flow_rp, src_label)
                 save_figure(fig, bucket,
                             f"{prefix}{FIGURES_PREFIX}map_{metric.lower()}_Q{flow_rp}_{sfx}.png")
+
+            # Precision-recall (one curve per duration)
+            fig = precision_recall_fig(df, flow_rp, src_label)
+            save_figure(fig, bucket,
+                        f"{prefix}{FIGURES_PREFIX}precision_recall_Q{flow_rp}_{sfx}.png")
+
+            # Cluster-pooled figures (skip if no cluster column)
+            if has_cluster:
+                for metric in ("CSI", "POD", "FAR"):
+                    fig = cluster_heatmap_fig(df, metric, flow_rp, src_label)
+                    save_figure(fig, bucket,
+                                f"{prefix}{FIGURES_PREFIX}{metric.lower()}_heatmap_Q{flow_rp}_byCluster_{sfx}.png")
+                fig = cluster_pod_vs_far_fig(df, flow_rp, src_label)
+                save_figure(fig, bucket,
+                            f"{prefix}{FIGURES_PREFIX}pod_vs_far_Q{flow_rp}_byCluster_{sfx}.png")
 
         # ── Per-station figures ──────────────────────────────────────────
         station_map = stations.set_index("site_no")["station_nm"].to_dict()
