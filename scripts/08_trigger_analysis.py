@@ -20,7 +20,15 @@ return period) the hourly record is classified into wet/dry events and scored:
 
 Sources (nearest only — watershed-mean sources removed):
     nearest          nearest MRMS pixel  (mrms/<product>/nearest_pixel.parquet)
-    station_nearest  nearest ISD/GHCNh hourly gauge
+    station_nearest  nearest ISD/GHCNh gauge that COVERS the analysis window
+
+Common analysis window (per gauge, IDENTICAL for both sources):
+    window = streamflow span  ∩  MRMS coverage   (clip-to-MRMS-era)
+    Both sources are scored over this same window, so a gauge's flood-event count
+    is identical regardless of precipitation source.  For station_nearest the
+    nearest ISD/GHCNh gauge whose record SPANS this window is used (walk outward
+    by distance, skipping any that don't cover it); a gauge with no covering
+    precip station is omitted from the station source only.
 
 Scope: only the LP3-fitted, clustered stations (clusters/clusters_k3.csv); each
 output row carries the station's basin-type cluster so results can be pooled by
@@ -30,6 +38,7 @@ thresholds and are skipped automatically — no separate QC.
 Output schema (one row per combination):
     site_no, cluster, source, duration_hr, precip_rp_yr, flow_rp_yr,
     tp, fp, fn, tn, n_precip_events, n_flow_events,
+    pct_precip_missing,                 # % of window hours with no precip record
     common_start, common_end, n_common_hours
 
 Writes:
@@ -46,6 +55,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
@@ -192,6 +202,68 @@ def assign_nearest_station(gauges: pd.DataFrame, stations_meta: pd.DataFrame) ->
     for _, row in gauges.iterrows():
         _, idx = kd.query([float(row["dec_lat_va"]), float(row["dec_long_va"])])
         result[str(row["site_no"])] = stations_meta.iloc[idx]["station_id"]
+    return result
+
+
+def load_station_coverage(bucket: str, prefix: str) -> pd.DataFrame:
+    """station_id, latitude, longitude, and record [start, end] for each precip gauge.
+
+    Reads only id/datetime/lat/lon so the period of record can be computed without
+    pulling the full precip values.
+    """
+    frames: list[pd.DataFrame] = []
+    for tag, fname, id_col in _STATION_SOURCES_CFG:
+        try:
+            df = _read_parquet_s3(bucket, f"{prefix}{fname}",
+                                  columns=[id_col, "datetime_utc", "latitude", "longitude"])
+            df = df.rename(columns={id_col: "_sid"})
+            df["station_id"]   = tag + "_" + df["_sid"].astype(str)
+            df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+            g = df.groupby("station_id")
+            cov = pd.DataFrame({
+                "latitude":  g["latitude"].first(),
+                "longitude": g["longitude"].first(),
+                "start":     g["datetime_utc"].min(),
+                "end":       g["datetime_utc"].max(),
+            }).reset_index()
+            frames.append(cov.dropna(subset=["latitude", "longitude"]))
+        except Exception as e:
+            log.warning("Could not load %s coverage: %s", tag, e)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).drop_duplicates("station_id").reset_index(drop=True)
+
+
+def assign_covering_station(
+    gauges: pd.DataFrame,
+    coverage: pd.DataFrame,
+    window_by_site: dict[str, tuple[pd.Timestamp, pd.Timestamp]],
+) -> dict[str, str]:
+    """Map each gauge to the NEAREST precip station whose record covers the gauge's
+    analysis window [window_start, window_end].  Walks outward by distance, skipping
+    stations that don't span the window; returns {} entry omitted if none qualifies.
+    """
+    from scipy.spatial import KDTree
+    if coverage.empty:
+        return {}
+    kd = KDTree(coverage[["latitude", "longitude"]].values)
+    starts = coverage["start"].to_numpy()
+    ends   = coverage["end"].to_numpy()
+    ids    = coverage["station_id"].to_numpy()
+    k_all  = len(coverage)
+
+    result: dict[str, str] = {}
+    for _, row in gauges.iterrows():
+        site = str(row["site_no"])
+        win = window_by_site.get(site)
+        if win is None:
+            continue
+        ws, we = win
+        _, idxs = kd.query([float(row["dec_lat_va"]), float(row["dec_long_va"])], k=k_all)
+        for idx in np.atleast_1d(idxs):
+            if starts[idx] <= ws and ends[idx] >= we:   # covers the whole window
+                result[site] = str(ids[idx])
+                break
     return result
 
 
@@ -361,15 +433,18 @@ def analyse_station(
     atlas14_site: pd.DataFrame,
     flow_stats_row: pd.Series,
     source: Source,
+    window_start: pd.Timestamp,  # analysis window = streamflow span ∩ MRMS coverage
+    window_end: pd.Timestamp,    # IDENTICAL for both sources → identical flood counts
 ) -> list[dict]:
-    common_start = max(precip_hourly.index.min(), flow_hourly.index.min())
-    common_end   = min(precip_hourly.index.max(), flow_hourly.index.max())
-    if pd.isna(common_start) or pd.isna(common_end) or common_start >= common_end:
-        log.warning("[%s] %s: no common period — skipping", source, site_no)
+    if pd.isna(window_start) or pd.isna(window_end) or window_start >= window_end:
+        log.warning("[%s] %s: empty window — skipping", source, site_no)
         return []
+    common_start, common_end = window_start, window_end
 
     grid = pd.date_range(common_start, common_end, freq="1h", tz="UTC")
-    precip = precip_hourly.reindex(grid, fill_value=0.0)          # missing precip = 0
+    precip = precip_hourly.reindex(grid)                          # NaN where no record
+    pct_precip_missing = round(100.0 * float(precip.isna().mean()), 2)
+    precip = precip.fillna(0.0)                                   # missing precip = 0
     flow   = flow_hourly.reindex(grid)                            # keep NaN gaps
     n_common = len(grid)
 
@@ -417,6 +492,7 @@ def analyse_station(
                     "tp": tp, "fp": fp, "fn": fn, "tn": tn,
                     "n_precip_events": len(precip_events),
                     "n_flow_events":   len(flow_events_by_rp[flow_rp]),
+                    "pct_precip_missing": pct_precip_missing,
                     "common_start":    common_start,
                     "common_end":      common_end,
                     "n_common_hours":  n_common,
@@ -498,7 +574,9 @@ def plot_station_diagnostic(
     cs = max(precip_raw.index.min(), flow_raw.index.min())
     ce = min(precip_raw.index.max(), flow_raw.index.max())
     grid   = pd.date_range(cs, ce, freq="1h", tz="UTC")
-    precip = precip_raw.reindex(grid, fill_value=0.0)
+    precip = precip_raw.reindex(grid)
+    pct_precip_missing = round(100.0 * float(precip.isna().mean()), 1)
+    precip = precip.fillna(0.0)
     flow   = flow_raw.reindex(grid)
     rolling = precip.rolling(duration_hr, min_periods=duration_hr).sum()
     precip_wet = (rolling >= precip_thr).fillna(False)
@@ -561,6 +639,7 @@ def plot_station_diagnostic(
     ax1.set_title(
         f"Station {site_no} | {source} | D={duration_hr}h | P{precip_rp}→Q{flow_rp}\n"
         f"whole record: TP={tp}  FP={fp}  FN={fn}  TN={tn}   "
+        f"({pct_precip_missing}% precip hrs missing)   "
         f"(view {view_s.date()} → {view_e.date()})"
     )
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
@@ -646,31 +725,53 @@ def main() -> None:
     )
     log.info("Clustered stations with all inputs: %d", len(stations_all))
 
-    flow_end_by_site = streamflow.groupby("site_no")["datetime_utc"].max()
-    existing, complete_keys, stored_end = load_existing(bucket, prefix)
+    flow_start_by_site = streamflow.groupby("site_no")["datetime_utc"].min()
+    flow_end_by_site   = streamflow.groupby("site_no")["datetime_utc"].max()
 
-    all_records: list[dict] = []
-
-    # ── Source 1: nearest MRMS pixel ──────────────────────────────────────────
+    # ── Per-gauge analysis window = streamflow span ∩ MRMS coverage ───────────
+    # Computed ONCE and used for BOTH sources, so the flood-event count for a
+    # gauge is identical regardless of precipitation source.
     log.info("Loading MRMS nearest-pixel precipitation...")
     try:
         mrms = load_mrms_nearest(bucket, prefix, product_key)
-        mrms_end_by_site = mrms.groupby("site_no")["datetime_utc"].max()
     except Exception as e:
         log.error("Could not load MRMS nearest: %s", e)
         mrms = pd.DataFrame()
 
-    if not mrms.empty:
-        n = len(stations_all)
-        for i, site_no in enumerate(stations_all, 1):
-            if (site_no, "nearest") in complete_keys:
-                exp_end = min(mrms_end_by_site.get(site_no, pd.NaT),
-                              flow_end_by_site.get(site_no, pd.NaT))
-                if pd.notna(exp_end) and exp_end <= stored_end.get((site_no, "nearest"), pd.NaT):
-                    log.info("[nearest][%d/%d] %s: complete, skipping", i, n, site_no)
-                    continue
-                complete_keys.discard((site_no, "nearest"))
+    mrms_start_by_site = mrms.groupby("site_no")["datetime_utc"].min() if not mrms.empty else {}
+    mrms_end_by_site   = mrms.groupby("site_no")["datetime_utc"].max() if not mrms.empty else {}
 
+    window_by_site: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {}
+    for s in stations_all:
+        fs_, fe_ = flow_start_by_site.get(s, pd.NaT), flow_end_by_site.get(s, pd.NaT)
+        ms_ = mrms_start_by_site.get(s, pd.NaT) if len(mrms_start_by_site) else pd.NaT
+        me_ = mrms_end_by_site.get(s, pd.NaT) if len(mrms_end_by_site) else pd.NaT
+        if any(pd.isna(x) for x in (fs_, fe_, ms_, me_)):
+            continue
+        ws, we = max(fs_, ms_), min(fe_, me_)
+        if ws < we:
+            window_by_site[s] = (ws, we)
+    sites_win = [s for s in stations_all if s in window_by_site]
+    log.info("Gauges with a valid flow∩MRMS window: %d / %d", len(sites_win), len(stations_all))
+
+    existing, complete_keys, stored_end = load_existing(bucket, prefix)
+    all_records: list[dict] = []
+
+    def _resume_skip(site_no: str, source: str, we: pd.Timestamp) -> bool:
+        if (site_no, source) in complete_keys:
+            if stored_end.get((site_no, source), pd.NaT) >= we:
+                return True
+            complete_keys.discard((site_no, source))
+        return False
+
+    # ── Source 1: nearest MRMS pixel ──────────────────────────────────────────
+    if not mrms.empty:
+        n = len(sites_win)
+        for i, site_no in enumerate(sites_win, 1):
+            ws, we = window_by_site[site_no]
+            if _resume_skip(site_no, "nearest", we):
+                log.info("[nearest][%d/%d] %s: complete, skipping", i, n, site_no)
+                continue
             precip_site = mrms[mrms["site_no"] == site_no].set_index("datetime_utc")["precip_in"].sort_index()
             flow_site   = streamflow[streamflow["site_no"] == site_no].set_index("datetime_utc")["value_cfs"].sort_index()
             a14_site    = atlas14[atlas14["site_no"] == site_no]
@@ -679,38 +780,35 @@ def main() -> None:
                 log.warning("[nearest][%d/%d] %s: missing data, skipping", i, n, site_no)
                 continue
             recs = analyse_station(site_no, clusters[site_no], precip_site, flow_site,
-                                   a14_site, fs_rows.iloc[0], "nearest")
+                                   a14_site, fs_rows.iloc[0], "nearest", ws, we)
             all_records.extend(recs)
             log.info("[nearest][%d/%d] %s: %d combos", i, n, site_no, len(recs))
 
-    # ── Source 2: nearest station (ISD / GHCNh) ───────────────────────────────
-    log.info("Loading station metadata for nearest-station assignment...")
-    stations_meta = load_station_meta(bucket, prefix)
-    if stations_meta.empty:
+    # ── Source 2: nearest station COVERING the window (ISD / GHCNh) ────────────
+    log.info("Loading station coverage (ISD + GHCNh)...")
+    coverage = load_station_coverage(bucket, prefix)
+    if coverage.empty:
         log.warning("No station precip — skipping station_nearest source.")
     else:
-        gauges  = load_gauges(bucket, prefix)
-        nearest = assign_nearest_station(gauges, stations_meta)
-        needed  = {nearest[s] for s in stations_all if s in nearest}
-        log.info("Loading precip for %d nearest stations...", len(needed))
+        gauges = load_gauges(bucket, prefix)
+        assign = assign_covering_station(gauges, coverage, window_by_site)
+        n_missing = len(sites_win) - len(set(sites_win) & set(assign))
+        log.info("Covering precip station found for %d / %d gauges (%d have none)",
+                 len(assign), len(sites_win), n_missing)
+        needed = set(assign.values())
+        log.info("Loading precip for %d covering stations...", len(needed))
         precip_hourly = load_precip_for_stations(bucket, prefix, needed)
         if precip_hourly.empty:
             log.warning("No station precip rows — skipping station_nearest.")
         else:
-            precip_end_by_sid = precip_hourly.groupby("station_id")["datetime_utc"].max()
-            n = len(stations_all)
-            for i, site_no in enumerate(stations_all, 1):
-                sid = nearest.get(site_no)
-                if sid is None:
+            sites_st = [s for s in sites_win if s in assign]
+            n = len(sites_st)
+            for i, site_no in enumerate(sites_st, 1):
+                ws, we = window_by_site[site_no]
+                if _resume_skip(site_no, "station_nearest", we):
+                    log.info("[station_nearest][%d/%d] %s: complete, skipping", i, n, site_no)
                     continue
-                if (site_no, "station_nearest") in complete_keys:
-                    exp_end = min(precip_end_by_sid.get(sid, pd.NaT),
-                                  flow_end_by_site.get(site_no, pd.NaT))
-                    if pd.notna(exp_end) and exp_end <= stored_end.get((site_no, "station_nearest"), pd.NaT):
-                        log.info("[station_nearest][%d/%d] %s: complete, skipping", i, n, site_no)
-                        continue
-                    complete_keys.discard((site_no, "station_nearest"))
-
+                sid = assign[site_no]
                 sub = precip_hourly[precip_hourly["station_id"] == sid]
                 if sub.empty:
                     log.warning("[station_nearest][%d/%d] %s: no precip, skipping", i, n, site_no)
@@ -722,7 +820,7 @@ def main() -> None:
                 if flow_site.empty or a14_site.empty or fs_rows.empty:
                     continue
                 recs = analyse_station(site_no, clusters[site_no], precip_site, flow_site,
-                                       a14_site, fs_rows.iloc[0], "station_nearest")
+                                       a14_site, fs_rows.iloc[0], "station_nearest", ws, we)
                 all_records.extend(recs)
                 log.info("[station_nearest][%d/%d] %s: %d combos", i, n, site_no, len(recs))
 

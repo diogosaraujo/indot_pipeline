@@ -116,6 +116,19 @@ def _duration_tick_labels(index):
     return [DURATION_LABELS.get(v, str(v)) for v in index]
 
 
+def _mean_pct_missing(d: pd.DataFrame) -> float | None:
+    """Mean (across gauges) % of window hours with no precip record, or None."""
+    if "pct_precip_missing" not in d.columns or d.empty:
+        return None
+    return float(d.groupby("site_no")["pct_precip_missing"].first().mean())
+
+
+def _missing_suffix(d: pd.DataFrame) -> str:
+    """'  |  N% precip hrs missing' for figure titles (empty if unavailable)."""
+    mp = _mean_pct_missing(d)
+    return f"  |  {mp:.0f}% precip hrs missing" if mp is not None else ""
+
+
 def _pool_metrics(df: pd.DataFrame, groupby_cols: list[str]) -> pd.DataFrame:
     """Sum raw TP/FP/FN by groupby_cols, then derive metrics from pooled totals."""
     counts = df.groupby(groupby_cols)[["tp", "fp", "fn"]].sum().reset_index()
@@ -151,7 +164,8 @@ def heatmap_fig(
         ax=ax,
     )
     ax.set_title(
-        f"{metric} (pooled counts) — flow threshold Q{flow_rp}  |  Source: {src_label}",
+        f"{metric} (pooled counts) — Q{flow_rp} target "
+        f"({_n_flood_events(sub)} events)  |  Source: {src_label}{_missing_suffix(sub)}",
         fontsize=12,
     )
     ax.set_xlabel("Precip Return Period (yr)", fontsize=10)
@@ -192,7 +206,8 @@ def pod_vs_far_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.Figure
     ax.set_xlabel("False Alarm Ratio (FAR)", fontsize=10)
     ax.set_ylabel("Probability of Detection (POD)", fontsize=10)
     ax.set_title(
-        f"POD vs FAR — flow threshold Q{flow_rp}  |  Source: {src_label}",
+        f"POD vs FAR — Q{flow_rp} target ({_n_flood_events(sub)} events)  "
+        f"|  Source: {src_label}{_missing_suffix(sub)}",
         fontsize=11,
     )
     ax.legend(fontsize=8)
@@ -202,16 +217,16 @@ def pod_vs_far_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.Figure
 
 # ---------- Cluster-pooled figures ----------
 
-def _cluster_n_events(cdf: pd.DataFrame) -> int:
-    """Number of flood (Q-target) events in a cluster subset.
+def _n_flood_events(d: pd.DataFrame) -> int:
+    """Number of flood (Q-target) events in a subset (single flow_rp expected).
 
     n_flow_events is constant per (station, flow_rp), so take one value per
     station and sum.  Falls back to the max TP+FN episode count if the column
     is absent (older output).
     """
-    if "n_flow_events" in cdf.columns:
-        return int(cdf.groupby("site_no")["n_flow_events"].first().sum())
-    per_site = cdf.assign(_e=cdf["tp"] + cdf["fn"]).groupby("site_no")["_e"].max()
+    if "n_flow_events" in d.columns:
+        return int(d.groupby("site_no")["n_flow_events"].first().sum())
+    per_site = d.assign(_e=d["tp"] + d["fn"]).groupby("site_no")["_e"].max()
     return int(per_site.sum())
 
 
@@ -240,7 +255,7 @@ def cluster_heatmap_fig(df: pd.DataFrame, metric: str, flow_rp: int, src_label: 
                     linewidths=0.4, ax=ax, cbar=(ci == len(clusters) - 1))
         ax.set_title(
             f"Cluster {c}  ({cdf['site_no'].nunique()} gauges, "
-            f"{_cluster_n_events(cdf)} Q{flow_rp} events)", fontsize=10)
+            f"{_n_flood_events(cdf)} Q{flow_rp} events)", fontsize=10)
         ax.set_xlabel("Precip Return Period (yr)", fontsize=8)
         ax.set_ylabel("Duration" if ci == 0 else "", fontsize=8)
         ax.tick_params(axis="x", rotation=0, labelsize=7)
@@ -266,7 +281,7 @@ def cluster_pod_vs_far_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> pl
         ax.scatter(agg["FAR"], agg["POD"], color=cmap(c % 10), s=40, alpha=0.7,
                    edgecolors="white", linewidths=0.3,
                    label=f"Cluster {c} ({cdf['site_no'].nunique()} gauges, "
-                         f"{_cluster_n_events(cdf)} events)")
+                         f"{_n_flood_events(cdf)} events)")
     ax.plot([0, 1], [0, 1], "k--", alpha=0.25, linewidth=1)
     far_all = pd.concat(far_all); pod_all = pd.concat(pod_all)
     fpad = max(0.02, (far_all.max() - far_all.min()) * 0.05)
@@ -312,7 +327,8 @@ def precision_recall_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.
     ax.set_ylim(0, max(1e-3, pmax * 1.1))
     ax.set_xlabel("Recall  (POD = TP / (TP+FN))", fontsize=10)
     ax.set_ylabel("Precision  (TP / (TP+FP) = 1 - FAR)", fontsize=10)
-    ax.set_title(f"Precision-Recall — Q{flow_rp} target  |  {src_label}\n"
+    ax.set_title(f"Precision-Recall — Q{flow_rp} target ({_n_flood_events(sub)} events)  "
+                 f"|  {src_label}{_missing_suffix(sub)}\n"
                  "(one curve per duration; points = precip return periods)", fontsize=11)
     ax.grid(True, alpha=0.3)
     ax.legend(title="Accumulation", fontsize=7, ncol=1,
@@ -340,7 +356,11 @@ def metric_comparison_boxplot_fig(df_all: pd.DataFrame) -> plt.Figure:
                 rows.append({"target": f"Q{int(flow_rp)}", "group": grp,
                              "POD": r["POD"], "FAR": r["FAR"], "CSI": r["CSI"]})
     box = pd.DataFrame(rows)
-    order = [f"Q{rp}" for rp in sorted(df_all["flow_rp_yr"].unique())]
+    flow_rps = sorted(df_all["flow_rp_yr"].unique())
+    order = [f"Q{rp}" for rp in flow_rps]
+    # Flood-event count per target (constant across sources; dedup by station).
+    ev = {f"Q{int(rp)}": _n_flood_events(df_all[df_all["flow_rp_yr"] == rp]) for rp in flow_rps}
+    tick_labels = [f"{t}\n({ev[t]} events)" for t in order]
 
     metrics = ["POD", "FAR", "CSI"]
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
@@ -351,12 +371,21 @@ def metric_comparison_boxplot_fig(df_all: pd.DataFrame) -> plt.Figure:
         ax.set_title(m, fontsize=12)
         ax.set_xlabel("Flow target", fontsize=10)
         ax.set_ylabel(m, fontsize=10)
+        ax.set_xticklabels(tick_labels)
         # No fixed ylim — each subplot auto-scales to its own metric range
         # (FAR clusters near 1, CSI near 0), maximising the visible spread.
         ax.grid(axis="y", alpha=0.3)
         ax.legend(title="Source", fontsize=8)
-    fig.suptitle("Skill distribution across all (duration × precip-RP) combinations",
-                 fontsize=13, y=1.02)
+
+    # Per-source mean precip-gap fraction (constant across targets per source).
+    gap_bits = []
+    for src, grp in SOURCE_GROUP.items():
+        mp = _mean_pct_missing(df_all[df_all["source"] == src])
+        if mp is not None:
+            gap_bits.append(f"{grp} {mp:.0f}%")
+    gap_txt = f"   |   precip hrs missing: {', '.join(gap_bits)}" if gap_bits else ""
+    fig.suptitle("Skill distribution across all (duration × precip-RP) combinations"
+                 + gap_txt, fontsize=13, y=1.02)
     fig.tight_layout()
     return fig
 
