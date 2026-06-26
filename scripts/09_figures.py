@@ -1,10 +1,10 @@
 """09_figures.py
 
 Generate summary figures from the event-overlap confusion matrix produced by
-script 08 (analysis/event_confusion_matrix.parquet).  Figures are written to:
+script 08 (analysis/event_confusion_matrix.parquet).  All figures are aggregate
+(pooled across gauges) — no per-station figures.  Written to:
 
     s3://<bucket>/<prefix>analysis/figures/
-    s3://<bucket>/<prefix>analysis/figures/stations/   (per-gauge)
 
 Metrics: POD = TP/(TP+FN), FAR = FP/(TP+FP), CSI = TP/(TP+FP+FN), pooled from
 raw counts.  Sources (suffix): nearest (MRMS pixel), station_nearest (gauge).
@@ -18,14 +18,10 @@ Per source × flow target Q{rp}:
     {csi,pod,far}_heatmap_Q{rp}_{sfx}.png          pooled metric, duration × precip_rp
     pod_vs_far_Q{rp}_{sfx}.png                      POD vs FAR (colour = duration)
     precision_recall_Q{rp}_{sfx}.png               PR curves, one per duration
-    {csi,pod,far}_heatmap_Q{rp}_byCluster_{sfx}.png  pooled metric per basin cluster
-    pod_vs_far_Q{rp}_byCluster_{sfx}.png             POD vs FAR coloured by cluster
-    best_csi_per_station_Q{rp}_{sfx}.png             best achievable CSI bar chart
-    best_combo_per_station_Q{rp}_{sfx}.png           best (duration, precip_rp) combo
-    map_{csi,pod,far}_Q{rp}_{sfx}.png                station maps at best-CSI trigger
 
-Per gauge (figures/stations/):
-    {site_no}_{sfx}.png                    CSI, POD, FAR heatmaps × flow targets
+Cluster breakdown (Q10 only — Q50/Q100 weren't clustered):
+    {csi,pod,far}_heatmap_Q10_byCluster_{sfx}.png  pooled metric per basin cluster
+    pod_vs_far_Q10_byCluster_{sfx}.png             POD vs FAR coloured by cluster
 """
 from __future__ import annotations
 
@@ -35,8 +31,6 @@ import logging
 import matplotlib
 matplotlib.use("Agg")  # no display on EC2
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -52,7 +46,11 @@ log = logging.getLogger("09_figures")
 
 EPS = 1e-9
 FIGURES_PREFIX = "analysis/figures/"
-STATIONS_PREFIX = "analysis/figures/stations/"
+
+# Cluster figures are only meaningful for the return period that was actually
+# clustered into groups (Q10 → k=3).  Q50/Q100 collapsed to one group with too
+# few events, so cluster breakdowns are skipped for them.
+CLUSTER_FLOW_RP = 10
 
 DURATION_LABELS = {
     1: "1 h", 2: "2 h", 3: "3 h", 6: "6 h", 12: "12 h",
@@ -86,14 +84,6 @@ def _read_parquet_s3(bucket: str, key: str) -> pd.DataFrame:
 
 def load_trigger_analysis(bucket: str, prefix: str) -> pd.DataFrame:
     return _read_parquet_s3(bucket, f"{prefix}analysis/event_confusion_matrix.parquet")
-
-
-def load_stations(bucket: str, prefix: str) -> pd.DataFrame:
-    df = _read_parquet_s3(bucket, f"{prefix}stations/indiana_streamflow_sites.parquet")
-    df["site_no"] = df["site_no"].astype(str)
-    return df[["site_no", "station_nm", "dec_lat_va", "dec_long_va"]].dropna(
-        subset=["dec_lat_va", "dec_long_va"]
-    )
 
 
 def fig_to_bytes(fig: plt.Figure) -> bytes:
@@ -135,31 +125,6 @@ def _pool_metrics(df: pd.DataFrame, groupby_cols: list[str]) -> pd.DataFrame:
     return counts
 
 
-def _metric_heatmap_ax(
-    ax, data: pd.DataFrame, flow_rp: int, metric: str, title: str
-) -> None:
-    cmap = METRIC_CMAP.get(metric, "YlOrRd")
-    sub = data[data["flow_rp_yr"] == flow_rp]
-    pivot = sub.groupby(["duration_hr", "precip_rp_yr"])[metric].mean().unstack()
-    pivot.index = _duration_tick_labels(pivot.index)
-    sns.heatmap(
-        pivot,
-        annot=True,
-        fmt=".2f",
-        cmap=cmap,
-        vmin=0.0,
-        vmax=1.0,
-        linewidths=0.4,
-        ax=ax,
-        cbar=True,
-    )
-    ax.set_title(title, fontsize=9)
-    ax.set_xlabel("Precip Return Period (yr)", fontsize=8)
-    ax.set_ylabel("Duration", fontsize=8)
-    ax.tick_params(axis="x", rotation=0, labelsize=7)
-    ax.tick_params(axis="y", rotation=0, labelsize=7)
-
-
 # ---------- Aggregate figures ----------
 
 def heatmap_fig(
@@ -176,13 +141,12 @@ def heatmap_fig(
     pivot.index = _duration_tick_labels(pivot.index)
 
     fig, ax = plt.subplots(figsize=(11, 6))
+    # Auto colour scale to this figure's data range (improves contrast vs 0-1).
     sns.heatmap(
         pivot,
         annot=True,
         fmt=".2f",
         cmap=cmap,
-        vmin=0.0,
-        vmax=1.0,
         linewidths=0.4,
         ax=ax,
     )
@@ -218,8 +182,13 @@ def pod_vs_far_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.Figure
     cbar.set_label("Accumulation Duration", fontsize=9)
 
     ax.plot([0, 1], [0, 1], "k--", alpha=0.25, linewidth=1, label="No skill")
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(-0.02, 1.02)
+    # Auto-scale to the data with a small margin (FAR for rare targets sits near 1).
+    fmin, fmax = agg["FAR"].min(), agg["FAR"].max()
+    pmin, pmax = agg["POD"].min(), agg["POD"].max()
+    fpad = max(0.02, (fmax - fmin) * 0.05)
+    ppad = max(0.02, (pmax - pmin) * 0.05)
+    ax.set_xlim(fmin - fpad, fmax + fpad)
+    ax.set_ylim(pmin - ppad, pmax + ppad)
     ax.set_xlabel("False Alarm Ratio (FAR)", fontsize=10)
     ax.set_ylabel("Probability of Detection (POD)", fontsize=10)
     ax.set_title(
@@ -231,115 +200,20 @@ def pod_vs_far_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.Figure
     return fig
 
 
-def best_csi_per_station_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.Figure:
-    sub = df[df["flow_rp_yr"] == flow_rp]
-    best = sub.groupby("site_no")["CSI"].max().sort_values(ascending=False)
-    n = len(best)
-
-    fig, ax = plt.subplots(figsize=(max(10, n * 0.25), 4))
-    colors = ["#2ecc71" if v >= 0.3 else "#e67e22" if v >= 0.1 else "#e74c3c" for v in best]
-    ax.bar(range(n), best.values, color=colors, edgecolor="none")
-    ax.set_xticks(range(n))
-    ax.set_xticklabels(best.index, rotation=90, fontsize=7)
-    ax.set_ylabel("Best CSI (any combination)")
-    ax.set_title(
-        f"Best achievable CSI per gauge — Q{flow_rp} threshold  |  Source: {src_label}\n"
-        "(green ≥ 0.3 | orange ≥ 0.1 | red < 0.1)"
-    )
-    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
-    ax.set_xlim(-0.5, n - 0.5)
-    ax.grid(axis="y", alpha=0.3)
-    return fig
-
-
-def best_combo_per_station_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.Figure:
-    """For each station show which (duration, precip_rp) gave the best CSI for a given flow threshold."""
-    sub = df[df["flow_rp_yr"] == flow_rp]
-    idx = sub.groupby("site_no")["CSI"].idxmax()
-    best = sub.loc[idx, ["site_no", "duration_hr", "precip_rp_yr", "CSI"]].copy()
-    best["duration_label"] = best["duration_hr"].map(DURATION_LABELS)
-    best["combo"] = best["duration_label"] + " / " + best["precip_rp_yr"].astype(str) + "yr"
-    best = best.sort_values("CSI", ascending=True)
-
-    n = len(best)
-    fig, ax = plt.subplots(figsize=(8, max(6, n * 0.22)))
-    colors = ["#2ecc71" if v >= 0.3 else "#e67e22" if v >= 0.1 else "#e74c3c" for v in best["CSI"]]
-    ax.barh(range(n), best["CSI"], color=colors, edgecolor="none")
-    ax.set_yticks(range(n))
-    ax.set_yticklabels(
-        [f"{row.site_no}  ({row.combo})" for _, row in best.iterrows()],
-        fontsize=7,
-    )
-    ax.set_xlabel("Best CSI")
-    ax.set_title(
-        f"Best trigger combination per gauge — Q{flow_rp} threshold  |  Source: {src_label}\n"
-        "(duration / precip return period)"
-    )
-    ax.axvline(0.3, color="#2ecc71", linestyle="--", linewidth=0.8, alpha=0.6)
-    ax.axvline(0.1, color="#e67e22", linestyle="--", linewidth=0.8, alpha=0.6)
-    ax.grid(axis="x", alpha=0.3)
-    fig.tight_layout()
-    return fig
-
-
-def map_metric_at_best_csi_fig(
-    df: pd.DataFrame,
-    stations: pd.DataFrame,
-    metric: str,
-    flow_rp: int,
-    src_label: str,
-) -> plt.Figure:
-    """Map stations coloured by `metric` at the best-CSI trigger for a given flow threshold."""
-    sub = df[df["flow_rp_yr"] == flow_rp]
-    idx = sub.groupby("site_no")["CSI"].idxmax()
-    best = sub.loc[idx, ["site_no", "CSI", "POD", "FAR"]].copy()
-    merged = stations.merge(best, on="site_no", how="inner")
-
-    # FAR: lower = better → reversed colormap
-    cmap = "RdYlGn" if metric in ("CSI", "POD") else "RdYlGn_r"
-    labels = {
-        "CSI": f"Best CSI — Q{flow_rp} threshold",
-        "POD": f"POD at best-CSI trigger — Q{flow_rp} threshold",
-        "FAR": f"FAR at best-CSI trigger — Q{flow_rp} threshold",
-    }
-
-    fig, ax = plt.subplots(figsize=(7, 9))
-    norm = mcolors.Normalize(vmin=0, vmax=1)
-    sc = ax.scatter(
-        merged["dec_long_va"],
-        merged["dec_lat_va"],
-        c=merged[metric],
-        cmap=cmap,
-        norm=norm,
-        s=60,
-        edgecolors="k",
-        linewidths=0.3,
-        zorder=3,
-    )
-    cbar = fig.colorbar(sc, ax=ax, pad=0.02, shrink=0.7)
-    cbar.set_label(labels[metric], fontsize=9)
-
-    for _, row in merged.iterrows():
-        annotate = row[metric] <= 0.3 if metric == "FAR" else row[metric] >= 0.3
-        if annotate:
-            ax.annotate(
-                row["site_no"],
-                (row["dec_long_va"], row["dec_lat_va"]),
-                textcoords="offset points",
-                xytext=(5, 3),
-                fontsize=6,
-                color="black",
-            )
-
-    ax.set_xlabel("Longitude", fontsize=9)
-    ax.set_ylabel("Latitude", fontsize=9)
-    ax.set_title(f"{labels[metric]}\nSource: {src_label}", fontsize=11)
-    ax.grid(True, alpha=0.2)
-    fig.tight_layout()
-    return fig
-
-
 # ---------- Cluster-pooled figures ----------
+
+def _cluster_n_events(cdf: pd.DataFrame) -> int:
+    """Number of flood (Q-target) events in a cluster subset.
+
+    n_flow_events is constant per (station, flow_rp), so take one value per
+    station and sum.  Falls back to the max TP+FN episode count if the column
+    is absent (older output).
+    """
+    if "n_flow_events" in cdf.columns:
+        return int(cdf.groupby("site_no")["n_flow_events"].first().sum())
+    per_site = cdf.assign(_e=cdf["tp"] + cdf["fn"]).groupby("site_no")["_e"].max()
+    return int(per_site.sum())
+
 
 def cluster_heatmap_fig(df: pd.DataFrame, metric: str, flow_rp: int, src_label: str) -> plt.Figure:
     """One pooled metric heatmap (duration × precip_rp) per basin cluster, side by side."""
@@ -347,16 +221,26 @@ def cluster_heatmap_fig(df: pd.DataFrame, metric: str, flow_rp: int, src_label: 
     clusters = sorted(int(c) for c in sub["cluster"].dropna().unique())
     cmap = METRIC_CMAP.get(metric, "YlOrRd")
 
-    fig, axes = plt.subplots(1, len(clusters), figsize=(6 * len(clusters), 5), squeeze=False)
-    for ci, c in enumerate(clusters):
-        ax = axes[0, ci]
+    # Precompute each cluster's pivot, then share ONE colour scale across panels
+    # (consistent within the figure, but fit to the data range, not 0-1).
+    panels = []
+    for c in clusters:
         cdf = sub[sub["cluster"] == c]
         pooled = _pool_metrics(cdf, ["duration_hr", "precip_rp_yr"])
         pivot = pooled.pivot(index="duration_hr", columns="precip_rp_yr", values=metric)
         pivot.index = _duration_tick_labels(pivot.index)
-        sns.heatmap(pivot, annot=True, fmt=".2f", cmap=cmap, vmin=0.0, vmax=1.0,
+        panels.append((c, cdf, pivot))
+    vmin = min(float(p.min().min()) for _, _, p in panels)
+    vmax = max(float(p.max().max()) for _, _, p in panels)
+
+    fig, axes = plt.subplots(1, len(clusters), figsize=(6 * len(clusters), 5), squeeze=False)
+    for ci, (c, cdf, pivot) in enumerate(panels):
+        ax = axes[0, ci]
+        sns.heatmap(pivot, annot=True, fmt=".2f", cmap=cmap, vmin=vmin, vmax=vmax,
                     linewidths=0.4, ax=ax, cbar=(ci == len(clusters) - 1))
-        ax.set_title(f"Cluster {c}  (n={cdf['site_no'].nunique()} gauges)", fontsize=10)
+        ax.set_title(
+            f"Cluster {c}  ({cdf['site_no'].nunique()} gauges, "
+            f"{_cluster_n_events(cdf)} Q{flow_rp} events)", fontsize=10)
         ax.set_xlabel("Precip Return Period (yr)", fontsize=8)
         ax.set_ylabel("Duration" if ci == 0 else "", fontsize=8)
         ax.tick_params(axis="x", rotation=0, labelsize=7)
@@ -374,15 +258,21 @@ def cluster_pod_vs_far_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> pl
     cmap = plt.get_cmap("tab10")
 
     fig, ax = plt.subplots(figsize=(7, 6))
+    far_all, pod_all = [], []
     for c in clusters:
         cdf = sub[sub["cluster"] == c]
         agg = _pool_metrics(cdf, ["duration_hr", "precip_rp_yr"])
+        far_all.append(agg["FAR"]); pod_all.append(agg["POD"])
         ax.scatter(agg["FAR"], agg["POD"], color=cmap(c % 10), s=40, alpha=0.7,
                    edgecolors="white", linewidths=0.3,
-                   label=f"Cluster {c} (n={cdf['site_no'].nunique()})")
+                   label=f"Cluster {c} ({cdf['site_no'].nunique()} gauges, "
+                         f"{_cluster_n_events(cdf)} events)")
     ax.plot([0, 1], [0, 1], "k--", alpha=0.25, linewidth=1)
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(-0.02, 1.02)
+    far_all = pd.concat(far_all); pod_all = pd.concat(pod_all)
+    fpad = max(0.02, (far_all.max() - far_all.min()) * 0.05)
+    ppad = max(0.02, (pod_all.max() - pod_all.min()) * 0.05)
+    ax.set_xlim(far_all.min() - fpad, far_all.max() + fpad)
+    ax.set_ylim(pod_all.min() - ppad, pod_all.max() + ppad)
     ax.set_xlabel("False Alarm Ratio (FAR)", fontsize=10)
     ax.set_ylabel("Probability of Detection (POD)", fontsize=10)
     ax.set_title(f"POD vs FAR by basin cluster — Q{flow_rp}  |  {src_label}", fontsize=11)
@@ -408,26 +298,25 @@ def precision_recall_fig(df: pd.DataFrame, flow_rp: int, src_label: str) -> plt.
     norm = plt.Normalize(vmin=np.log2(min(durations)), vmax=np.log2(max(durations)))
     cmap = plt.get_cmap("viridis")
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(9, 6))
     for d in durations:
         dd = pooled[pooled["duration_hr"] == d].sort_values("recall")
-        ax.plot(dd["recall"], dd["precision"], "-o", ms=3, lw=1.0,
-                color=cmap(norm(np.log2(d))), alpha=0.85)
+        ax.plot(dd["recall"], dd["precision"], "-", lw=1.6,
+                color=cmap(norm(np.log2(d))), alpha=0.9,
+                label=DURATION_LABELS.get(d, str(d)))
 
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
-    cbar.set_ticks([np.log2(d) for d in durations])
-    cbar.set_ticklabels([DURATION_LABELS.get(d, str(d)) for d in durations])
-    cbar.set_label("Accumulation Duration", fontsize=9)
-
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(-0.02, 1.02)
+    # Auto-scale to the data so the (often tiny) precision range fills the plot.
+    rmax = float(pooled["recall"].max())
+    pmax = float(pooled["precision"].max())
+    ax.set_xlim(0, max(0.05, rmax * 1.05))
+    ax.set_ylim(0, max(1e-3, pmax * 1.1))
     ax.set_xlabel("Recall  (POD = TP / (TP+FN))", fontsize=10)
     ax.set_ylabel("Precision  (TP / (TP+FP) = 1 - FAR)", fontsize=10)
     ax.set_title(f"Precision-Recall — Q{flow_rp} target  |  {src_label}\n"
                  "(one curve per duration; points = precip return periods)", fontsize=11)
     ax.grid(True, alpha=0.3)
+    ax.legend(title="Accumulation", fontsize=7, ncol=1,
+              loc="center left", bbox_to_anchor=(1.01, 0.5))
     return fig
 
 
@@ -462,45 +351,12 @@ def metric_comparison_boxplot_fig(df_all: pd.DataFrame) -> plt.Figure:
         ax.set_title(m, fontsize=12)
         ax.set_xlabel("Flow target", fontsize=10)
         ax.set_ylabel(m, fontsize=10)
-        ax.set_ylim(-0.02, 1.02)
+        # No fixed ylim — each subplot auto-scales to its own metric range
+        # (FAR clusters near 1, CSI near 0), maximising the visible spread.
         ax.grid(axis="y", alpha=0.3)
         ax.legend(title="Source", fontsize=8)
     fig.suptitle("Skill distribution across all (duration × precip-RP) combinations",
                  fontsize=13, y=1.02)
-    fig.tight_layout()
-    return fig
-
-
-# ---------- Per-station figures ----------
-
-def station_metrics_fig(
-    site_no: str,
-    station_nm: str,
-    df_site: pd.DataFrame,
-    src_label: str,
-) -> plt.Figure:
-    """CSI, POD, FAR heatmaps (rows) × flow thresholds (columns) for one station."""
-    flow_rps = sorted(df_site["flow_rp_yr"].unique())
-    metrics = ["CSI", "POD", "FAR"]
-    ncols = len(flow_rps)
-    nrows = len(metrics)
-
-    fig, axes = plt.subplots(nrows, ncols, figsize=(9 * ncols, 5 * nrows))
-    if ncols == 1:
-        axes = axes.reshape(-1, 1)
-
-    for row_i, metric in enumerate(metrics):
-        for col_i, flow_rp in enumerate(flow_rps):
-            ax = axes[row_i, col_i]
-            _metric_heatmap_ax(ax, df_site, flow_rp, metric, f"{metric} — Q{flow_rp}")
-
-    n_events = int(df_site["tp"].max() + df_site["fn"].max())
-    fig.suptitle(
-        f"Station {site_no}  |  {station_nm}\n"
-        f"Source: {src_label}  |  max flow events detected/missed: {n_events}",
-        fontsize=11,
-        y=1.01,
-    )
     fig.tight_layout()
     return fig
 
@@ -561,9 +417,6 @@ def main() -> None:
         len(sites_with_events), n_total, n_total - len(sites_with_events),
     )
 
-    log.info("Loading station coordinates from S3...")
-    stations = load_stations(bucket, prefix)
-
     sources = sorted(df_all["source"].unique())
     log.info("Sources found: %s", sources)
 
@@ -595,26 +448,14 @@ def main() -> None:
             save_figure(fig, bucket,
                         f"{prefix}{FIGURES_PREFIX}pod_vs_far_Q{flow_rp}_{sfx}.png")
 
-            fig = best_csi_per_station_fig(df, flow_rp, src_label)
-            save_figure(fig, bucket,
-                        f"{prefix}{FIGURES_PREFIX}best_csi_per_station_Q{flow_rp}_{sfx}.png")
-
-            fig = best_combo_per_station_fig(df, flow_rp, src_label)
-            save_figure(fig, bucket,
-                        f"{prefix}{FIGURES_PREFIX}best_combo_per_station_Q{flow_rp}_{sfx}.png")
-
-            for metric in ("CSI", "POD", "FAR"):
-                fig = map_metric_at_best_csi_fig(df, stations, metric, flow_rp, src_label)
-                save_figure(fig, bucket,
-                            f"{prefix}{FIGURES_PREFIX}map_{metric.lower()}_Q{flow_rp}_{sfx}.png")
-
             # Precision-recall (one curve per duration)
             fig = precision_recall_fig(df, flow_rp, src_label)
             save_figure(fig, bucket,
                         f"{prefix}{FIGURES_PREFIX}precision_recall_Q{flow_rp}_{sfx}.png")
 
-            # Cluster-pooled figures (skip if no cluster column)
-            if has_cluster:
+            # Cluster-pooled figures — only for the clustered RP (Q10); Q50/Q100
+            # collapsed to one group with too few events per cluster.
+            if has_cluster and flow_rp == CLUSTER_FLOW_RP:
                 for metric in ("CSI", "POD", "FAR"):
                     fig = cluster_heatmap_fig(df, metric, flow_rp, src_label)
                     save_figure(fig, bucket,
@@ -622,20 +463,6 @@ def main() -> None:
                 fig = cluster_pod_vs_far_fig(df, flow_rp, src_label)
                 save_figure(fig, bucket,
                             f"{prefix}{FIGURES_PREFIX}pod_vs_far_Q{flow_rp}_byCluster_{sfx}.png")
-
-        # ── Per-station figures ──────────────────────────────────────────
-        station_map = stations.set_index("site_no")["station_nm"].to_dict()
-        stations_in_df = sorted(df["site_no"].unique())
-        log.info("  Per-station figures: %d stations...", len(stations_in_df))
-
-        for i, site_no in enumerate(stations_in_df, 1):
-            df_site = df[df["site_no"] == site_no]
-            station_nm = station_map.get(site_no, "")
-            fig = station_metrics_fig(site_no, station_nm, df_site, src_label)
-            key = f"{prefix}{STATIONS_PREFIX}{site_no}_{sfx}.png"
-            save_figure(fig, bucket, key)
-            if i % 10 == 0:
-                log.info("    %d / %d stations done", i, len(stations_in_df))
 
     log.info(
         "All figures written to s3://%s/%s%s",
