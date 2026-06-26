@@ -39,6 +39,7 @@ Output schema (one row per combination):
     site_no, cluster, source, duration_hr, precip_rp_yr, flow_rp_yr,
     tp, fp, fn, tn, n_precip_events, n_flow_events,
     pct_precip_missing,                 # % of window hours with no precip record
+    precip_agg,                         # hourly-binning method (mrms / max / sum / none)
     common_start, common_end, n_common_hours
 
 Writes:
@@ -267,6 +268,23 @@ def assign_covering_station(
     return result
 
 
+def resample_station_precip(precip: pd.Series) -> tuple[pd.Series, str]:
+    """Bin a (sub-hourly, NaN-padded) station precip series to a clean hourly series.
+
+    ISD/GHCNh precipitation is ACCUMULATION-based, never independent sub-hourly
+    increments: a station reports the depth over the preceding hour, either once
+    per hour or repeated across sub-hourly METAR rows as a running 1-hour total.
+    So the correct hourly value is the per-hour MAX (skip-NaN) — it recovers the
+    single hourly report, and for running-accumulation stations takes the largest
+    trailing-hour total.  (Summing would multiply overlapping accumulations.)
+    An hour with no report stays NaN (truly missing).
+    """
+    if precip.empty:
+        return precip, "none"
+    hourly = precip.groupby(precip.index.floor("h")).max()   # skip-NaN; NaN if all-NaN
+    return hourly, "max"
+
+
 # ---------- Event detection & classification ----------
 
 def group_wet_events(is_wet: pd.Series) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
@@ -435,6 +453,7 @@ def analyse_station(
     source: Source,
     window_start: pd.Timestamp,  # analysis window = streamflow span ∩ MRMS coverage
     window_end: pd.Timestamp,    # IDENTICAL for both sources → identical flood counts
+    precip_agg: str = "mrms",    # hourly-binning method for the precip series
 ) -> list[dict]:
     if pd.isna(window_start) or pd.isna(window_end) or window_start >= window_end:
         log.warning("[%s] %s: empty window — skipping", source, site_no)
@@ -493,6 +512,7 @@ def analyse_station(
                     "n_precip_events": len(precip_events),
                     "n_flow_events":   len(flow_events_by_rp[flow_rp]),
                     "pct_precip_missing": pct_precip_missing,
+                    "precip_agg":      precip_agg,
                     "common_start":    common_start,
                     "common_end":      common_end,
                     "n_common_hours":  n_common,
@@ -803,26 +823,35 @@ def main() -> None:
         else:
             sites_st = [s for s in sites_win if s in assign]
             n = len(sites_st)
+            resamp_cache: dict[str, tuple[pd.Series, str]] = {}   # sid → (hourly, agg)
             for i, site_no in enumerate(sites_st, 1):
                 ws, we = window_by_site[site_no]
                 if _resume_skip(site_no, "station_nearest", we):
                     log.info("[station_nearest][%d/%d] %s: complete, skipping", i, n, site_no)
                     continue
                 sid = assign[site_no]
-                sub = precip_hourly[precip_hourly["station_id"] == sid]
-                if sub.empty:
+                if sid not in resamp_cache:
+                    sub = precip_hourly[precip_hourly["station_id"] == sid]
+                    if sub.empty:
+                        resamp_cache[sid] = (pd.Series(dtype=float), "none")
+                    else:
+                        resamp_cache[sid] = resample_station_precip(
+                            sub.set_index("datetime_utc")["precip_in"].sort_index())
+                precip_site, agg_method = resamp_cache[sid]
+                if precip_site.empty:
                     log.warning("[station_nearest][%d/%d] %s: no precip, skipping", i, n, site_no)
                     continue
-                precip_site = sub.set_index("datetime_utc")["precip_in"].sort_index()
                 flow_site   = streamflow[streamflow["site_no"] == site_no].set_index("datetime_utc")["value_cfs"].sort_index()
                 a14_site    = atlas14[atlas14["site_no"] == site_no]
                 fs_rows     = flow_stats[flow_stats["site_no"] == site_no]
                 if flow_site.empty or a14_site.empty or fs_rows.empty:
                     continue
                 recs = analyse_station(site_no, clusters[site_no], precip_site, flow_site,
-                                       a14_site, fs_rows.iloc[0], "station_nearest", ws, we)
+                                       a14_site, fs_rows.iloc[0], "station_nearest", ws, we,
+                                       precip_agg=agg_method)
                 all_records.extend(recs)
-                log.info("[station_nearest][%d/%d] %s: %d combos", i, n, site_no, len(recs))
+                log.info("[station_nearest][%d/%d] %s: %d combos (agg=%s)",
+                         i, n, site_no, len(recs), agg_method)
 
     # ── Combine with retained complete pairs and write ────────────────────────
     parts: list[pd.DataFrame] = []
