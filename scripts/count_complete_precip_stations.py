@@ -45,8 +45,11 @@ def main() -> None:
         df = df[(df["datetime_utc"] >= START) & (df["datetime_utc"] <= END)
                 & df["precip_in"].notna()]                       # hours with a value
         df["hour"] = df["datetime_utc"].dt.floor("h")
-        cov = (df.groupby("station_id")["hour"].nunique()
-                 .rename("covered_hours").reset_index())
+        cov = df.groupby("station_id").agg(
+            covered_hours=("hour", "nunique"),
+            span_start=("hour", "min"),
+            span_end=("hour", "max"),
+        ).reset_index()
         cov["source"] = src
         frames.append(cov)
         print(f"  loaded {src}: {cov['station_id'].nunique()} stations")
@@ -55,19 +58,31 @@ def main() -> None:
         print("No precip data."); return
 
     allcov = pd.concat(frames, ignore_index=True)
-    allcov["coverage_pct"] = (allcov["covered_hours"] / TOTAL_HOURS * 100).round(1)
+    allcov["span_hours"] = (((allcov["span_end"] - allcov["span_start"]).dt.total_seconds() // 3600) + 1).astype(int)
+    allcov["coverage_full"]     = (allcov["covered_hours"] / TOTAL_HOURS * 100).round(1)
+    allcov["coverage_internal"] = (allcov["covered_hours"] / allcov["span_hours"] * 100).round(1)
 
     print(f"\nTotal precip stations with any 2002-2026 data: {len(allcov)}")
-    print("\nCoverage distribution (% of window hours with a precip value):")
-    print(allcov["coverage_pct"].describe().round(1).to_string())
 
-    print("\nStations meeting a coverage threshold:")
+    print("\n[A] FULL-WINDOW coverage = covered hours / full 2002-2026 window")
+    print("    (penalises stations that start late OR end early)")
     for t in THRESHOLDS:
-        n = int((allcov["coverage_pct"] >= t).sum())
-        print(f"  >= {t:3d}% : {n:4d}")
+        print(f"    >= {t:3d}% : {int((allcov['coverage_full'] >= t).sum()):4d}")
 
-    print("\nBy source:")
-    print(allcov.groupby("source")["coverage_pct"].describe()[["count", "mean", "50%", "max"]].round(1).to_string())
+    print("\n[B] INTERNAL coverage = covered hours / station's own start→end span")
+    print("    (how gap-free a station is WITHIN its record, ignoring span length)")
+    for t in THRESHOLDS:
+        print(f"    >= {t:3d}% : {int((allcov['coverage_internal'] >= t).sum()):4d}")
+
+    print("\n[C] Genuinely complete over 2002-2026 (spans the window AND dense):")
+    spans = ((allcov["span_start"] <= pd.Timestamp("2003-01-01", tz="UTC"))
+             & (allcov["span_end"] >= pd.Timestamp("2025-01-01", tz="UTC")))
+    print(f"    starts <=2003 AND ends >=2025          : {int(spans.sum())}")
+    print(f"    ...AND >=90% internal coverage          : {int((spans & (allcov['coverage_internal'] >= 90)).sum())}")
+    print(f"    ...AND >=80% internal coverage          : {int((spans & (allcov['coverage_internal'] >= 80)).sum())}")
+
+    print("\nBy source (full-window coverage):")
+    print(allcov.groupby("source")["coverage_full"].describe()[["count", "mean", "50%", "max"]].round(1).to_string())
 
 
 if __name__ == "__main__":
