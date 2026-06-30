@@ -36,14 +36,23 @@ cluster.  Stations without valid Q (regulated / insufficient record) have null
 thresholds and are skipped automatically — no separate QC.
 
 Output schema (one row per combination):
-    site_no, cluster, source, duration_hr, precip_rp_yr, flow_rp_yr,
-    tp, fp, fn, tn, n_precip_events, n_flow_events,
+    site_no, cluster, source, duration_hr, precip_rp_yr, precip_depth_in,
+    flow_rp_yr, tp, fp, fn, tn, n_precip_events, n_flow_events,
     pct_precip_missing,                 # % of window hours with no precip record
     precip_agg,                         # hourly-binning method (mrms / max / sum / none)
     common_start, common_end, n_common_hours
 
+Return-period grid:
+    Default (discrete) — the 10 published Atlas 14 precip return periods.
+    --smooth           — a GEV is fit to each station/duration's 10 DDF quantiles
+                         and resampled on a 40-point log-spaced RP grid (1..1000 yr)
+                         for a continuous POD/FAR/CSI-vs-RP curve.  Counts stay
+                         integer (recomputed per RP); only the depth threshold is
+                         interpolated, via a published DDF family (see 08b).
+
 Writes:
-    s3://<bucket>/<prefix>analysis/event_confusion_matrix.parquet
+    s3://<bucket>/<prefix>analysis/event_confusion_matrix.parquet         (discrete)
+    s3://<bucket>/<prefix>analysis/event_confusion_matrix_smooth.parquet  (--smooth)
 """
 from __future__ import annotations
 
@@ -61,6 +70,8 @@ import pandas as pd
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 from matplotlib.patches import Patch
+from scipy.optimize import least_squares
+from scipy.stats import genextreme
 
 from utils import load_config, s3_client, write_parquet_to_s3
 
@@ -79,6 +90,16 @@ FLOW_RPS     = [10, 50, 100]
 
 OUTPUT_KEY = "analysis/event_confusion_matrix.parquet"
 COMPLETE_COMBINATIONS = len(DURATIONS_HR) * len(PRECIP_RPS) * len(FLOW_RPS)  # 480
+
+# ── Smooth (continuous) return-period grid ────────────────────────────────────
+# Atlas 14 publishes 10 DDF return periods (1..1000 yr).  For a smooth POD/FAR/CSI
+# vs return-period curve we fit a GEV to those 10 (RP, depth) quantiles per
+# (station, duration) and resample the depth on a dense log-spaced RP grid.  The
+# counts stay integer and are recomputed at each RP (no metric interpolation) —
+# only the depth THRESHOLD is interpolated, on a published parametric DDF family.
+SMOOTH_RPS = np.logspace(0.0, 3.0, 40)        # 40 RPs, 1 → 1000 yr (log-spaced)
+SMOOTH_OUTPUT_KEY = "analysis/event_confusion_matrix_smooth.parquet"
+SMOOTH_COMBINATIONS = len(DURATIONS_HR) * len(SMOOTH_RPS) * len(FLOW_RPS)
 
 Source = Literal["nearest", "station_nearest"]
 
@@ -441,6 +462,98 @@ def classify_overlap(
     return tp, fp, fn, tn
 
 
+# ---------- DDF fitting (smooth return-period thresholds) ----------
+#
+# Atlas 14 gives discrete (RP, depth) DDF quantiles.  To score on a continuous
+# return-period axis we fit a GEV (generalized extreme value) distribution to the
+# 10 published quantiles per station/duration and evaluate its depth at any RP.
+#
+# Method:  RP → non-exceedance probability F = 1 − 1/RP; depth = GEV.ppf(F).
+# Parameters are found by least-squares on the 10 (F, depth) points.  GEV is the
+# standard frequency model behind NOAA Atlas 14 regional DDF (Bonnin et al. 2006,
+# NOAA Atlas 14 Vol. 2) and the L-moment / regional-frequency framework of Hosking
+# & Wallis (1997); fitting a parametric quantile function to published DDF points
+# follows Stedinger et al. (1993, Handbook of Hydrology ch.18).  When the GEV fit
+# fails we fall back to log-log (Chow–Maidment–Mays) interpolation of depth vs RP.
+
+def fit_gev_quantiles(rps: np.ndarray, depths: np.ndarray):
+    """Fit GEV (scipy genextreme) to (RP, depth) DDF points → (c, loc, scale) | None."""
+    rps = np.asarray(rps, float)
+    depths = np.asarray(depths, float)
+    ok = np.isfinite(rps) & np.isfinite(depths) & (rps > 1.0) & (depths > 0.0)
+    rps, depths = rps[ok], depths[ok]
+    if len(rps) < 3:
+        return None
+    order = np.argsort(rps)
+    rps, depths = rps[order], depths[order]
+    F = 1.0 - 1.0 / rps                      # non-exceedance probability
+    y = -np.log(-np.log(F))                  # Gumbel reduced variate
+    # initial guess from a Gumbel (c≈0) least-squares line  depth ≈ loc + scale·y
+    b, a = np.polyfit(y, depths, 1)
+    p0 = [0.0, float(a), float(max(b, 1e-3))]
+
+    def resid(p):
+        c, loc, scale = p
+        if scale <= 0:
+            return np.full_like(depths, 1e6)
+        q = genextreme.ppf(F, c, loc=loc, scale=scale)
+        return np.where(np.isfinite(q), q - depths, 1e6)
+
+    try:
+        sol = least_squares(
+            resid, p0,
+            bounds=([-0.5, -np.inf, 1e-6], [0.5, np.inf, np.inf]),
+            max_nfev=2000,
+        )
+    except Exception:
+        return None
+    c, loc, scale = (float(v) for v in sol.x)
+    if not np.all(np.isfinite([c, loc, scale])) or scale <= 0:
+        return None
+    return c, loc, scale
+
+
+def gev_depth_at_rp(params, rp: float) -> float:
+    c, loc, scale = params
+    return float(genextreme.ppf(1.0 - 1.0 / rp, c, loc=loc, scale=scale))
+
+
+def loglog_depth_at_rp(rps: np.ndarray, depths: np.ndarray, rp: float) -> float:
+    """Log-log interpolation of depth vs RP (fallback; clamps at endpoints)."""
+    rps = np.asarray(rps, float)
+    depths = np.asarray(depths, float)
+    ok = np.isfinite(rps) & np.isfinite(depths) & (rps > 0.0) & (depths > 0.0)
+    rps, depths = rps[ok], depths[ok]
+    if len(rps) < 2:
+        return float("nan")
+    order = np.argsort(rps)
+    lx, ly = np.log(rps[order]), np.log(depths[order])
+    return float(np.exp(np.interp(np.log(rp), lx, ly)))
+
+
+def duration_thresholds(a14_dur: pd.DataFrame, smooth: bool) -> list[tuple[float, float]]:
+    """(rp, depth_in) threshold pairs for one duration.
+
+    smooth=False → the published Atlas 14 quantiles as-is.
+    smooth=True  → SMOOTH_RPS depths from a GEV fit (log-log fallback)."""
+    a = a14_dur.dropna(subset=["depth_in"])
+    if a.empty:
+        return []
+    rps = a["return_period_yr"].to_numpy(float)
+    depths = a["depth_in"].to_numpy(float)
+    if not smooth:
+        return list(zip(rps.tolist(), depths.tolist()))
+    params = fit_gev_quantiles(rps, depths)
+    out: list[tuple[float, float]] = []
+    for rp in SMOOTH_RPS:
+        d = gev_depth_at_rp(params, rp) if params is not None else float("nan")
+        if not np.isfinite(d) or d <= 0:
+            d = loglog_depth_at_rp(rps, depths, rp)
+        if np.isfinite(d) and d > 0:
+            out.append((float(rp), float(d)))
+    return out
+
+
 # ---------- Per-station analysis ----------
 
 def analyse_station(
@@ -454,6 +567,7 @@ def analyse_station(
     window_start: pd.Timestamp,  # analysis window = streamflow span ∩ MRMS coverage
     window_end: pd.Timestamp,    # IDENTICAL for both sources → identical flood counts
     precip_agg: str = "mrms",    # hourly-binning method for the precip series
+    smooth: bool = False,        # True → dense GEV-DDF return-period grid (SMOOTH_RPS)
 ) -> list[dict]:
     if pd.isna(window_start) or pd.isna(window_end) or window_start >= window_end:
         log.warning("[%s] %s: empty window — skipping", source, site_no)
@@ -484,15 +598,12 @@ def analyse_station(
 
     records: list[dict] = []
     for duration_hr in DURATIONS_HR:
+        a14_dur = atlas14_site.loc[atlas14_site["duration_hr"] == duration_hr]
+        thresholds = duration_thresholds(a14_dur, smooth)   # [(rp, depth_in), ...]
+        if not thresholds:
+            continue
         rolling = precip.rolling(window=duration_hr, min_periods=duration_hr).sum()
-        for precip_rp in PRECIP_RPS:
-            a14 = atlas14_site.loc[
-                (atlas14_site["duration_hr"] == duration_hr)
-                & (atlas14_site["return_period_yr"] == precip_rp)
-            ]
-            if a14.empty:
-                continue
-            precip_thr = float(a14["depth_in"].iloc[0])
+        for precip_rp, precip_thr in thresholds:
             precip_wet = (rolling >= precip_thr).fillna(False)
             precip_events = group_wet_events(precip_wet)
 
@@ -507,6 +618,7 @@ def analyse_station(
                     "source":          source,
                     "duration_hr":     duration_hr,
                     "precip_rp_yr":    precip_rp,
+                    "precip_depth_in": round(precip_thr, 4),
                     "flow_rp_yr":      flow_rp,
                     "tp": tp, "fp": fp, "fn": fn, "tn": tn,
                     "n_precip_events": len(precip_events),
@@ -522,16 +634,17 @@ def analyse_station(
 
 # ---------- Resume helpers ----------
 
-def load_existing(bucket: str, prefix: str):
+def load_existing(bucket: str, prefix: str, output_key: str = OUTPUT_KEY,
+                  n_combos: int = COMPLETE_COMBINATIONS):
     """Return (existing_df_or_None, complete_keys, stored_end) for resume."""
     try:
-        existing = _read_parquet_s3(bucket, f"{prefix}{OUTPUT_KEY}")
+        existing = _read_parquet_s3(bucket, f"{prefix}{output_key}")
     except Exception:
         log.info("No existing results — running fresh.")
         return None, set(), {}
     existing["site_no"] = existing["site_no"].astype(str)
     counts = existing.groupby(["site_no", "source"]).size()
-    complete = {key for key, n in counts.items() if n == COMPLETE_COMBINATIONS}
+    complete = {key for key, n in counts.items() if n == n_combos}
     stored_end = {
         key: grp["common_end"].max()
         for key, grp in existing.groupby(["site_no", "source"]) if key in complete
@@ -721,7 +834,11 @@ def plot_station_diagnostic(
 
 # ---------- Main ----------
 
-def main() -> None:
+def main(smooth: bool = False, output_key: str = OUTPUT_KEY) -> None:
+    n_combos = SMOOTH_COMBINATIONS if smooth else COMPLETE_COMBINATIONS
+    log.info("Mode: %s return-period grid (%d RPs, ~%d combos/station) → %s",
+             "SMOOTH" if smooth else "discrete",
+             len(SMOOTH_RPS) if smooth else len(PRECIP_RPS), n_combos, output_key)
     cfg = load_config()
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
@@ -774,7 +891,7 @@ def main() -> None:
     sites_win = [s for s in stations_all if s in window_by_site]
     log.info("Gauges with a valid flow∩MRMS window: %d / %d", len(sites_win), len(stations_all))
 
-    existing, complete_keys, stored_end = load_existing(bucket, prefix)
+    existing, complete_keys, stored_end = load_existing(bucket, prefix, output_key, n_combos)
     all_records: list[dict] = []
 
     def _resume_skip(site_no: str, source: str, we: pd.Timestamp) -> bool:
@@ -800,7 +917,8 @@ def main() -> None:
                 log.warning("[nearest][%d/%d] %s: missing data, skipping", i, n, site_no)
                 continue
             recs = analyse_station(site_no, clusters[site_no], precip_site, flow_site,
-                                   a14_site, fs_rows.iloc[0], "nearest", ws, we)
+                                   a14_site, fs_rows.iloc[0], "nearest", ws, we,
+                                   smooth=smooth)
             all_records.extend(recs)
             log.info("[nearest][%d/%d] %s: %d combos", i, n, site_no, len(recs))
 
@@ -848,7 +966,7 @@ def main() -> None:
                     continue
                 recs = analyse_station(site_no, clusters[site_no], precip_site, flow_site,
                                        a14_site, fs_rows.iloc[0], "station_nearest", ws, we,
-                                       precip_agg=agg_method)
+                                       precip_agg=agg_method, smooth=smooth)
                 all_records.extend(recs)
                 log.info("[station_nearest][%d/%d] %s: %d combos (agg=%s)",
                          i, n, site_no, len(recs), agg_method)
@@ -871,9 +989,9 @@ def main() -> None:
         return
 
     out = pd.concat(parts, ignore_index=True)
-    write_parquet_to_s3(out, bucket, f"{prefix}{OUTPUT_KEY}")
+    write_parquet_to_s3(out, bucket, f"{prefix}{output_key}")
     log.info("Wrote %s%s (%d rows, %d stations)",
-             prefix, OUTPUT_KEY, len(out), out["site_no"].nunique())
+             prefix, output_key, len(out), out["site_no"].nunique())
 
 
 if __name__ == "__main__":
@@ -887,6 +1005,8 @@ if __name__ == "__main__":
     p.add_argument("--flow-rp", type=int, default=10, help="flow return period (default 10)")
     p.add_argument("--start", default=None, help="view window start (YYYY-MM-DD); default auto-zoom")
     p.add_argument("--end", default=None, help="view window end (YYYY-MM-DD)")
+    p.add_argument("--smooth", action="store_true",
+                   help="dense GEV-DDF return-period grid → " + SMOOTH_OUTPUT_KEY)
     args = p.parse_args()
 
     if args.plot:
@@ -897,5 +1017,7 @@ if __name__ == "__main__":
             args.plot, args.source, args.duration, args.precip_rp, args.flow_rp,
             args.start, args.end,
         )
+    elif args.smooth:
+        main(smooth=True, output_key=SMOOTH_OUTPUT_KEY)
     else:
         main()
