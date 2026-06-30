@@ -7,7 +7,8 @@ accumulation duration is FIXED per station at its Kirpich time of concentration,
 rounded to the nearest hour (validated against the per-cluster CSI ridge — see
 tc_vs_csi_ridge.py).  Only the precipitation threshold (ARI / return period) is
 swept, so results can be pooled GLOBALLY (all stations together) rather than per
-cluster.
+cluster.  Source is MRMS nearest-pixel only — the ISD/GHCNh station source is not
+computed here (the MRMS-vs-station comparison is a separate, later step).
 
 For each station:
     D = round(Tc)  hours                               (MRMS is hourly → exact)
@@ -237,50 +238,8 @@ def main() -> None:
             log.info("[nearest][%d/%d] %s: Tc=%dh, %d combos",
                      i, n, site_no, max(1, round(tc_by_site[site_no])), len(recs))
 
-    # ── Source 2: nearest covering ISD/GHCNh station ──────────────────────────
-    log.info("Loading station coverage (ISD + GHCNh)...")
-    coverage = m.load_station_coverage(bucket, prefix)
-    if coverage.empty:
-        log.warning("No station precip — skipping station_nearest source.")
-    else:
-        gauges = m.load_gauges(bucket, prefix)
-        assign = m.assign_covering_station(gauges, coverage, window_by_site)
-        needed = set(assign.values())
-        log.info("Covering precip station for %d / %d gauges; loading %d stations...",
-                 len(assign), len(sites_win), len(needed))
-        precip_hourly = m.load_precip_for_stations(bucket, prefix, needed)
-        if precip_hourly.empty:
-            log.warning("No station precip rows — skipping station_nearest.")
-        else:
-            sites_st = [s for s in sites_win if s in assign]
-            n = len(sites_st)
-            resamp_cache: dict[str, tuple[pd.Series, str]] = {}
-            for i, site_no in enumerate(sites_st, 1):
-                ws, we = window_by_site[site_no]
-                if _resume_skip(site_no, "station_nearest", we):
-                    log.info("[station_nearest][%d/%d] %s: complete, skipping", i, n, site_no)
-                    continue
-                sid = assign[site_no]
-                if sid not in resamp_cache:
-                    sub = precip_hourly[precip_hourly["station_id"] == sid]
-                    resamp_cache[sid] = (
-                        m.resample_station_precip(
-                            sub.set_index("datetime_utc")["precip_in"].sort_index())
-                        if not sub.empty else (pd.Series(dtype=float), "none"))
-                precip_site, agg_method = resamp_cache[sid]
-                if precip_site.empty:
-                    continue
-                flow_site = streamflow[streamflow["site_no"] == site_no].set_index("datetime_utc")["value_cfs"].sort_index()
-                a14_site  = atlas14[atlas14["site_no"] == site_no]
-                fs_rows   = flow_stats[flow_stats["site_no"] == site_no]
-                if flow_site.empty or a14_site.empty or fs_rows.empty:
-                    continue
-                recs = analyse_station_tc(site_no, clusters[site_no], precip_site, flow_site,
-                                          a14_site, fs_rows.iloc[0], "station_nearest", ws, we,
-                                          tc_by_site[site_no], precip_agg=agg_method)
-                all_records.extend(recs)
-                log.info("[station_nearest][%d/%d] %s: %d combos (agg=%s)",
-                         i, n, site_no, len(recs), agg_method)
+    # Station (ISD/GHCNh) source is intentionally NOT computed here — 08c is
+    # MRMS-only; the MRMS-vs-station comparison is a separate, later step.
 
     # ── Combine with retained complete pairs and write ────────────────────────
     parts: list[pd.DataFrame] = []
