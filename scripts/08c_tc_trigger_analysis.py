@@ -6,9 +6,14 @@ Instead of sweeping accumulation duration × precip return period, the
 accumulation duration is FIXED per station at its Kirpich time of concentration,
 rounded to the nearest hour (validated against the per-cluster CSI ridge — see
 tc_vs_csi_ridge.py).  Only the precipitation threshold (ARI / return period) is
-swept, so results can be pooled GLOBALLY (all stations together) rather than per
-cluster.  Source is MRMS nearest-pixel only — the ISD/GHCNh station source is not
-computed here (the MRMS-vs-station comparison is a separate, later step).
+swept, and it is optimised GLOBALLY (all stations pooled together).  Source is
+MRMS nearest-pixel only — the ISD/GHCNh station source is not computed here (the
+MRMS-vs-station comparison is a separate, later step).
+
+Clustering is NOT used here.  The station universe is defined purely by physical
+data requirements — LP3-fitted (valid Q) ∩ Kirpich Tc ∩ Atlas 14 DDF ∩ streamflow
+∩ a valid flow∩MRMS window — and the cluster assignment is carried only as an
+optional descriptive tag on each row (`cluster`, default -1 if unclustered).
 
 For each station:
     D = round(Tc)  hours                               (MRMS is hourly → exact)
@@ -166,18 +171,28 @@ def main() -> None:
     atlas14    = m.load_atlas14(bucket, prefix)
     flow_stats = m.load_flow_stats(bucket, prefix)
     streamflow = m.load_streamflow(bucket, prefix)
-    clusters   = m.load_clusters(bucket, prefix)
     tc_by_site = load_tc(bucket, prefix)
     log.info("Stations with a Kirpich Tc: %d", len(tc_by_site))
 
+    # Clustering is NOT part of this analysis — the threshold is optimised
+    # globally on a per-station Tc duration.  We load the cluster assignment only
+    # as an optional descriptive tag on each row (default -1 if a station was not
+    # clustered); it never gates the station universe.
+    try:
+        clusters = m.load_clusters(bucket, prefix)
+    except Exception:
+        clusters = {}
+
+    # Universe = physical requirements only: LP3-fitted (valid Q) ∩ Kirpich Tc ∩
+    # Atlas14 DDF ∩ streamflow (∩ a valid MRMS window, applied below).
     q_cols = [f"Q{rp}" for rp in FLOW_RPS if f"Q{rp}" in flow_stats.columns]
     has_q  = set(flow_stats.loc[flow_stats[q_cols].notna().any(axis=1), "site_no"])
 
     stations_all = sorted(
-        set(clusters) & has_q & set(tc_by_site)
+        has_q & set(tc_by_site)
         & set(atlas14["site_no"]) & set(streamflow["site_no"])
     )
-    log.info("Stations with all inputs (incl. Tc): %d", len(stations_all))
+    log.info("Universe (valid Q ∩ Tc ∩ Atlas14 ∩ streamflow): %d", len(stations_all))
 
     flow_start_by_site = streamflow.groupby("site_no")["datetime_utc"].min()
     flow_end_by_site   = streamflow.groupby("site_no")["datetime_utc"].max()
@@ -231,7 +246,7 @@ def main() -> None:
             if precip_site.empty or flow_site.empty or a14_site.empty or fs_rows.empty:
                 log.warning("[nearest][%d/%d] %s: missing data, skipping", i, n, site_no)
                 continue
-            recs = analyse_station_tc(site_no, clusters[site_no], precip_site, flow_site,
+            recs = analyse_station_tc(site_no, clusters.get(site_no, -1), precip_site, flow_site,
                                       a14_site, fs_rows.iloc[0], "nearest", ws, we,
                                       tc_by_site[site_no])
             all_records.extend(recs)

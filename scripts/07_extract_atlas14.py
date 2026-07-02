@@ -1,8 +1,16 @@
 """07_extract_atlas14.py
 
 Download NOAA Atlas 14 precipitation frequency estimates from the NOAA
-Precipitation Frequency Data Server (PFDS) API for every active Indiana
-streamflow gauge.
+Precipitation Frequency Data Server (PFDS) API for every Indiana streamflow
+gauge in the inventory.  DDF depends only on lat/lon, so it is fetched for the
+FULL inventory by default (previously only the active inventory was covered,
+which left ~52 LP3-fitted but discontinued gauges without DDF — the bottleneck
+in 08c).  Resume-safe: only stations missing from the existing DDF parquet are
+fetched, then appended.
+
+    python scripts/07_extract_atlas14.py                 # full inventory, resume
+    python scripts/07_extract_atlas14.py --inventory active
+    python scripts/07_extract_atlas14.py --refetch       # re-fetch everything
 
 Durations (matching MRMS hourly rolling windows used in script 08):
     1, 2, 3, 6, 12, 24 h and 2, 3, 4, 5, 7, 10, 20, 30, 45, 60 days
@@ -17,6 +25,7 @@ Writes:
 """
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import logging
@@ -29,6 +38,10 @@ import pyarrow.parquet as pq
 import requests
 
 from utils import RetryPolicy, load_config, s3_client, with_retries, write_parquet_to_s3
+
+FULL_INVENTORY_KEY   = "stations/indiana_streamflow_sites.parquet"
+ACTIVE_INVENTORY_KEY = "stations/indiana_streamflow_sites_active.parquet"
+OUTPUT_KEY           = "atlas14/precipitation_frequency.parquet"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,11 +73,20 @@ DURATION_MAP: dict[str, int] = {
 RETURN_PERIODS = [1, 2, 5, 10, 25, 50, 100, 200, 500, 1000]
 
 
-def read_active_inventory(bucket: str, prefix: str) -> pd.DataFrame:
-    obj = s3_client().get_object(
-        Bucket=bucket, Key=f"{prefix}stations/indiana_streamflow_sites_active.parquet"
-    )
+def read_inventory(bucket: str, prefix: str, key: str) -> pd.DataFrame:
+    obj = s3_client().get_object(Bucket=bucket, Key=f"{prefix}{key}")
     return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
+
+
+def load_existing_atlas14(bucket: str, prefix: str) -> pd.DataFrame:
+    """Existing DDF parquet (empty frame if none) — for resume-safe fetching."""
+    try:
+        obj = s3_client().get_object(Bucket=bucket, Key=f"{prefix}{OUTPUT_KEY}")
+        df = pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
+        df["site_no"] = df["site_no"].astype(str)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 def fetch_atlas14(lat: float, lon: float) -> Optional[str]:
@@ -131,45 +153,66 @@ def parse_atlas14(site_no: str, text: str) -> pd.DataFrame:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--inventory", choices=["full", "active"], default="full",
+                    help="which station inventory to cover (default: full — closes "
+                         "the gap where DDF was only fetched for active gauges)")
+    ap.add_argument("--refetch", action="store_true",
+                    help="ignore existing DDF and re-fetch every station")
+    args = ap.parse_args()
+
     cfg = load_config()
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
 
-    inv = read_active_inventory(bucket, prefix)
+    key = FULL_INVENTORY_KEY if args.inventory == "full" else ACTIVE_INVENTORY_KEY
+    inv = read_inventory(bucket, prefix, key)
     inv["site_no"] = inv["site_no"].astype(str)
-    log.info("Fetching Atlas 14 data for %d active stations", len(inv))
+    inv = inv.dropna(subset=["dec_lat_va", "dec_long_va"]).drop_duplicates("site_no")
 
-    all_records: list[pd.DataFrame] = []
-    for i, row in enumerate(inv.itertuples(index=False), 1):
+    existing = pd.DataFrame() if args.refetch else load_existing_atlas14(bucket, prefix)
+    have = set(existing["site_no"]) if not existing.empty else set()
+    todo = inv[~inv["site_no"].isin(have)]
+    log.info("Inventory (%s): %d stations | already have DDF: %d | to fetch: %d",
+             args.inventory, len(inv), len(have), len(todo))
+    if todo.empty:
+        log.info("Nothing to fetch — Atlas 14 already covers this inventory.")
+        return
+
+    new_records: list[pd.DataFrame] = []
+    n = len(todo)
+    for i, row in enumerate(todo.itertuples(index=False), 1):
         site = str(row.site_no)
         lat = float(row.dec_lat_va)
         lon = float(row.dec_long_va)
-
         try:
             data = fetch_atlas14(lat, lon)
             if data is None:
-                log.warning("[%d/%d] %s: fetch failed after retries", i, len(inv), site)
+                log.warning("[%d/%d] %s: fetch failed after retries", i, n, site)
                 continue
             df = parse_atlas14(site, data)
             if df.empty:
-                log.warning("[%d/%d] %s: no records parsed", i, len(inv), site)
+                log.warning("[%d/%d] %s: no records parsed", i, n, site)
             else:
-                all_records.append(df)
-                log.info("[%d/%d] %s: %d rows", i, len(inv), site, len(df))
+                new_records.append(df)
+                log.info("[%d/%d] %s: %d rows", i, n, site, len(df))
         except Exception as e:
-            log.error("[%d/%d] %s failed: %s", i, len(inv), site, e)
-
+            log.error("[%d/%d] %s failed: %s", i, n, site, e)
         time.sleep(REQUEST_PAUSE_SEC)
 
-    if not all_records:
+    parts = [existing] if not existing.empty else []
+    if new_records:
+        parts.append(pd.concat(new_records, ignore_index=True))
+    if not parts:
         log.error("No Atlas 14 data retrieved.")
         return
 
-    combined = pd.concat(all_records, ignore_index=True)
-    write_parquet_to_s3(combined, bucket, f"{prefix}atlas14/precipitation_frequency.parquet")
+    combined = pd.concat(parts, ignore_index=True).drop_duplicates(
+        subset=["site_no", "duration_hr", "return_period_yr"], keep="last")
+    write_parquet_to_s3(combined, bucket, f"{prefix}{OUTPUT_KEY}")
     log.info(
-        "Wrote atlas14/precipitation_frequency.parquet (%d rows, %d stations)",
-        len(combined), combined["site_no"].nunique(),
+        "Wrote %s (%d rows, %d stations; +%d newly fetched)",
+        OUTPUT_KEY, len(combined), combined["site_no"].nunique(), len(new_records),
     )
 
 

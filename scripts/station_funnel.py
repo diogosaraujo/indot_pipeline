@@ -111,13 +111,15 @@ def main() -> None:
     a14_sites = set(atlas14["site_no"].astype(str))
     sf_sites = set(m.load_streamflow(bucket, prefix)["site_no"].astype(str))
 
-    stations_all = clustered & has_q & tc_sites & a14_sites & sf_sites
-    hdr("5. Used in 08c")
-    print(f"   clustered                      : {len(clustered):5d}")
-    print(f"   ∩ valid Q                      : {len(clustered & has_q):5d}")
-    print(f"   ∩ Kirpich Tc                   : {len(clustered & has_q & tc_sites):5d}")
-    print(f"   ∩ Atlas14                      : {len(clustered & has_q & tc_sites & a14_sites):5d}")
+    # 08c universe is now decoupled from clustering: physical requirements only.
+    stations_all = has_q & tc_sites & a14_sites & sf_sites
+    hdr("5. Used in 08c  (clustering NOT a gate)")
+    print(f"   valid Q (LP3-fitted)           : {len(has_q):5d}")
+    print(f"   ∩ Kirpich Tc                   : {len(has_q & tc_sites):5d}")
+    print(f"   ∩ Atlas14                      : {len(has_q & tc_sites & a14_sites):5d}")
     print(f"   ∩ streamflow                   : {len(stations_all):5d}")
+    print(f"   (for reference, with old cluster gate: "
+          f"{len(clustered & stations_all):5d})")
 
     # what 08c actually wrote
     try:
@@ -133,14 +135,12 @@ def main() -> None:
     except Exception as e:
         print(f"\n   08c output not read (run 08c first): {e}")
 
-    # Clustered-but-unused reasons
-    hdr("Clustered but NOT used — reason")
-    dropped = clustered - stations_all
-    print(f"   no valid Q                     : {len(clustered - has_q):5d}")
-    print(f"   no Kirpich Tc                  : {len((clustered & has_q) - tc_sites):5d}")
-    print(f"   no Atlas14                     : {len((clustered & has_q & tc_sites) - a14_sites):5d}")
-    print(f"   no streamflow                  : {len((clustered & has_q & tc_sites & a14_sites) - sf_sites):5d}")
-    print(f"   total clustered-but-unused     : {len(dropped):5d}  (before MRMS-window)")
+    # LP3-fitted-but-unused reasons (universe base = valid Q / LP3-fitted)
+    hdr("LP3-fitted but NOT used — reason")
+    print(f"   no Kirpich Tc                  : {len(has_q - tc_sites):5d}")
+    print(f"   no Atlas14                     : {len((has_q & tc_sites) - a14_sites):5d}")
+    print(f"   no streamflow                  : {len((has_q & tc_sites & a14_sites) - sf_sites):5d}")
+    print(f"   total fitted-but-unused        : {len(has_q - stations_all):5d}  (before MRMS-window)")
 
 
 if __name__ == "__main__":
