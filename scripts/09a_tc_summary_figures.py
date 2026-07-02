@@ -5,18 +5,24 @@ Summary bar charts for the fixed-Tc trigger analysis (08c).
 Reads analysis/event_confusion_matrix_tc.parquet, pools TP/FP/FN GLOBALLY (all
 stations together, no clusters) for the MRMS nearest-pixel source, and draws a
 3×1 multipanel figure — one row per flood target Q10 / Q50 / Q100.  Each panel is
-a grouped bar chart over the precipitation ARI thresholds; every ARI shows three
-bars — POD, FAR, CSI — with the value written above each bar.  A secondary
-(log) axis overlays the false-alarm FREQUENCY as a line: FAR is a ratio and
-stays nearly flat across thresholds, so it hides that the absolute number of
-false alarms collapses as the threshold rises — the frequency line shows that
-operational burden directly.
+a grouped bar chart over the precipitation ARI thresholds; every ARI shows two
+bounded skill bars — POD, CSI — with the value written above each bar.  A
+secondary (log) axis overlays the false-alarm RATE as two lines.
+
+FAR (false alarm RATIO) is deliberately NOT shown: it is a ratio that stays
+nearly flat across thresholds and hides that the absolute number of false alarms
+collapses as the threshold rises.  The false-alarm RATE (per time) on the
+secondary axis is the operational replacement — it shows the alarm burden
+directly and, unlike any bounded ratio, retains the per-year frequency.
 
 Metrics from pooled counts:
-    POD = TP / (TP + FN)      FAR = FP / (TP + FP)      CSI = TP / (TP + FP + FN)
-    False alarms / year (network) = Σ_i FP_i / T_i,  T_i = n_common_hours_i / 8766
-        — each station's own annual false-alarm rate, summed over all stations:
-          the nuisance-inspection volume per year INDOT would run fleet-wide.
+    POD = TP / (TP + FN)      CSI = TP / (TP + FP + FN)
+    False alarms / station-year = Σ FP / Σ station-years   (Σ n_common_hours / 8766)
+        — the transferable per-station rate (the 106 gauges are a calibration
+          sample; this is what scales to any deployed fleet).
+    Projected fleet false alarms / year = (per-station-year) × 758 scour-critical
+          bridges — the nuisance-inspection volume INDOT would run statewide
+          (assumes scour-critical bridges share the gauged basins' alarm rate).
 
 Output:
     s3://<bucket>/<prefix>analysis/figures/tc_summary_bars.png (+ .svg)
@@ -46,11 +52,15 @@ SOURCE = "nearest"                 # MRMS nearest pixel (global pool)
 FLOW_RPS = [10, 50, 100]
 EPS = 1e-9
 HOURS_PER_YEAR = 8766.0            # 365.25 d → station-years from window hours
+SCOUR_CRITICAL_BRIDGES = 758       # Indiana scour-critical bridges (fleet projection)
 INPUT_KEY = "analysis/event_confusion_matrix_tc.parquet"
 OUTPUT_KEY = "analysis/figures/tc_summary_bars"
 
-METRICS = [("POD", "#2c7fb8"), ("FAR", "#d95f0e"), ("CSI", "#31a354")]
-FA_COLOR = "#000000"               # false-alarm frequency (secondary axis)
+# FAR (false alarm RATIO) dropped — it is a ratio that stays flat across
+# thresholds and hides the alarm burden.  The false-alarm RATE (per time) on the
+# secondary axis replaces it.  Bars keep only the bounded 0-1 skill scores.
+METRICS = [("POD", "#2c7fb8"), ("CSI", "#31a354")]
+FA_COLOR = "#000000"               # false-alarm rate (secondary axis)
 
 
 def _read_parquet(bucket: str, key: str, columns=None) -> pd.DataFrame:
@@ -73,7 +83,7 @@ def main() -> None:
 
     precip_rps = sorted(df["precip_rp_yr"].unique())
     x = np.arange(len(precip_rps))
-    width = 0.26
+    width = 0.36
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
 
@@ -88,37 +98,45 @@ def main() -> None:
         tp, fp, fn = pooled["tp"], pooled["fp"], pooled["fn"]
         vals = {
             "POD": (tp / (tp + fn + EPS)).to_numpy(),
-            "FAR": (fp / (tp + fp + EPS)).to_numpy(),
             "CSI": (tp / (tp + fp + fn + EPS)).to_numpy(),
         }
         n_events = int(sub.groupby("site_no")["n_flow_events"].first().sum())
         n_stations = int(sub["site_no"].nunique())
 
         for k, (metric, color) in enumerate(METRICS):
-            offset = (k - 1) * width
+            offset = (k - (len(METRICS) - 1) / 2) * width
             ax.bar(x + offset, vals[metric], width, label=metric, color=color)
             for xi, v in zip(x + offset, vals[metric]):
                 ax.text(xi, v + 0.012, f"{v:.2f}", ha="center", va="bottom",
                         fontsize=7, rotation=90)
 
-        # ── false-alarm FREQUENCY (count, not ratio) on a secondary log axis ──
-        # FAR is a ratio and stays flat; the absolute alarm burden collapses as
-        # the threshold rises.  Network total = Σ_i FP_i / T_i  (each station's
-        # own annual rate, summed) = inspections/yr INDOT would run fleet-wide.
-        rate = sub.assign(
-            fa_year_i=sub["fp"] / (sub["n_common_hours"] / HOURS_PER_YEAR + EPS))
-        fa_year = (rate.groupby("precip_rp_yr")["fa_year_i"].sum()
-                       .reindex(precip_rps).fillna(0.0).to_numpy())
+        # ── false-alarm RATE (per time) on a secondary log axis ───────────────
+        # Replaces FAR.  Per-station-year rate = ΣFP / Σ station-years is the
+        # transferable unit; project to the scour-critical fleet by ×758.
+        station_years = float(
+            sub.groupby("site_no")["n_common_hours"].first().sum()) / HOURS_PER_YEAR
+        fa_station = (fp / (station_years + EPS)).to_numpy()        # per station-yr
+        fa_fleet = fa_station * SCOUR_CRITICAL_BRIDGES              # 758-bridge fleet
+
+        def _fmt(v: float) -> str:
+            return f"{v:.0f}" if v >= 10 else (f"{v:.1f}" if v >= 1 else f"{v:.2g}")
+
         ax2 = ax.twinx()
-        line, = ax2.plot(x, np.where(fa_year > 0, fa_year, np.nan),
+        line, = ax2.plot(x, np.where(fa_station > 0, fa_station, np.nan),
                          color=FA_COLOR, marker="o", ms=5, lw=1.6,
-                         label="False alarms / yr (all stations)")
+                         label="False alarms / station-yr")
+        line_fleet, = ax2.plot(x, np.where(fa_fleet > 0, fa_fleet, np.nan),
+                               color=FA_COLOR, marker="s", ms=4, lw=1.4, ls="--",
+                               label=f"Projected to {SCOUR_CRITICAL_BRIDGES} "
+                                     "scour-critical bridges / yr")
         ax2.set_yscale("log")
-        ax2.set_ylabel("False alarms per year\n(all stations, log)")
-        for xi, v in zip(x, fa_year):
-            if v > 0:
-                txt = f"{v:.0f}" if v >= 10 else (f"{v:.1f}" if v >= 1 else f"{v:.2g}")
-                ax2.annotate(txt, (xi, v), textcoords="offset points",
+        ax2.set_ylabel("False alarms per year (log)")
+        for xi, vs, vf in zip(x, fa_station, fa_fleet):
+            if vs > 0:
+                ax2.annotate(_fmt(vs), (xi, vs), textcoords="offset points",
+                             xytext=(7, 0), fontsize=6.5, color=FA_COLOR, va="center")
+            if vf > 0:
+                ax2.annotate(_fmt(vf), (xi, vf), textcoords="offset points",
                              xytext=(7, 0), fontsize=6.5, color=FA_COLOR, va="center")
 
         ax.set_ylim(0, 1.12)
@@ -131,8 +149,10 @@ def main() -> None:
         ax.grid(axis="y", ls=":", alpha=0.4)
         if row == 0:
             from matplotlib.patches import Patch
-            handles = [Patch(color=c, label=mname) for mname, c in METRICS] + [line]
-            ax.legend(handles=handles, ncol=4, loc="upper right", framealpha=0.9)
+            handles = ([Patch(color=c, label=mname) for mname, c in METRICS]
+                       + [line, line_fleet])
+            ax.legend(handles=handles, ncol=3, loc="upper right", fontsize=8,
+                      framealpha=0.9)
 
     axes[-1].set_xticks(x)
     axes[-1].set_xticklabels([f"P{int(r)}" for r in precip_rps])
