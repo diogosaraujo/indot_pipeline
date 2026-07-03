@@ -14,6 +14,16 @@ Coordinates come from the station inventory
     (stations/indiana_streamflow_sites.parquet): dec_lat_va / dec_long_va,
     decimal degrees in EPSG:4326 (WGS84).  GeoJSON opens directly in ArcGIS Pro.
 
+Nearest precipitation station:
+    Each exported point also carries the nearest NOAA hourly precip gauge
+    (ISD/LCD + GHCNh, the same networks scored by count_complete_precip_stations)
+    that has a (near-)complete record over the MRMS era 2002-2026 — at least 80%
+    of all hours in that window carry a precip value.  Coverage is measured the
+    same way as count_complete_precip_stations' "full-window" metric:
+    distinct hours with a non-NaN value / total hours in 2002-2026.  Added
+    properties: precip_site_id, precip_name, precip_source, precip_coverage_pct,
+    precip_dist_mi.
+
 Writes:
     ./exports/stations_08c.geojson                       (local, for ArcGIS)
     s3://<bucket>/<prefix>stations/stations_08c.geojson  (matches the other layers)
@@ -28,6 +38,7 @@ import logging
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from shapely.geometry import Point
@@ -49,10 +60,109 @@ LOCAL_GJ = Path("exports/stations_08c.geojson")
 ATTR_COLS = ["site_no", "station_nm", "dec_lat_va", "dec_long_va",
              "drain_area_va", "huc_cd", "begin_date", "end_date"]
 
+# ── Nearest-precip-station settings ───────────────────────────────────────────
+# NOAA hourly precip parquets (written by 12_download_noaa_precip); both carry
+# station_id / name / latitude / longitude / datetime_utc / precip_in.
+PRECIP_KEYS = {
+    "isd":   "precip/noaa/isd_hourly.parquet",
+    "ghcnh": "precip/noaa/ghcnh_hourly.parquet",
+}
+# MRMS era window — same as count_complete_precip_stations.
+PRECIP_START = pd.Timestamp("2002-01-01", tz="UTC")
+PRECIP_END   = pd.Timestamp("2026-06-30", tz="UTC")
+PRECIP_TOTAL_HOURS = int((PRECIP_END - PRECIP_START).total_seconds() // 3600) + 1
+# Minimum full-window coverage (% of all hours in 2002-2026 carrying a value).
+PRECIP_MIN_COVERAGE = 80.0
+EARTH_RADIUS_MI = 3958.7613
+
 
 def _read_parquet_s3(bucket: str, key: str, columns: list | None = None) -> pd.DataFrame:
     obj = s3_client().get_object(Bucket=bucket, Key=key)
     return pq.read_table(io.BytesIO(obj["Body"].read()), columns=columns).to_pandas()
+
+
+def qualifying_precip_stations(bucket: str, prefix: str) -> pd.DataFrame:
+    """Precip gauges with >= PRECIP_MIN_COVERAGE of the 2002-2026 window covered.
+
+    Coverage = distinct hours carrying a non-NaN precip value / total hours in
+    the window (the "full-window" metric of count_complete_precip_stations).
+    Returns one row per station_id with coordinates, name, source, coverage_pct.
+    """
+    frames: list[pd.DataFrame] = []
+    for src, key in PRECIP_KEYS.items():
+        try:
+            df = _read_parquet_s3(
+                bucket, f"{prefix}{key}",
+                columns=["station_id", "name", "latitude", "longitude",
+                         "datetime_utc", "precip_in"],
+            )
+        except Exception as e:                                   # noqa: BLE001
+            log.warning("Precip source %s unavailable, skipping: %s", src, e)
+            continue
+
+        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+        df = df[(df["datetime_utc"] >= PRECIP_START)
+                & (df["datetime_utc"] <= PRECIP_END)
+                & df["precip_in"].notna()]                       # hours with a value
+        if df.empty:
+            continue
+        df["hour"] = df["datetime_utc"].dt.floor("h")
+        cov = df.groupby("station_id").agg(
+            covered_hours=("hour", "nunique"),
+            latitude=("latitude", "first"),
+            longitude=("longitude", "first"),
+            name=("name", "first"),
+        ).reset_index()
+        cov["source"] = src
+        frames.append(cov)
+
+    if not frames:
+        return pd.DataFrame()
+
+    allcov = pd.concat(frames, ignore_index=True)
+    allcov["coverage_pct"] = (allcov["covered_hours"] / PRECIP_TOTAL_HOURS * 100).round(1)
+    allcov["latitude"]  = pd.to_numeric(allcov["latitude"], errors="coerce")
+    allcov["longitude"] = pd.to_numeric(allcov["longitude"], errors="coerce")
+    q = allcov[(allcov["coverage_pct"] >= PRECIP_MIN_COVERAGE)].copy()
+    q = q.dropna(subset=["latitude", "longitude"]).reset_index(drop=True)
+    return q
+
+
+def _haversine_mi(lat1, lon1, lat2, lon2):
+    """Great-circle distance in miles; lat2/lon2 may be arrays."""
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return 2 * EARTH_RADIUS_MI * np.arcsin(np.sqrt(a))
+
+
+def attach_nearest_precip(sub: pd.DataFrame, precip: pd.DataFrame) -> pd.DataFrame:
+    """Add the nearest qualifying precip gauge to each streamflow point."""
+    cols = ["precip_site_id", "precip_name", "precip_source",
+            "precip_coverage_pct", "precip_dist_mi"]
+    sub = sub.reset_index(drop=True)
+    if precip.empty:
+        log.warning("No precip stations meet the >= %.0f%% 2002-2026 coverage "
+                    "bar; nearest-precip columns will be empty.", PRECIP_MIN_COVERAGE)
+        for c in cols:
+            sub[c] = None
+        return sub
+
+    plat = precip["latitude"].to_numpy(dtype=float)
+    plon = precip["longitude"].to_numpy(dtype=float)
+    rows: list[dict] = []
+    for _, r in sub.iterrows():
+        d = _haversine_mi(r["dec_lat_va"], r["dec_long_va"], plat, plon)
+        j = int(np.argmin(d))
+        p = precip.iloc[j]
+        rows.append({
+            "precip_site_id":      str(p["station_id"]),
+            "precip_name":         p["name"],
+            "precip_source":       p["source"],
+            "precip_coverage_pct": float(p["coverage_pct"]),
+            "precip_dist_mi":      round(float(d[j]), 2),
+        })
+    return pd.concat([sub, pd.DataFrame(rows, columns=cols)], axis=1)
 
 
 def main() -> None:
@@ -86,13 +196,19 @@ def main() -> None:
         if col in sub.columns:
             sub[col] = pd.to_datetime(sub[col], errors="coerce").dt.strftime("%Y-%m-%d")
 
+    # ── 3. Nearest qualifying precip station per point ───────────────────────
+    precip = qualifying_precip_stations(bucket, prefix)
+    log.info("Precip gauges with >= %.0f%% 2002-2026 coverage: %d",
+             PRECIP_MIN_COVERAGE, len(precip))
+    sub = attach_nearest_precip(sub, precip)
+
     gdf = gpd.GeoDataFrame(
         sub,
         geometry=[Point(xy) for xy in zip(sub["dec_long_va"], sub["dec_lat_va"])],
         crs="EPSG:4326",
     )
 
-    # ── 3. Write GeoJSON — local (for ArcGIS) + S3 (matches other layers) ────
+    # ── 4. Write GeoJSON — local (for ArcGIS) + S3 (matches other layers) ────
     gj_bytes = gdf.to_json().encode()
 
     LOCAL_GJ.parent.mkdir(parents=True, exist_ok=True)
