@@ -24,9 +24,18 @@ Nearest precipitation station:
     properties: precip_site_id, precip_name, precip_source, precip_coverage_pct,
     precip_dist_mi.
 
-Writes:
-    ./exports/stations_08c.geojson                       (local, for ArcGIS)
-    s3://<bucket>/<prefix>stations/stations_08c.geojson  (matches the other layers)
+Writes (two layers, local for ArcGIS + S3 to match the other station layers):
+    ./exports/stations_08c.geojson
+    ./exports/precip_stations_08c.geojson
+    s3://<bucket>/<prefix>stations/stations_08c.geojson         (streamflow)
+    s3://<bucket>/<prefix>stations/precip_stations_08c.geojson  (paired precip)
+
+The streamflow layer carries the precip_* pairing columns; the precip layer has
+one point per gauge that was paired, with n_streamflow_paired.  Join the two on
+precip_site_id in ArcGIS to draw the pairings.
+
+GeoJSON is written via OGR (RFC 7946) so ArcGIS 'GeoJSON To Features' imports it
+cleanly — not GeoDataFrame.to_json(), whose NaN tokens can yield empty output.
 
 Usage:
     python scripts/export_stations_gis.py
@@ -53,8 +62,13 @@ log = logging.getLogger("export_gis")
 
 TC_KEY   = "analysis/event_confusion_matrix_tc.parquet"          # 08c output
 INV_KEY  = "stations/indiana_streamflow_sites.parquet"
-OUT_KEY  = "stations/stations_08c.geojson"                       # matches other layers
-LOCAL_GJ = Path("exports/stations_08c.geojson")
+
+# Two output layers: the evaluated streamflow stations, and the precip gauges
+# they were paired to. Both match the other station layers this pipeline writes.
+FLOW_OUT_KEY     = "stations/stations_08c.geojson"
+PRECIP_OUT_KEY   = "stations/precip_stations_08c.geojson"
+FLOW_LOCAL_GJ    = Path("exports/stations_08c.geojson")
+PRECIP_LOCAL_GJ  = Path("exports/precip_stations_08c.geojson")
 
 # Inventory attributes to carry onto each point.
 ATTR_COLS = ["site_no", "station_nm", "dec_lat_va", "dec_long_va",
@@ -165,6 +179,62 @@ def attach_nearest_precip(sub: pd.DataFrame, precip: pd.DataFrame) -> pd.DataFra
     return pd.concat([sub, pd.DataFrame(rows, columns=cols)], axis=1)
 
 
+def build_precip_layer(paired: pd.DataFrame, precip: pd.DataFrame) -> gpd.GeoDataFrame:
+    """One point per precip gauge that got paired to >= 1 streamflow station.
+
+    Carries the gauge's coverage plus n_streamflow_paired (how many evaluated
+    streamflow stations picked it as their nearest qualifying gauge).
+    """
+    empty = gpd.GeoDataFrame(
+        columns=["precip_site_id", "precip_name", "precip_source",
+                 "precip_coverage_pct", "n_streamflow_paired", "geometry"],
+        geometry="geometry", crs="EPSG:4326",
+    )
+    if precip.empty or "precip_site_id" not in paired.columns:
+        return empty
+    counts = (paired["precip_site_id"].dropna().astype(str)
+              .value_counts().rename("n_streamflow_paired"))
+    if counts.empty:
+        return empty
+
+    sel = precip.copy()
+    sel["station_id"] = sel["station_id"].astype(str)
+    sel = sel[sel["station_id"].isin(counts.index)]
+    sel = sel.merge(counts, left_on="station_id", right_index=True, how="left")
+
+    out = pd.DataFrame({
+        "precip_site_id":      sel["station_id"].values,
+        "precip_name":         sel["name"].values,
+        "precip_source":       sel["source"].values,
+        "precip_coverage_pct": pd.to_numeric(sel["coverage_pct"], errors="coerce").values,
+        "n_streamflow_paired": sel["n_streamflow_paired"].astype(int).values,
+    }).sort_values("precip_site_id").reset_index(drop=True)
+
+    return gpd.GeoDataFrame(
+        out,
+        geometry=[Point(xy) for xy in zip(sel["longitude"], sel["latitude"])],
+        crs="EPSG:4326",
+    )
+
+
+def write_geojson(gdf: gpd.GeoDataFrame, out_key: str, local_path: Path,
+                  bucket: str, prefix: str, label: str) -> None:
+    """Write a GeoDataFrame as GeoJSON locally (via OGR, for ArcGIS) and to S3.
+
+    OGR-driven output is RFC 7946 compliant — no invalid ``NaN`` tokens, which
+    is what makes ArcGIS 'GeoJSON To Features' silently drop everything.
+    """
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_path.exists():
+        local_path.unlink()                     # OGR GeoJSON will not overwrite
+    gdf.to_file(local_path, driver="GeoJSON")
+    log.info("Wrote local GeoJSON (%s): %s  [%d features]",
+             label, local_path.resolve(), len(gdf))
+
+    write_bytes_to_s3(local_path.read_bytes(), bucket, f"{prefix}{out_key}")
+    log.info("Wrote GeoJSON (%s): s3://%s/%s%s", label, bucket, prefix, out_key)
+
+
 def main() -> None:
     cfg    = load_config()
     bucket = cfg["aws"]["output_bucket"]
@@ -202,23 +272,22 @@ def main() -> None:
              PRECIP_MIN_COVERAGE, len(precip))
     sub = attach_nearest_precip(sub, precip)
 
-    gdf = gpd.GeoDataFrame(
+    # ── 4. Build the two layers ──────────────────────────────────────────────
+    flow_gdf = gpd.GeoDataFrame(
         sub,
         geometry=[Point(xy) for xy in zip(sub["dec_long_va"], sub["dec_lat_va"])],
         crs="EPSG:4326",
     )
+    precip_gdf = build_precip_layer(sub, precip)
 
-    # ── 4. Write GeoJSON — local (for ArcGIS) + S3 (matches other layers) ────
-    gj_bytes = gdf.to_json().encode()
+    # ── 5. Write GeoJSON — local (for ArcGIS) + S3 (matches other layers) ─────
+    write_geojson(flow_gdf,   FLOW_OUT_KEY,   FLOW_LOCAL_GJ,
+                  bucket, prefix, "streamflow stations")
+    write_geojson(precip_gdf, PRECIP_OUT_KEY, PRECIP_LOCAL_GJ,
+                  bucket, prefix, "paired precip stations")
 
-    LOCAL_GJ.parent.mkdir(parents=True, exist_ok=True)
-    LOCAL_GJ.write_bytes(gj_bytes)
-    log.info("Wrote local GeoJSON: %s", LOCAL_GJ.resolve())
-
-    write_bytes_to_s3(gj_bytes, bucket, f"{prefix}{OUT_KEY}")
-    log.info("Wrote GeoJSON: s3://%s/%s%s", bucket, prefix, OUT_KEY)
-
-    log.info("Done. %d stations exported.", len(gdf))
+    log.info("Done. %d streamflow stations, %d paired precip stations.",
+             len(flow_gdf), len(precip_gdf))
 
 
 if __name__ == "__main__":
