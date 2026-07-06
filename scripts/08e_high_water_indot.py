@@ -150,12 +150,13 @@ def assign_station(lat, lon, cov_start, cov_end, qual, hourly_by_sid):
 
 
 def max_accum(ser: pd.Series, earliest, latest) -> float:
-    grid = pd.date_range(earliest - pd.Timedelta(hours=BACK_COVER_H), latest,
-                         freq="1h", tz="UTC")
+    # Floor to the hour: event times carry sub-hour precision, but the station
+    # series is on the hour — an unfloored grid would align to nothing.
+    e0, l0 = earliest.floor("h"), latest.floor("h")
+    grid = pd.date_range(e0 - pd.Timedelta(hours=BACK_COVER_H), l0, freq="1h", tz="UTC")
     p = ser.reindex(grid).fillna(0.0)
     roll = p.rolling(DURATION_HR, min_periods=DURATION_HR).sum()
-    det = roll[(roll.index >= earliest - pd.Timedelta(hours=BACK_DETECT_H))
-               & (roll.index <= latest)]
+    det = roll[(roll.index >= e0 - pd.Timedelta(hours=BACK_DETECT_H)) & (roll.index <= l0)]
     return float(det.max()) if len(det) and np.isfinite(det.max()) else 0.0
 
 
@@ -184,8 +185,9 @@ def draw_example(fig, cell, ev, ser):
     inner = GridSpecFromSubplotSpec(2, 1, subplot_spec=cell, height_ratios=[2.2, 1.0], hspace=0.12)
     axp = fig.add_subplot(inner[0]); axr = fig.add_subplot(inner[1], sharex=axp)
 
-    vs, ve = earliest - pd.Timedelta(hours=72), latest + pd.Timedelta(hours=24)
-    grid = pd.date_range(earliest - pd.Timedelta(hours=BACK_COVER_H), latest, freq="1h", tz="UTC")
+    e0, l0 = earliest.floor("h"), latest.floor("h")
+    vs, ve = e0 - pd.Timedelta(hours=72), l0 + pd.Timedelta(hours=24)
+    grid = pd.date_range(e0 - pd.Timedelta(hours=BACK_COVER_H), l0, freq="1h", tz="UTC")
     roll = ser.reindex(grid).fillna(0.0).rolling(DURATION_HR, min_periods=DURATION_HR).sum()
     gv = pd.date_range(vs, ve, freq="1h", tz="UTC")
     pv, rv = ser.reindex(gv), roll.reindex(gv)
@@ -269,16 +271,18 @@ def main() -> None:
     log.info("Classified %d events: TP=%d  FN=%d  POD=%.0f%%  (no station: %d)",
              len(events), n_tp, n_fn, pod, n_no_station)
 
-    # 1) bar chart
-    bars_figure(n_tp, n_fn, bucket, f"{prefix}{HW_DIR}hw_classification_bars")
+    # ── Diagnostics: is 0 TP a real result or an assignment/coverage artefact? ──
+    accs = np.array([e["max_accum"] for e in events])
+    dists = np.array([e["dist_mi"] for e in events])
+    log.info("max 24-h accum (in):  min=%.2f  median=%.2f  p90=%.2f  max=%.2f  |  >=%.1f in: %d",
+             accs.min(), np.median(accs), np.percentile(accs, 90), accs.max(),
+             THRESH_IN, int((accs >= THRESH_IN).sum()))
+    log.info("assigned-station distance (mi):  median=%.1f  p90=%.1f  max=%.1f",
+             np.median(dists), np.percentile(dists, 90), dists.max())
+    log.info("events with ZERO accumulation (no precip in window): %d / %d",
+             int((accs == 0).sum()), len(accs))
 
-    # 2) example TP + FN (clearest exceedance / closest miss)
-    tps = [e for e in events if e["klass"] == "TP"]
-    fns = [e for e in events if e["klass"] == "FN"]
-    ev_tp = max(tps, key=lambda e: e["max_accum"]) if tps else None
-    ev_fn = max(fns, key=lambda e: e["max_accum"]) if fns else None
-    example_figure(ev_tp, ev_fn, hourly_by_sid, f"{prefix}{HW_DIR}hw_example_tp_fn")
-
+    # ── Data outputs FIRST (so they persist even if a figure errors) ──────────
     # 3) precip stations used
     used: dict = {}
     for e in events:
@@ -314,6 +318,17 @@ def main() -> None:
                           "sid", "dist_mi", "source", "max_accum", "klass")} for e in events])
     _put(bucket, f"{prefix}{HW_DIR}hw_classification.csv", csv.to_csv(index=False).encode(),
          "text/csv")
+
+    # ── Figures ───────────────────────────────────────────────────────────────
+    bars_figure(n_tp, n_fn, bucket, f"{prefix}{HW_DIR}hw_classification_bars")
+    tps = [e for e in events if e["klass"] == "TP"]
+    fns = [e for e in events if e["klass"] == "FN"]
+    ev_tp = max(tps, key=lambda e: e["max_accum"]) if tps else None
+    ev_fn = max(fns, key=lambda e: e["max_accum"]) if fns else None
+    try:
+        example_figure(ev_tp, ev_fn, hourly_by_sid, bucket, f"{prefix}{HW_DIR}hw_example_tp_fn")
+    except Exception as e:                                       # noqa: BLE001
+        log.warning("example figure failed (data outputs already written): %s", e)
     log.info("Done. Outputs under s3://%s/%s%s", bucket, prefix, HW_DIR)
 
 
