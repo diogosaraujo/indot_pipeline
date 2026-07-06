@@ -21,9 +21,8 @@ picture matches the analysis exactly.  The example station is auto-selected as
 the shortest-Tc gauge that has >=1 of TP, FP and FN at the chosen return-period
 pair (crisp hyetograph), or pass --site to override.
 
-Writes:
+Writes (S3 only):
     s3://<bucket>/<prefix>analysis/figures/confusion_case_examples.{png,svg}
-    ./exports/confusion_case_examples.{png,svg}
 
 Usage:
     python scripts/09e_confusion_case_examples.py
@@ -59,7 +58,6 @@ _spec.loader.exec_module(m)
 
 TC_KEY  = "analysis/event_confusion_matrix_tc.parquet"
 FIG_KEY = "analysis/figures/confusion_case_examples"
-LOCAL   = Path("exports/confusion_case_examples")
 
 CLR = {"TP": "#2e7d32", "FP": "#ef6c00", "FN": "#c62828", "TN": "#455a64"}
 DEF = {
@@ -283,15 +281,11 @@ def main() -> None:
         log.warning("No example found for: %s", ", ".join(missing))
     fig = build_figure(st, examples, site_no, args.precip_rp, args.flow_rp)
 
-    LOCAL.parent.mkdir(parents=True, exist_ok=True)
-    for ext, ctype in (("png", "image/png"), ("svg", "image/svg+xml")):
+    for ext in ("png", "svg"):
         buf = io.BytesIO()
         fig.savefig(buf, format=ext, dpi=170, bbox_inches="tight")
-        data = buf.getvalue()
-        (LOCAL.with_suffix(f".{ext}")).write_bytes(data)
-        write_bytes_to_s3(data, bucket, f"{prefix}{FIG_KEY}.{ext}")
-        log.info("Wrote %s and s3://%s/%s%s.%s",
-                 LOCAL.with_suffix(f".{ext}"), bucket, prefix, FIG_KEY, ext)
+        write_bytes_to_s3(buf.getvalue(), bucket, f"{prefix}{FIG_KEY}.{ext}")
+        log.info("Wrote s3://%s/%s%s.%s", bucket, prefix, FIG_KEY, ext)
     plt.close(fig)
 
 

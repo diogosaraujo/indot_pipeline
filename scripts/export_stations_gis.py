@@ -24,9 +24,7 @@ Nearest precipitation station:
     properties: precip_site_id, precip_name, precip_source, precip_coverage_pct,
     precip_dist_mi.
 
-Writes (two layers, local for ArcGIS + S3 to match the other station layers):
-    ./exports/stations_08c.geojson
-    ./exports/precip_stations_08c.geojson
+Writes (two layers to S3; download from S3 for ArcGIS):
     s3://<bucket>/<prefix>stations/stations_08c.geojson         (streamflow)
     s3://<bucket>/<prefix>stations/precip_stations_08c.geojson  (paired precip)
 
@@ -44,6 +42,7 @@ from __future__ import annotations
 
 import io
 import logging
+import tempfile
 from pathlib import Path
 
 import geopandas as gpd
@@ -67,8 +66,6 @@ INV_KEY  = "stations/indiana_streamflow_sites.parquet"
 # they were paired to. Both match the other station layers this pipeline writes.
 FLOW_OUT_KEY     = "stations/stations_08c.geojson"
 PRECIP_OUT_KEY   = "stations/precip_stations_08c.geojson"
-FLOW_LOCAL_GJ    = Path("exports/stations_08c.geojson")
-PRECIP_LOCAL_GJ  = Path("exports/precip_stations_08c.geojson")
 
 # Inventory attributes to carry onto each point.
 ATTR_COLS = ["site_no", "station_nm", "dec_lat_va", "dec_long_va",
@@ -217,22 +214,22 @@ def build_precip_layer(paired: pd.DataFrame, precip: pd.DataFrame) -> gpd.GeoDat
     )
 
 
-def write_geojson(gdf: gpd.GeoDataFrame, out_key: str, local_path: Path,
+def write_geojson(gdf: gpd.GeoDataFrame, out_key: str,
                   bucket: str, prefix: str, label: str) -> None:
-    """Write a GeoDataFrame as GeoJSON locally (via OGR, for ArcGIS) and to S3.
+    """Serialize a GeoDataFrame to GeoJSON (via OGR) and upload it to S3.
 
     OGR-driven output is RFC 7946 compliant — no invalid ``NaN`` tokens, which
-    is what makes ArcGIS 'GeoJSON To Features' silently drop everything.
+    is what makes ArcGIS 'GeoJSON To Features' silently drop everything.  OGR
+    needs a real file path, so we render to an ephemeral temp file and upload the
+    bytes; nothing persists locally (download from S3 for ArcGIS).
     """
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    if local_path.exists():
-        local_path.unlink()                     # OGR GeoJSON will not overwrite
-    gdf.to_file(local_path, driver="GeoJSON")
-    log.info("Wrote local GeoJSON (%s): %s  [%d features]",
-             label, local_path.resolve(), len(gdf))
-
-    write_bytes_to_s3(local_path.read_bytes(), bucket, f"{prefix}{out_key}")
-    log.info("Wrote GeoJSON (%s): s3://%s/%s%s", label, bucket, prefix, out_key)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir) / "layer.geojson"
+        gdf.to_file(tmp, driver="GeoJSON")
+        data = tmp.read_bytes()
+    write_bytes_to_s3(data, bucket, f"{prefix}{out_key}")
+    log.info("Wrote GeoJSON (%s): s3://%s/%s%s  [%d features]",
+             label, bucket, prefix, out_key, len(gdf))
 
 
 def main() -> None:
@@ -281,10 +278,8 @@ def main() -> None:
     precip_gdf = build_precip_layer(sub, precip)
 
     # ── 5. Write GeoJSON — local (for ArcGIS) + S3 (matches other layers) ─────
-    write_geojson(flow_gdf,   FLOW_OUT_KEY,   FLOW_LOCAL_GJ,
-                  bucket, prefix, "streamflow stations")
-    write_geojson(precip_gdf, PRECIP_OUT_KEY, PRECIP_LOCAL_GJ,
-                  bucket, prefix, "paired precip stations")
+    write_geojson(flow_gdf,   FLOW_OUT_KEY,   bucket, prefix, "streamflow stations")
+    write_geojson(precip_gdf, PRECIP_OUT_KEY, bucket, prefix, "paired precip stations")
 
     log.info("Done. %d streamflow stations, %d paired precip stations.",
              len(flow_gdf), len(precip_gdf))

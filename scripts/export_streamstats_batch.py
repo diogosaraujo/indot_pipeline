@@ -18,9 +18,9 @@ StreamStats stream grid.
 Reads:
     s3://<bucket>/<prefix>stations/indiana_streamflow_sites.parquet
 
-Writes (local):
-    streamstats_batches/streamstats_batch_01.zip
-    streamstats_batches/streamstats_batch_02.zip  (if > 250 stations)
+Writes (S3 only; download from S3 for the StreamStats uploader):
+    s3://<bucket>/<prefix>stations/streamstats_batches/streamstats_batch_01.zip
+    s3://<bucket>/<prefix>stations/streamstats_batches/streamstats_batch_02.zip  (if > 250 stations)
     ...
 """
 from __future__ import annotations
@@ -42,6 +42,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 log = logging.getLogger("export_streamstats_batch")
 
 BATCH_SIZE = 250
+S3_BATCH_FOLDER = "stations/streamstats_batches"
 
 
 def read_station_inventory(bucket: str, prefix: str) -> pd.DataFrame:
@@ -51,10 +52,9 @@ def read_station_inventory(bucket: str, prefix: str) -> pd.DataFrame:
     return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
 
 
-def export_streamstats_batch_shapefiles(df: pd.DataFrame, output_dir: str = "streamstats_batches") -> list[str]:
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
+def export_streamstats_batch_shapefiles(df: pd.DataFrame, bucket: str, prefix: str) -> list[str]:
+    """Build one zipped point shapefile per 250-station batch in memory and
+    upload each to S3 under ``<prefix>stations/streamstats_batches/``."""
     gdf = gpd.GeoDataFrame(
         df[["site_no"]].copy(),
         geometry=[Point(lon, lat) for lon, lat in zip(df["dec_long_va"], df["dec_lat_va"])],
@@ -62,30 +62,32 @@ def export_streamstats_batch_shapefiles(df: pd.DataFrame, output_dir: str = "str
     ).to_crs("EPSG:4269")
 
     n_batches = (len(gdf) + BATCH_SIZE - 1) // BATCH_SIZE
-    zip_paths: list[str] = []
+    keys: list[str] = []
 
     for i in range(n_batches):
         batch = gdf.iloc[i * BATCH_SIZE:(i + 1) * BATCH_SIZE].copy()
         batch_num = i + 1
-        zip_path = output_path / f"streamstats_batch_{batch_num:02d}.zip"
 
+        # OGR needs a real path, so render the shapefile parts into a temp dir,
+        # then zip them into an in-memory buffer (nothing persists locally).
+        buf = io.BytesIO()
         with tempfile.TemporaryDirectory() as tmpdir:
             shp_path = Path(tmpdir) / f"stations_batch_{batch_num:02d}.shp"
             batch.to_file(shp_path, driver="ESRI Shapefile")
-
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for ext in (".shp", ".shx", ".dbf", ".prj"):
                     f = shp_path.with_suffix(ext)
                     if f.exists():
                         zf.write(f, f.name)
 
-        log.info(
-            "Wrote %s  (%d points, batch %d/%d)",
-            zip_path, len(batch), batch_num, n_batches,
-        )
-        zip_paths.append(str(zip_path))
+        key = f"{prefix}{S3_BATCH_FOLDER}/streamstats_batch_{batch_num:02d}.zip"
+        s3_client().put_object(Bucket=bucket, Key=key, Body=buf.getvalue(),
+                               ContentType="application/zip")
+        log.info("Wrote s3://%s/%s  (%d points, batch %d/%d)",
+                 bucket, key, len(batch), batch_num, n_batches)
+        keys.append(key)
 
-    return zip_paths
+    return keys
 
 
 def main() -> None:
@@ -96,13 +98,11 @@ def main() -> None:
     sites = read_station_inventory(bucket, prefix)
     log.info("Loaded %d stations from S3", len(sites))
 
-    zip_paths = export_streamstats_batch_shapefiles(sites)
-    log.info(
-        "Done. %d zip file(s) written to streamstats_batches/:",
-        len(zip_paths),
-    )
-    for p in zip_paths:
-        log.info("  %s", p)
+    keys = export_streamstats_batch_shapefiles(sites, bucket, prefix)
+    log.info("Done. %d zip file(s) written to s3://%s/%s%s/:",
+             len(keys), bucket, prefix, S3_BATCH_FOLDER)
+    for k in keys:
+        log.info("  s3://%s/%s", bucket, k)
 
 
 if __name__ == "__main__":

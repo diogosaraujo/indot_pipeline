@@ -23,7 +23,8 @@ Classification of dropped stations:
     no_overlap              — has an MRMS series but spans don't intersect.
     no_flow                 — no streamflow rows (shouldn't happen; a gate).
 
-Prints a per-station table + summary, and writes exports/mrms_window_dropped.csv.
+Prints a per-station table + summary, and writes (S3 only)
+s3://<bucket>/<prefix>analysis/diagnostics/mrms_window_dropped.csv.
 
 Usage:
     python scripts/diagnose_mrms_window.py
@@ -35,7 +36,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from utils import load_config
+from utils import load_config, s3_client
 
 STAGE4_START = pd.Timestamp("2002-01-01", tz="UTC")   # earliest historical MRMS (Stage IV)
 
@@ -45,7 +46,7 @@ _spec = importlib.util.spec_from_file_location(
 m = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(m)
 
-OUT_CSV = Path("exports/mrms_window_dropped.csv")
+DROPPED_KEY = "analysis/diagnostics/mrms_window_dropped.csv"
 
 
 def _spans(df: pd.DataFrame) -> pd.DataFrame:
@@ -146,9 +147,10 @@ def main() -> None:
         with pd.option_context("display.max_rows", None, "display.width", 200):
             print(dropped.sort_values(["reason", "site_no"]).to_string(index=False))
 
-    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    dropped.sort_values(["reason", "site_no"]).to_csv(OUT_CSV, index=False)
-    print(f"\nWrote {OUT_CSV.resolve()}")
+    csv_bytes = dropped.sort_values(["reason", "site_no"]).to_csv(index=False).encode()
+    s3_client().put_object(Bucket=bucket, Key=f"{prefix}{DROPPED_KEY}",
+                           Body=csv_bytes, ContentType="text/csv")
+    print(f"\nWrote s3://{bucket}/{prefix}{DROPPED_KEY}")
 
 
 if __name__ == "__main__":
