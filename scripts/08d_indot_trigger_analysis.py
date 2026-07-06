@@ -19,11 +19,13 @@ the rural COOP network, whose winter accumulation lumps are kept — see
 load_and_qualify).  Stations are filtered to those with a DENSE hourly record
 (>= a coverage threshold over the 2002-present era — the same 'valid record near
 the gauge' set the earlier scripts identify), so we never brute-force every station
-per gauge.  Each gauge is then paired to its NEAREST such station whose record
-spans >= MIN_PERIOD_OVERLAP (80%) of the streamflow record's period, clipped to
-the 2002 precip era ([max(flow_start, 2002), flow_end]) — walking outward until
-one qualifies (distance is not gated; in-window missingness is recorded, not
-gated).  The analysis window is that clipped streamflow-station overlap.
+per gauge.  Each gauge is then paired to its NEAREST such station that carries a
+real hourly value for >= MIN_PERIOD_COVERAGE (80%) of the reference period — the
+streamflow record clipped to the 2002 precip era ([max(flow_start, 2002),
+flow_end]) — where MISSING hours count against the station, not just its span.
+Walk outward until one qualifies (distance is not gated).  The analysis window is
+that reference period.  The gauge set is restricted to the 08c stations so the
+INDOT-vs-08c comparison is on identical gauges.
 
 Per station we keep only the TP/FP/FN/TN counts (+ event counts and window QC).
 Skill metrics are computed GLOBALLY ONLY — the cells are pooled across all
@@ -79,6 +81,7 @@ PRECIP_THRESH_IN = 2.5                  # INDOT: fixed 2.5 in trigger
 ISD_KEY   = "precip/noaa/isd_hourly.parquet"    # LCD HourlyPrecipitation — hourly inches
 GHCNH_KEY = "precip/noaa/ghcnh_hourly.parquet"  # GHCNh precipitation — stored in MILLIMETRES
 INV_KEY   = "stations/indiana_streamflow_sites.parquet"
+TC_KEY    = "analysis/event_confusion_matrix_tc.parquet"   # 08c output — the gauges to compare against
 # (source name, S3 key, mm->inch divisor): GHCNh is millimetres, ISD already inches.
 PRECIP_SOURCES = [("isd", ISD_KEY, 1.0), ("ghcnh", GHCNH_KEY, 25.4)]
 
@@ -91,10 +94,10 @@ FIG_KEY     = "analysis/figures/indot_performance_diagram"
 ANALYSIS_ERA_START = "2002-01-01"   # coverage era floor (matches export_stations_gis)
 MIN_COVERAGE_PCT   = 50.0           # keep stations with >= this % hourly precip coverage of the era
 SANITY_MAX_IN      = 12.0           # reject stations with implausibly large hourly values
-MIN_PERIOD_OVERLAP = 0.80           # precip station must span >= this fraction of the streamflow
-                                    # record's period (clipped to start at the 2002 precip era);
-                                    # else walk to the next-nearest.  Distance is NOT gated;
-                                    # in-window missingness is recorded, not gated.
+MIN_PERIOD_COVERAGE = 0.80          # precip station must carry a REAL hourly value for >= this
+                                    # fraction of the reference period ([max(flow_start,2002),
+                                    # flow_end]) — counting missing hours, not just the record span;
+                                    # else walk to the next-nearest.  Distance is NOT gated.
 EARTH_MI = 3958.7613
 
 
@@ -242,32 +245,31 @@ def _haversine_mi(lat1, lon1, lat2, lon2):
 
 
 def assign_station(lat, lon, flow_start, flow_end, qual, hourly_by_sid):
-    """Pair the gauge to its NEAREST precip station whose record spans at least
-    MIN_PERIOD_OVERLAP of the reference period.  The reference period is the
-    streamflow record CLIPPED to the precip era: [max(flow_start, 2002), flow_end]
-    — so a pre-2002 gauge is judged over 2002→flow_end, a post-2002 gauge over its
-    own window.  Walk outward (2nd nearest, 3rd, …) past any station that doesn't
-    meet the overlap until one does; distance itself is not gated.  Returns None
-    only if NO station reaches the required overlap.
+    """Pair the gauge to its NEAREST precip station that carries a REAL hourly
+    value for at least MIN_PERIOD_COVERAGE of the reference period.  The reference
+    period is the streamflow record CLIPPED to the precip era,
+    [max(flow_start, 2002), flow_end] — pre-2002 gauge judged over 2002→flow_end,
+    post-2002 over its own window.  Coverage counts actual values, so MISSING
+    hours count against the station (not just its start/end span).  Walk outward
+    (2nd nearest, 3rd, …) until one meets the coverage; distance is not gated.
+    Returns None only if none reach it.
     Returns (station_id, dist_mi, win_start, win_end, precip_on_grid, miss_pct) | None."""
     ids = qual["station_id"].to_numpy()
     d = _haversine_mi(lat, lon, qual["latitude"].to_numpy(float), qual["longitude"].to_numpy(float))
     ref_start = max(flow_start, pd.Timestamp(ANALYSIS_ERA_START, tz="UTC"))
-    ref_dur = (flow_end - ref_start).total_seconds()
-    if ref_dur <= 0:
+    if flow_end <= ref_start:
         return None
+    grid = pd.date_range(ref_start, flow_end, freq="1h", tz="UTC")   # the whole reference period
     for idx in np.argsort(d):                          # nearest first
         ser = hourly_by_sid.get(ids[idx])
         if ser is None or ser.empty:
             continue
-        ws, we = max(ref_start, ser.index.min()), min(flow_end, ser.index.max())
-        overlap = (we - ws).total_seconds()
-        if overlap <= 0 or overlap / ref_dur < MIN_PERIOD_OVERLAP:   # too little overlap → next nearest
-            continue
-        grid = pd.date_range(ws, we, freq="1h", tz="UTC")
         p = ser.reindex(grid)                          # NaN = hours with no station value
-        miss = round(float(p.isna().mean()) * 100, 2)  # % of window hours missing (filled with 0 = dry)
-        return str(ids[idx]), float(d[idx]), ws, we, p.fillna(0.0), miss
+        cov = float(p.notna().mean())                  # fraction of reference-period hours with a value
+        if cov < MIN_PERIOD_COVERAGE:                  # too many missing hours → next nearest
+            continue
+        miss = round((1.0 - cov) * 100, 2)
+        return str(ids[idx]), float(d[idx]), ref_start, flow_end, p.fillna(0.0), miss
     return None
 
 
@@ -361,8 +363,16 @@ def main() -> None:
 
     q_cols = [f"Q{rp}" for rp in FLOW_RPS if f"Q{rp}" in flow_stats.columns]
     has_q = set(flow_stats.loc[flow_stats[q_cols].notna().any(axis=1), "site_no"])
-    universe = sorted(has_q & set(streamflow["site_no"]) & set(coords.index))
-    log.info("Universe (valid Q ∩ streamflow ∩ coords): %d", len(universe))
+    universe = has_q & set(streamflow["site_no"]) & set(coords.index)
+    # Restrict to the SAME gauges 08c (the proposed method) evaluated, so the
+    # INDOT-vs-08c comparison is on identical stations.
+    try:
+        tc = m._read_parquet_s3(bucket, f"{prefix}{TC_KEY}", columns=["site_no"])
+        universe &= set(tc["site_no"].astype(str))
+    except Exception as e:                               # noqa: BLE001
+        log.warning("Could not read 08c stations (%s) — using the full valid-Q universe", e)
+    universe = sorted(universe)
+    log.info("Universe (valid Q ∩ streamflow ∩ coords ∩ 08c set): %d", len(universe))
 
     log.info("Loading NOAA hourly precip (ISD + GHCNh; memory-lean Arrow)...")
     qual, hourly_by_sid = load_and_qualify(bucket, prefix)
@@ -393,10 +403,9 @@ def main() -> None:
         all_records.extend(recs)
         log.info("[%d/%d] %s ← %s (%.1f mi, %.0f%% missing): %d combos",
                  i, len(universe), site_no, sid, dist_mi, miss, len(recs))
-    log.info("Paired %d/%d gauges to their nearest station with >=%.0f%% period overlap "
-             "(%d had none — streamflow largely predates the 2002 precip era, "
-             "or lower MIN_PERIOD_OVERLAP)",
-             n_assigned, len(universe), MIN_PERIOD_OVERLAP * 100, n_no_station)
+    log.info("Paired %d/%d gauges to their nearest station with >=%.0f%% data coverage of the "
+             "reference period (%d had none — lower MIN_PERIOD_COVERAGE to pair more)",
+             n_assigned, len(universe), MIN_PERIOD_COVERAGE * 100, n_no_station)
 
     if not all_records:
         log.error("No results produced.")
