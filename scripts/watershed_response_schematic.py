@@ -45,7 +45,8 @@ def panel(ax, q, color, exceeds: bool):
     if exceeds:
         ax.fill_between(T, Q10, q, where=q > Q10, color=color, alpha=0.30)
     tag = "Q10 exceeded" if exceeds else "Q10 not reached"
-    ax.text(0.5, 1.78, tag, fontsize=12, color=color, fontweight="bold", va="top")
+    ax.text(47.5, 1.82, tag, fontsize=12, color=color, fontweight="bold",
+            va="top", ha="right")
 
     # 2.5 in storm (hangs from the top, same in both panels)
     axp = ax.twinx(); axp.axis("off"); axp.set_ylim(0, 2.4); axp.invert_yaxis()
