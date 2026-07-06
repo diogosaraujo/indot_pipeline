@@ -48,6 +48,9 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 from shapely.geometry import Point
 
@@ -92,40 +95,59 @@ def _read_parquet_s3(bucket: str, key: str, columns: list | None = None) -> pd.D
     return pq.read_table(io.BytesIO(obj["Body"].read()), columns=columns).to_pandas()
 
 
+_FS = None
+
+
+def _fs():
+    global _FS
+    if _FS is None:
+        _FS = pafs.S3FileSystem()
+    return _FS
+
+
 def qualifying_precip_stations(bucket: str, prefix: str) -> pd.DataFrame:
     """Precip gauges with >= PRECIP_MIN_COVERAGE of the 2002-2026 window covered.
 
     Coverage = distinct hours carrying a non-NaN precip value / total hours in
     the window (the "full-window" metric of count_complete_precip_stations).
-    Returns one row per station_id with coordinates, name, source, coverage_pct.
+    Computed in Arrow (group_by), so the full GHCNh table (~200M rows) is never
+    materialized as pandas objects — the old to_pandas() version OOM'd and
+    silently skipped GHCNh.  Returns one row per station_id with coordinates,
+    name, source, coverage_pct.  Only precip presence (not value) is used, so
+    GHCNh's millimetre units and COOP accumulation lumps don't matter here.
     """
+    start = pa.scalar(PRECIP_START, type=pa.timestamp("us", "UTC"))
+    end   = pa.scalar(PRECIP_END,   type=pa.timestamp("us", "UTC"))
     frames: list[pd.DataFrame] = []
     for src, key in PRECIP_KEYS.items():
         try:
-            df = _read_parquet_s3(
-                bucket, f"{prefix}{key}",
+            tbl = pq.read_table(
+                f"{bucket}/{prefix}{key}", filesystem=_fs(),
                 columns=["station_id", "name", "latitude", "longitude",
-                         "datetime_utc", "precip_in"],
-            )
+                         "datetime_utc", "precip_in"])
         except Exception as e:                                   # noqa: BLE001
             log.warning("Precip source %s unavailable, skipping: %s", src, e)
             continue
 
-        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
-        df = df[(df["datetime_utc"] >= PRECIP_START)
-                & (df["datetime_utc"] <= PRECIP_END)
-                & df["precip_in"].notna()]                       # hours with a value
-        if df.empty:
+        dt = pc.cast(tbl["datetime_utc"], pa.timestamp("us", "UTC"))
+        tbl = tbl.filter(pc.and_(pc.and_(pc.is_valid(tbl["precip_in"]),
+                                         pc.greater_equal(dt, start)),
+                                 pc.less_equal(dt, end)))
+        if tbl.num_rows == 0:
             continue
-        df["hour"] = df["datetime_utc"].dt.floor("h")
-        cov = df.groupby("station_id").agg(
-            covered_hours=("hour", "nunique"),
-            latitude=("latitude", "first"),
-            longitude=("longitude", "first"),
-            name=("name", "first"),
-        ).reset_index()
+        tbl = tbl.append_column(
+            "hour", pc.floor_temporal(pc.cast(tbl["datetime_utc"], pa.timestamp("us", "UTC")), unit="hour"))
+        covered = (tbl.select(["station_id", "hour"]).group_by(["station_id", "hour"]).aggregate([])
+                   .group_by("station_id").aggregate([("hour", "count")]).to_pandas())
+        meta = tbl.group_by("station_id").aggregate(
+            [("latitude", "min"), ("longitude", "min"), ("name", "min")]).to_pandas()
+        cov = covered.merge(meta, on="station_id").rename(columns={
+            "hour_count": "covered_hours", "latitude_min": "latitude",
+            "longitude_min": "longitude", "name_min": "name"})
+        cov["station_id"] = cov["station_id"].astype(str)
         cov["source"] = src
         frames.append(cov)
+        log.info("Precip source %s: %d stations with data", src, len(cov))
 
     if not frames:
         return pd.DataFrame()

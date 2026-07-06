@@ -5,7 +5,7 @@ INDOT current-procedure version of the event-overlap confusion matrix.
 Where 08c tests the PROPOSED trigger (nearest MRMS pixel, Kirpich-Tc duration,
 Atlas-14 depth), this script tests INDOT's CURRENT operational rule:
 
-    precip source   : nearest hourly weather station (NOAA ISD/LCD; see load_precip)
+    precip source   : nearest hourly weather station (NOAA ISD/LCD + GHCNh; see load_and_qualify)
     accumulation    : trailing 24 hours          (FIXED, not Tc)
     trigger depth   : 2.5 in                       (FIXED, not Atlas-14 / return period)
     flood           : hourly streamflow >= Q(flow_rp)   (Q10 / Q50 / Q100)
@@ -14,13 +14,16 @@ Everything else — event grouping, +/-24 h linking, episodes, TP/FN/FP/TN — i
 IDENTICAL to 08 (helpers are imported from it, not reimplemented), so the flood
 side is directly comparable to 08c.
 
-Precip is ISD/LCD hourly inches (GHCNh adds only ~2-6 duplicate airport stations
-and its own unit/accumulation problems — see load_precip).  Stations are filtered
-to those with a DENSE hourly record (>= a coverage threshold over the 2002-present
-era — the same 'valid record near the gauge' set the earlier scripts identify), so
-we never brute-force every station per gauge.  Each gauge is matched to the nearest
-qualifying station whose record overlaps the streamflow by >= MIN_OVERLAP_YEARS
-with acceptable in-window missingness; the analysis window is that overlap.
+Precip is ISD/LCD + GHCNh hourly inches (GHCNh is millimetres → converted; it adds
+the rural COOP network, whose winter accumulation lumps are kept — see
+load_and_qualify).  Stations are filtered to those with a DENSE hourly record
+(>= a coverage threshold over the 2002-present era — the same 'valid record near
+the gauge' set the earlier scripts identify), so we never brute-force every station
+per gauge.  Each gauge is then paired to its NEAREST such station whose record
+spans >= MIN_PERIOD_OVERLAP (80%) of the streamflow record's period, clipped to
+the 2002 precip era ([max(flow_start, 2002), flow_end]) — walking outward until
+one qualifies (distance is not gated; in-window missingness is recorded, not
+gated).  The analysis window is that clipped streamflow-station overlap.
 
 Per station we keep only the TP/FP/FN/TN counts (+ event counts and window QC).
 Skill metrics are computed GLOBALLY ONLY — the cells are pooled across all
@@ -53,6 +56,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.fs as pafs
+import pyarrow.parquet as pq
 
 from utils import load_config, s3_client, write_bytes_to_s3, write_parquet_to_s3
 
@@ -70,7 +77,10 @@ FLOW_RPS   = m.FLOW_RPS                 # Q10 / Q50 / Q100
 DURATION_HR = 24                        # INDOT: trailing 24-hour accumulation
 PRECIP_THRESH_IN = 2.5                  # INDOT: fixed 2.5 in trigger
 ISD_KEY   = "precip/noaa/isd_hourly.parquet"    # LCD HourlyPrecipitation — hourly inches
+GHCNH_KEY = "precip/noaa/ghcnh_hourly.parquet"  # GHCNh precipitation — stored in MILLIMETRES
 INV_KEY   = "stations/indiana_streamflow_sites.parquet"
+# (source name, S3 key, mm->inch divisor): GHCNh is millimetres, ISD already inches.
+PRECIP_SOURCES = [("isd", ISD_KEY, 1.0), ("ghcnh", GHCNH_KEY, 25.4)]
 
 MAX_HOURLY_IN = 10.0            # clip implausible hourly values (sentinels / bad reports) to NaN
 OUTPUT_KEY  = "analysis/event_confusion_matrix_indot.parquet"
@@ -79,10 +89,12 @@ FIG_KEY     = "analysis/figures/indot_performance_diagram"
 
 # Station-eligibility knobs
 ANALYSIS_ERA_START = "2002-01-01"   # coverage era floor (matches export_stations_gis)
-MIN_COVERAGE_PCT   = 50.0           # keep ISD stations with >= this % hourly precip coverage of the era
-MIN_OVERLAP_YEARS  = 2.0            # station record must overlap the streamflow record this long
-MAX_MISSING_PCT    = 35.0           # skip a gauge if its nearest station is emptier than this in-window
+MIN_COVERAGE_PCT   = 50.0           # keep stations with >= this % hourly precip coverage of the era
 SANITY_MAX_IN      = 12.0           # reject stations with implausibly large hourly values
+MIN_PERIOD_OVERLAP = 0.80           # precip station must span >= this fraction of the streamflow
+                                    # record's period (clipped to start at the 2002 precip era);
+                                    # else walk to the next-nearest.  Distance is NOT gated;
+                                    # in-window missingness is recorded, not gated.
 EARTH_MI = 3958.7613
 
 
@@ -102,33 +114,124 @@ def skill(tp: int, fp: int, fn: int, tn: int) -> dict:
 
 # ---------- Precip: load, qualify, assign ----------
 
-def _load_precip_source(bucket: str, prefix: str, key: str) -> pd.DataFrame:
-    df = m._read_parquet_s3(bucket, f"{prefix}{key}",
-                            columns=["station_id", "datetime_utc", "latitude", "longitude", "precip_in"])
-    df["station_id"]   = df["station_id"].astype(str)
-    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
-    df["precip_in"]    = pd.to_numeric(df["precip_in"], errors="coerce")
-    return df
+_FS: "pafs.S3FileSystem | None" = None
 
 
-def load_precip(bucket: str, prefix: str) -> pd.DataFrame:
-    """Hourly precip in INCHES.  ISD/LCD only.
+def _fs() -> "pafs.S3FileSystem":
+    global _FS
+    if _FS is None:
+        _FS = pafs.S3FileSystem()
+    return _FS
 
-    GHCNh was evaluated and dropped.  Its only clean hourly stations are the
-    automated airports (report type FM-15/16 = USW/USI), which are the SAME sites
-    as ISD: over 2002-present they add just ~2-6 unique well-covered stations
-    (~68 -> ~70 at 50% coverage) while dragging in GHCNh's millimetre units and
-    COOP daily-accumulation records that its own metadata cannot reliably flag.
-    ISD/LCD is clean hourly inches and already covers the airport network, so it
-    is the trustworthy source.  (To expand to the rural COOP network, the correct
-    path is the native NCEI HPD/TD-3240 product, which keeps the accumulation
-    flag — a separate ingestion, not a GHCNh tweak.)
+
+def _to_inches(col, divisor: float):
+    """Cast precip to float64 inches (÷divisor for mm sources) and null out any
+    value above MAX_HOURLY_IN (gross multi-day dumps / sentinels)."""
+    p = pc.cast(col, pa.float64())
+    if divisor != 1.0:
+        p = pc.divide(p, divisor)
+    return pc.if_else(pc.greater(p, MAX_HOURLY_IN), pa.scalar(None, pa.float64()), p)
+
+
+def _coverage_one(path: str, era, divisor: float):
+    """Per-station coverage for one precip source, computed in Arrow so the full
+    (up to ~200M-row) table is never materialized as pandas objects.  Returns
+    (DataFrame[station_id, covered, latitude, longitude, max_in], max_hour)."""
+    tbl = pq.read_table(path, filesystem=_fs(),
+                        columns=["station_id", "datetime_utc", "latitude", "longitude", "precip_in"])
+    dt = pc.cast(tbl["datetime_utc"], pa.timestamp("us", "UTC"))
+    tbl = tbl.set_column(tbl.schema.get_field_index("precip_in"),
+                         "precip_in", _to_inches(tbl["precip_in"], divisor))
+    tbl = tbl.filter(pc.and_(pc.is_valid(tbl["precip_in"]), pc.greater_equal(dt, era)))
+    if tbl.num_rows == 0:
+        return None, None
+    tbl = tbl.append_column(
+        "hour", pc.floor_temporal(pc.cast(tbl["datetime_utc"], pa.timestamp("us", "UTC")), unit="hour"))
+    covered = (tbl.select(["station_id", "hour"]).group_by(["station_id", "hour"]).aggregate([])
+               .group_by("station_id").aggregate([("hour", "count")]).to_pandas())
+    meta = tbl.group_by("station_id").aggregate(
+        [("latitude", "min"), ("longitude", "min"), ("precip_in", "max")]).to_pandas()
+    cov = covered.merge(meta, on="station_id").rename(columns={
+        "hour_count": "covered", "latitude_min": "latitude",
+        "longitude_min": "longitude", "precip_in_max": "max_in"})
+    cov["station_id"] = cov["station_id"].astype(str)
+    mh = pd.Timestamp(pc.max(tbl["hour"]).as_py())
+    mh = mh.tz_localize("UTC") if mh.tzinfo is None else mh.tz_convert("UTC")
+    return cov, mh
+
+
+def _hourly_one(path: str, era, divisor: float, qual_ids: list) -> dict:
+    """{station_id: per-hour-max precip Series (inches)} for the qualifying stations
+    of one source, via a FILTERED read so only those stations' rows are loaded."""
+    tbl = pq.read_table(path, filesystem=_fs(),
+                        columns=["station_id", "datetime_utc", "precip_in"],
+                        filters=[("station_id", "in", list(qual_ids))])
+    if tbl.num_rows == 0:
+        return {}
+    dt = pc.cast(tbl["datetime_utc"], pa.timestamp("us", "UTC"))
+    tbl = tbl.set_column(tbl.schema.get_field_index("precip_in"),
+                         "precip_in", _to_inches(tbl["precip_in"], divisor))
+    tbl = tbl.filter(pc.and_(pc.is_valid(tbl["precip_in"]), pc.greater_equal(dt, era)))
+    if tbl.num_rows == 0:
+        return {}
+    tbl = tbl.append_column(
+        "hour", pc.floor_temporal(pc.cast(tbl["datetime_utc"], pa.timestamp("us", "UTC")), unit="hour"))
+    h = tbl.group_by(["station_id", "hour"]).aggregate([("precip_in", "max")]).to_pandas()
+    out: dict = {}
+    for sid, g in h.groupby("station_id"):
+        s = g.set_index("hour")["precip_in_max"].sort_index()
+        s.index = pd.to_datetime(s.index, utc=True)
+        out[str(sid)] = s
+    return out
+
+
+def load_and_qualify(bucket: str, prefix: str):
+    """Load ISD + GHCNh, keep the well-covered stations, and build their hourly
+    series — all memory-lean (Arrow coverage pass + a filtered re-read for the
+    qualifying subset), so GHCNh's ~200M rows don't OOM the box.
+
+    GHCNh is stored in MILLIMETRES (÷25.4 here) and adds the rural COOP network,
+    whose winter records carry daily/accumulation lumps.  Those lumps are kept on
+    purpose: for a 24-h/2.5-in trigger a single-day lump preserves the 24-h total,
+    and rare multi-day snowmelt lumps only add a few benign false alarms; values
+    above MAX_HOURLY_IN (gross dumps / sentinels) are dropped.
     """
-    isd = _load_precip_source(bucket, prefix, ISD_KEY)
-    isd["source"] = "isd"
-    isd.loc[isd["precip_in"] > MAX_HOURLY_IN, "precip_in"] = np.nan
-    log.info("Precip: ISD %d rows, %d stations", len(isd), isd["station_id"].nunique())
-    return isd
+    era = pd.Timestamp(ANALYSIS_ERA_START, tz="UTC")
+    era_sc = pa.scalar(era, type=pa.timestamp("us", "UTC"))
+    covs, present, max_hours = [], [], []
+    for name, key, div in PRECIP_SOURCES:
+        try:
+            cov, mh = _coverage_one(f"{bucket}/{prefix}{key}", era_sc, div)
+        except Exception as e:                            # noqa: BLE001
+            log.warning("Precip source %s unavailable: %s", name, e)
+            continue
+        if cov is None or cov.empty:
+            continue
+        cov["source"] = name
+        covs.append(cov); present.append((name, key, div))
+        if mh is not None:
+            max_hours.append(mh)
+        log.info("%s: %d stations with data", name, len(cov))
+    if not covs:
+        raise SystemExit("No precip sources available.")
+
+    era_end = max(max_hours)
+    total_hours = int((era_end - era).total_seconds() // 3600) + 1
+    cov = pd.concat(covs, ignore_index=True)
+    cov["coverage_pct"] = (cov["covered"] / total_hours * 100).round(1)
+    qual = cov[(cov["coverage_pct"] >= MIN_COVERAGE_PCT)
+               & (cov["max_in"] <= SANITY_MAX_IN)
+               & cov["latitude"].notna() & cov["longitude"].notna()].reset_index(drop=True)
+    log.info("Precip stations: %d with data, %d qualifying (>=%.0f%% coverage %d–%s) by source %s",
+             cov["station_id"].nunique(), len(qual), MIN_COVERAGE_PCT, era.year, era_end.date(),
+             qual["source"].value_counts().to_dict())
+
+    hourly_by_sid: dict = {}
+    for name, key, div in present:
+        ids = qual.loc[qual["source"] == name, "station_id"].tolist()
+        if ids:
+            hourly_by_sid.update(_hourly_one(f"{bucket}/{prefix}{key}", era_sc, div, ids))
+    return qual, hourly_by_sid
 
 
 def _haversine_mi(lat1, lon1, lat2, lon2):
@@ -138,65 +241,33 @@ def _haversine_mi(lat1, lon1, lat2, lon2):
     return 2 * EARTH_MI * np.arcsin(np.sqrt(a))
 
 
-def qualifying_stations(precip: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Stations with a DENSE hourly precip record, plus their hourly series.
-
-    Coverage = distinct hours carrying a non-NaN precip value over the analysis
-    era (ANALYSIS_ERA_START → data end) / total hours in that era — the same
-    'full-window' coverage metric used by export_stations_gis and
-    count_complete_precip_stations.  Pre-filtering to well-covered stations
-    removes the temperature-only / sparse sites up front, so we never assign
-    (and then discard) an empty station per gauge.  The hourly series (per-hour
-    max, skip-NaN — matches 08.resample_station_precip) are built in one groupby
-    so the per-gauge loop does no table scans.
-
-    Returns (catalogue with station_id/latitude/longitude/coverage_pct,
-             {station_id: hourly precip Series}).
-    """
-    era_start = pd.Timestamp(ANALYSIS_ERA_START, tz="UTC")
-    era_end = precip["datetime_utc"].max()
-    total_hours = int((era_end - era_start).total_seconds() // 3600) + 1
-
-    valued = precip[precip["precip_in"].notna() & (precip["datetime_utc"] >= era_start)].copy()
-    valued["hour"] = valued["datetime_utc"].dt.floor("h")
-    cov = valued.groupby("station_id").agg(
-        covered=("hour", "nunique"),
-        latitude=("latitude", "first"),
-        longitude=("longitude", "first"),
-        max_in=("precip_in", "max"),
-    )
-    cov["coverage_pct"] = (cov["covered"] / total_hours * 100).round(1)
-    qual = cov[(cov["coverage_pct"] >= MIN_COVERAGE_PCT)
-               & (cov["max_in"] <= SANITY_MAX_IN)
-               & cov["latitude"].notna() & cov["longitude"].notna()]
-    log.info("Precip stations: %d with data, %d qualifying (>=%.0f%% hourly coverage %d–%s)",
-             len(cov), len(qual), MIN_COVERAGE_PCT, era_start.year, era_end.date())
-
-    sub = valued[valued["station_id"].isin(set(qual.index))]
-    hourly = sub.groupby(["station_id", "hour"])["precip_in"].max()
-    hourly_by_sid = {sid: s.droplevel(0).sort_index() for sid, s in hourly.groupby(level=0)}
-    return qual.reset_index(), hourly_by_sid
-
-
 def assign_station(lat, lon, flow_start, flow_end, qual, hourly_by_sid):
-    """Nearest qualifying ISD station whose hourly record overlaps the streamflow
-    by >= MIN_OVERLAP_YEARS with in-window missingness <= MAX_MISSING_PCT.
+    """Pair the gauge to its NEAREST precip station whose record spans at least
+    MIN_PERIOD_OVERLAP of the reference period.  The reference period is the
+    streamflow record CLIPPED to the precip era: [max(flow_start, 2002), flow_end]
+    — so a pre-2002 gauge is judged over 2002→flow_end, a post-2002 gauge over its
+    own window.  Walk outward (2nd nearest, 3rd, …) past any station that doesn't
+    meet the overlap until one does; distance itself is not gated.  Returns None
+    only if NO station reaches the required overlap.
     Returns (station_id, dist_mi, win_start, win_end, precip_on_grid, miss_pct) | None."""
     ids = qual["station_id"].to_numpy()
     d = _haversine_mi(lat, lon, qual["latitude"].to_numpy(float), qual["longitude"].to_numpy(float))
-    min_win = pd.Timedelta(days=365.25 * MIN_OVERLAP_YEARS)
-    for idx in np.argsort(d):
+    ref_start = max(flow_start, pd.Timestamp(ANALYSIS_ERA_START, tz="UTC"))
+    ref_dur = (flow_end - ref_start).total_seconds()
+    if ref_dur <= 0:
+        return None
+    for idx in np.argsort(d):                          # nearest first
         ser = hourly_by_sid.get(ids[idx])
         if ser is None or ser.empty:
             continue
-        ws, we = max(flow_start, ser.index.min()), min(flow_end, ser.index.max())
-        if we - ws < min_win:
+        ws, we = max(ref_start, ser.index.min()), min(flow_end, ser.index.max())
+        overlap = (we - ws).total_seconds()
+        if overlap <= 0 or overlap / ref_dur < MIN_PERIOD_OVERLAP:   # too little overlap → next nearest
             continue
         grid = pd.date_range(ws, we, freq="1h", tz="UTC")
-        p = ser.reindex(grid)
-        miss = round(float(p.isna().mean()) * 100, 2)
-        if miss <= MAX_MISSING_PCT:
-            return str(ids[idx]), float(d[idx]), ws, we, p.fillna(0.0), miss
+        p = ser.reindex(grid)                          # NaN = hours with no station value
+        miss = round(float(p.isna().mean()) * 100, 2)  # % of window hours missing (filled with 0 = dry)
+        return str(ids[idx]), float(d[idx]), ws, we, p.fillna(0.0), miss
     return None
 
 
@@ -259,7 +330,7 @@ def performance_diagram(pooled: pd.DataFrame, bucket: str, prefix: str) -> None:
     ax.set_xlabel("Success ratio  (1 − FAR)", fontsize=12)
     ax.set_ylabel("Probability of detection (POD)", fontsize=12)
     ax.text(0.985, 0.03, "frequency-bias lines", fontsize=8, color="0.4", ha="right", style="italic")
-    ax.set_title("INDOT current flood trigger — nearest ISD gauge, 24-h ≥ 2.5 in\n"
+    ax.set_title("INDOT current flood trigger — nearest ISD/GHCNh gauge, 24-h ≥ 2.5 in\n"
                  "performance diagram (dashed = bias, shaded = CSI)",
                  fontsize=12, fontweight="bold")
     ax.legend(loc="upper right", fontsize=8.5, framealpha=0.95)
@@ -293,10 +364,8 @@ def main() -> None:
     universe = sorted(has_q & set(streamflow["site_no"]) & set(coords.index))
     log.info("Universe (valid Q ∩ streamflow ∩ coords): %d", len(universe))
 
-    log.info("Loading NOAA ISD hourly precip (this is the big one)...")
-    precip = load_precip(bucket, prefix)
-    qual, hourly_by_sid = qualifying_stations(precip)
-    del precip                                           # free the big frame
+    log.info("Loading NOAA hourly precip (ISD + GHCNh; memory-lean Arrow)...")
+    qual, hourly_by_sid = load_and_qualify(bucket, prefix)
 
     # Precompute per-gauge hourly streamflow and Q-threshold rows ONCE — no
     # repeated full-table scans of the streamflow/ISD frames inside the loop.
@@ -324,8 +393,10 @@ def main() -> None:
         all_records.extend(recs)
         log.info("[%d/%d] %s ← %s (%.1f mi, %.0f%% missing): %d combos",
                  i, len(universe), site_no, sid, dist_mi, miss, len(recs))
-    log.info("Assigned a qualifying station to %d/%d gauges (%d had none within record)",
-             n_assigned, len(universe), n_no_station)
+    log.info("Paired %d/%d gauges to their nearest station with >=%.0f%% period overlap "
+             "(%d had none — streamflow largely predates the 2002 precip era, "
+             "or lower MIN_PERIOD_OVERLAP)",
+             n_assigned, len(universe), MIN_PERIOD_OVERLAP * 100, n_no_station)
 
     if not all_records:
         log.error("No results produced.")
