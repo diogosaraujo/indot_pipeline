@@ -49,13 +49,17 @@ from __future__ import annotations
 
 import io
 import logging
+import shutil
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional
 
-import botocore.exceptions
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 import requests
 
@@ -179,30 +183,39 @@ def fetch_ghcnh_stations() -> pd.DataFrame:
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
-def _read_parquet_s3(bucket: str, key: str) -> Optional[pd.DataFrame]:
+_S3FS: "pafs.S3FileSystem | None" = None
+
+
+def _s3fs() -> "pafs.S3FileSystem":
+    global _S3FS
+    if _S3FS is None:
+        _S3FS = pafs.S3FileSystem()
+    return _S3FS
+
+
+def _to_utc(v):
+    t = pd.Timestamp(v)
+    return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+
+
+def _existing_bounds(bucket: str, key: str) -> tuple[dict, dict]:
+    """Per-station (max_datetime, min_datetime) for the gap-fill, read with only
+    the two needed columns so we never materialize the whole (up to ~200M-row)
+    hourly table in memory.  Returns ({sid: max}, {sid: min}); empty if absent."""
     try:
-        obj = s3_client().get_object(Bucket=bucket, Key=key)
-        return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
-            return None
-        raise
-
-
-def get_max_dates(df: Optional[pd.DataFrame]) -> dict:
-    if df is None or df.empty:
-        return {}
-    df = df.copy()
-    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
-    return df.groupby("station_id")["datetime_utc"].max().to_dict()
-
-
-def get_min_dates(df: Optional[pd.DataFrame]) -> dict:
-    if df is None or df.empty:
-        return {}
-    df = df.copy()
-    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
-    return df.groupby("station_id")["datetime_utc"].min().to_dict()
+        tbl = pq.read_table(f"{bucket}/{key}", filesystem=_s3fs(),
+                            columns=["station_id", "datetime_utc"])
+    except (FileNotFoundError, OSError):
+        return {}, {}
+    if tbl.num_rows == 0:
+        return {}, {}
+    agg = tbl.group_by("station_id").aggregate(
+        [("datetime_utc", "max"), ("datetime_utc", "min")])
+    sids = agg.column("station_id").to_pylist()
+    maxs = agg.column("datetime_utc_max").to_pylist()
+    mins = agg.column("datetime_utc_min").to_pylist()
+    return ({s: _to_utc(m) for s, m in zip(sids, maxs) if m is not None},
+            {s: _to_utc(m) for s, m in zip(sids, mins) if m is not None})
 
 
 def _find_col(columns: list[str], candidates: list[str]) -> Optional[str]:
@@ -397,33 +410,73 @@ def download_all(
     return pd.concat(frames, ignore_index=True)
 
 
+def _row_keys(tbl: "pa.Table") -> "pa.Array":
+    """station_id@epoch key for de-duplication on (station_id, datetime_utc)."""
+    sid = pc.cast(tbl.column("station_id"), pa.string())
+    ep  = pc.cast(pc.cast(tbl.column("datetime_utc"), pa.timestamp("us", "UTC")), pa.int64())
+    return pc.binary_join_element_wise(sid, pc.cast(ep, pa.string()), "@").combine_chunks()
+
+
 def _merge_and_write(
     new_df: pd.DataFrame,
-    existing: Optional[pd.DataFrame],
-    stations_meta: pd.DataFrame,
     bucket: str,
     key: str,
+    stations_meta: pd.DataFrame,
     label: str,
 ) -> None:
-    if new_df.empty and (existing is None or existing.empty):
-        log.info("%s: nothing to write.", label)
+    """Merge freshly-downloaded rows into the existing hourly parquet and write it
+    back — STREAMING one row-group at a time, so peak memory stays ~one batch plus
+    the (small) new rows rather than the whole 200M-row table.  The pandas
+    concat+drop_duplicates+sort_values version OOM-killed the process on GHCNh.
+
+    Existing rows whose (station_id, datetime_utc) also appear in the new batch are
+    dropped so the new value wins (matches the old keep="last").  Output is not
+    globally re-sorted; downstream loaders sort as needed.
+    """
+    if new_df is None or new_df.empty:
+        log.info("%s: no new rows; leaving existing parquet unchanged.", label)
         return
 
-    if not new_df.empty:
-        meta_cols = [c for c in ["station_id", "name", "latitude", "longitude"] if c in stations_meta.columns]
-        new_df = new_df.merge(stations_meta[meta_cols], on="station_id", how="left")
+    meta_cols = [c for c in ["station_id", "name", "latitude", "longitude"]
+                 if c in stations_meta.columns]
+    new_df = new_df.merge(stations_meta[meta_cols], on="station_id", how="left")
+    new_df["datetime_utc"] = pd.to_datetime(new_df["datetime_utc"], utc=True)
 
-    parts = [p for p in [existing, new_df] if p is not None and not p.empty]
-    combined = pd.concat(parts, ignore_index=True)
-    combined["datetime_utc"] = pd.to_datetime(combined["datetime_utc"], utc=True)
-    combined = (
-        combined
-        .drop_duplicates(subset=["station_id", "datetime_utc"], keep="last")
-        .sort_values(["station_id", "datetime_utc"])
-        .reset_index(drop=True)
-    )
-    write_parquet_to_s3(combined, bucket, key)
-    log.info("%s: wrote %d rows for %d stations.", label, len(combined), combined["station_id"].nunique())
+    fs = _s3fs()
+    s3_path = f"{bucket}/{key}"
+    try:
+        pf = pq.ParquetFile(fs.open_input_file(s3_path))
+        schema, have_existing = pf.schema_arrow, True
+    except (FileNotFoundError, OSError):
+        pf, schema, have_existing = None, None, False
+
+    if have_existing:
+        new_tbl = pa.Table.from_pandas(
+            new_df[[f.name for f in schema]], schema=schema, preserve_index=False)
+    else:
+        new_tbl = pa.Table.from_pandas(new_df, preserve_index=False)
+        schema = new_tbl.schema
+
+    new_keys = _row_keys(new_tbl)
+    tmpdir = tempfile.mkdtemp(prefix="noaa_merge_")
+    tmp = f"{tmpdir}/out.parquet"
+    n = 0
+    try:
+        with pq.ParquetWriter(tmp, schema, compression="zstd") as w:
+            if have_existing:
+                for batch in pf.iter_batches(batch_size=1_000_000):
+                    bt = pa.Table.from_batches([batch], schema=pf.schema_arrow)
+                    bt = bt.filter(pc.invert(pc.is_in(_row_keys(bt), value_set=new_keys)))
+                    if bt.num_rows:
+                        w.write_table(bt)
+                        n += bt.num_rows
+            w.write_table(new_tbl)
+            n += new_tbl.num_rows
+        s3_client().upload_file(tmp, bucket, key)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    log.info("%s: wrote %d rows (streamed, +%d new) to s3://%s/%s",
+             label, n, len(new_df), bucket, key)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -456,14 +509,10 @@ def main() -> None:
     log.info("ISD stations in watershed: %d", len(isd_stations))
     write_parquet_to_s3(isd_stations, bucket, f"{prefix}precip/noaa/stations_isd.parquet")
 
-    existing_isd  = _read_parquet_s3(bucket, f"{prefix}precip/noaa/isd_hourly.parquet")
-    max_dates_isd = get_max_dates(existing_isd)
-    min_dates_isd = get_min_dates(existing_isd)
+    isd_key = f"{prefix}precip/noaa/isd_hourly.parquet"
+    max_dates_isd, min_dates_isd = _existing_bounds(bucket, isd_key)
     new_isd = download_all(isd_stations, "isd", start_dt, end_dt, max_dates_isd, min_dates_isd, max_workers)
-    _merge_and_write(
-        new_isd, existing_isd, isd_stations,
-        bucket, f"{prefix}precip/noaa/isd_hourly.parquet", "ISD/LCD",
-    )
+    _merge_and_write(new_isd, bucket, isd_key, isd_stations, "ISD/LCD")
 
     # ── GHCNh ──────────────────────────────────────────────────────────────
     log.info("Fetching GHCNh station list from NCEI...")
@@ -473,14 +522,10 @@ def main() -> None:
         log.info("GHCNh stations in watershed: %d", len(ghcnh_stations))
         write_parquet_to_s3(ghcnh_stations, bucket, f"{prefix}precip/noaa/stations_ghcnh.parquet")
 
-        existing_ghcnh  = _read_parquet_s3(bucket, f"{prefix}precip/noaa/ghcnh_hourly.parquet")
-        max_dates_ghcnh = get_max_dates(existing_ghcnh)
-        min_dates_ghcnh = get_min_dates(existing_ghcnh)
+        ghcnh_key = f"{prefix}precip/noaa/ghcnh_hourly.parquet"
+        max_dates_ghcnh, min_dates_ghcnh = _existing_bounds(bucket, ghcnh_key)
         new_ghcnh = download_all(ghcnh_stations, "ghcnh", start_dt, end_dt, max_dates_ghcnh, min_dates_ghcnh, max_workers)
-        _merge_and_write(
-            new_ghcnh, existing_ghcnh, ghcnh_stations,
-            bucket, f"{prefix}precip/noaa/ghcnh_hourly.parquet", "GHCNh",
-        )
+        _merge_and_write(new_ghcnh, bucket, ghcnh_key, ghcnh_stations, "GHCNh")
     except Exception as e:
         log.error("GHCNh section failed: %s", e)
 
