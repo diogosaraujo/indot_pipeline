@@ -16,3 +16,9 @@ Thumbs.db
 checkpoints/
 tmp/
 temp/
+
+# Generated outputs go to S3, never to the repo
+exports/
+streamstats_batches/
+mrms_shards_nearest/
+mrms_shards_watershed/
