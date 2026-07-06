@@ -234,7 +234,10 @@ def example_figure(ev_tp, ev_fn, hourly_by_sid, bucket, key_stem):
 # ---------- main ----------
 
 def main() -> None:
-    argparse.ArgumentParser(description=__doc__).parse_args()
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--tp-id", default=None, help="roadway_event_id for the TP example (default: auto)")
+    ap.add_argument("--fn-id", default=None, help="roadway_event_id for the FN example (default: auto)")
+    args = ap.parse_args()
     cfg = load_config()
     bucket, prefix = cfg["aws"]["output_bucket"], cfg["aws"]["output_prefix"]
 
@@ -323,8 +326,28 @@ def main() -> None:
     bars_figure(n_tp, n_fn, bucket, f"{prefix}{HW_DIR}hw_classification_bars")
     tps = [e for e in events if e["klass"] == "TP"]
     fns = [e for e in events if e["klass"] == "FN"]
-    ev_tp = max(tps, key=lambda e: e["max_accum"]) if tps else None
-    ev_fn = max(fns, key=lambda e: e["max_accum"]) if fns else None
+
+    def _by_id(pool, rid):
+        hit = [e for e in pool if str(e["roadway_event_id"]) == str(rid)]
+        if not hit:
+            log.warning("event id %s not in that class — using auto pick", rid)
+        return hit[0] if hit else None
+
+    def _rep_fn(pool):
+        # Representative miss: visible rain but comfortably below threshold and,
+        # by taking the MEDIAN of that band, not a borderline near-miss that gets
+        # cropped at the window edge.
+        band = sorted((e for e in pool if 0.3 <= e["max_accum"] <= 0.8 * THRESH_IN),
+                      key=lambda e: e["max_accum"]) or sorted(pool, key=lambda e: e["max_accum"])
+        return band[len(band) // 2] if band else None
+
+    ev_tp = (_by_id(tps, args.tp_id) if args.tp_id else None) \
+        or (max(tps, key=lambda e: e["max_accum"]) if tps else None)
+    ev_fn = (_by_id(fns, args.fn_id) if args.fn_id else None) or _rep_fn(fns)
+    if ev_tp:
+        log.info("TP example: event %s (max accum %.2f in)", ev_tp["roadway_event_id"], ev_tp["max_accum"])
+    if ev_fn:
+        log.info("FN example: event %s (max accum %.2f in)", ev_fn["roadway_event_id"], ev_fn["max_accum"])
     try:
         example_figure(ev_tp, ev_fn, hourly_by_sid, bucket, f"{prefix}{HW_DIR}hw_example_tp_fn")
     except Exception as e:                                       # noqa: BLE001
