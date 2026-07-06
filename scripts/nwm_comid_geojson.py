@@ -20,6 +20,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import logging
@@ -37,8 +38,9 @@ INV_KEY   = "stations/indiana_streamflow_sites.parquet"
 CL_KEY    = "nwm/comid_locations.parquet"
 RETRO_KEY = "nwm/retrospective.parquet"
 AA_KEY    = "nwm/analysis_assim.parquet"
-REACH_OUT = "analysis/nwm/nwm_reaches.geojson"
-OUTLET_OUT = "analysis/nwm/nwm_comid_outlets.geojson"
+TC_KEY    = "analysis/event_confusion_matrix_tc.parquet"   # 08c analysis stations
+REACH_STEM  = "analysis/nwm/nwm_reaches"
+OUTLET_STEM = "analysis/nwm/nwm_comid_outlets"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("nwm_geojson")
@@ -78,6 +80,11 @@ def fetch_flowline(comid: int, timeout: int):
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--analysis-only", action="store_true",
+                    help="restrict to the 08c analysis stations; write *_analysis.geojson")
+    args = ap.parse_args()
+
     cfg = load_config()
     bucket, prefix = cfg["aws"]["output_bucket"], cfg["aws"]["output_prefix"]
     timeout = cfg["streamstats"]["request_timeout_sec"]
@@ -90,6 +97,36 @@ def main() -> None:
 
     retro_c = _unique_comids(bucket, prefix, RETRO_KEY)
     aa_c    = _unique_comids(bucket, prefix, AA_KEY)
+
+    suffix = ""
+    if args.analysis_only:
+        asites = set(_pq(bucket, f"{prefix}{TC_KEY}", ["site_no"])["site_no"].astype(str))
+        resolved = set(cl["site_no"])
+        site_comid = dict(zip(cl["site_no"], cl["comid"]))
+        res_a     = asites & resolved
+        with_retro = {s for s in res_a if site_comid[s] in retro_c}
+        with_aa    = {s for s in res_a if site_comid[s] in aa_c}
+        no_comid   = sorted(asites - resolved)
+        no_retro   = sorted(s for s in res_a if site_comid[s] not in retro_c)
+
+        print("\n=== NWM coverage of the 08c analysis stations ===")
+        print(f"  analysis stations (08c)          : {len(asites)}")
+        print(f"  with a resolved COMID            : {len(res_a)}")
+        print(f"  with NWM retrospective data      : {len(with_retro)}")
+        print(f"  with NWM analysis_assim data     : {len(with_aa)}")
+        complete = len(with_retro) == len(asites)
+        print(f"  COMPLETE retrospective coverage? : {'YES' if complete else 'NO'}")
+        if no_comid:
+            print(f"  no COMID ({len(no_comid)}): {no_comid}")
+        if no_retro:
+            print(f"  COMID but no retro ({len(no_retro)}): {no_retro}")
+        print()
+
+        cl = cl[cl["site_no"].isin(asites)]
+        suffix = "_analysis"
+
+    reach_out  = f"{REACH_STEM}{suffix}.geojson"
+    outlet_out = f"{OUTLET_STEM}{suffix}.geojson"
 
     # one record per COMID (a COMID may serve >1 gauge)
     by_comid = cl.groupby("comid").agg(
@@ -129,22 +166,23 @@ def main() -> None:
                              "geometry": {"type": "Point", "coordinates": [outlet[0], outlet[1]]},
                              "properties": props})
 
-    for key, feats in [(REACH_OUT, reach_feats), (OUTLET_OUT, outlet_feats)]:
+    for key, feats in [(reach_out, reach_feats), (outlet_out, outlet_feats)]:
         body = json.dumps({"type": "FeatureCollection", "features": feats}, indent=1).encode()
         s3_client().put_object(Bucket=bucket, Key=f"{prefix}{key}", Body=body,
                                ContentType="application/geo+json")
         log.info("Wrote s3://%s/%s%s (%d features)", bucket, prefix, key, len(feats))
 
-    # ── coverage funnel ──
-    print("\n=== NWM coverage funnel ===")
+    # ── coverage funnel (for the set being exported) ──
+    scope = "08c analysis stations" if suffix else "all inventory"
+    print(f"\n=== NWM export funnel ({scope}) ===")
     print(f"  inventory stations              : {n_inv}")
-    print(f"  COMIDs resolved (comid_locations): {cl['site_no'].nunique()} stations, "
+    print(f"  COMIDs exported                  : {cl['site_no'].nunique()} stations, "
           f"{cl['comid'].nunique()} distinct COMIDs")
-    print(f"  COMIDs with retrospective data   : {len(retro_c)}")
-    print(f"  COMIDs with analysis_assim data  : {len(aa_c)}")
+    print(f"  COMIDs with retrospective data   : {len(retro_c)} (global)")
+    print(f"  COMIDs with analysis_assim data  : {len(aa_c)} (global)")
     print(f"  flowline geometry fetched        : {len(geoms)} / {len(by_comid)}")
-    print(f"\nDownload:  aws s3 cp s3://{bucket}/{prefix}{REACH_OUT} .")
-    print(f"           aws s3 cp s3://{bucket}/{prefix}{OUTLET_OUT} .")
+    print(f"\nDownload:  aws s3 cp s3://{bucket}/{prefix}{reach_out} .")
+    print(f"           aws s3 cp s3://{bucket}/{prefix}{outlet_out} .")
 
 
 if __name__ == "__main__":
