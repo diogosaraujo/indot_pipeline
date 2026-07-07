@@ -42,6 +42,7 @@ Schema (precip_iv.parquet):
 """
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import logging
@@ -277,6 +278,15 @@ def process_station(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--site", action="append", metavar="SITE_NO",
+                    help="download ONLY this USGS site number (repeatable). Skips the NWIS "
+                         "inventory refresh and does NOT overwrite stations.parquet / "
+                         "stations_active.parquet — it only gap-fills precip_iv.parquet for "
+                         "the requested site(s). Example: --site 03294500")
+    args = ap.parse_args()
+    target_sites = [str(s).strip() for s in args.site] if args.site else None
+
     cfg         = load_config()
     bucket      = cfg["aws"]["output_bucket"]
     prefix      = cfg["aws"]["output_prefix"]
@@ -292,30 +302,54 @@ def main() -> None:
     else:
         log.warning("API_USGS_PAT not set; requests may be more rate-limited")
 
-    # ── Watershed polygon ──────────────────────────────────────────────────
-    log.info("Building watershed union from S3...")
-    polygon = build_watershed_union(bucket, prefix)
-    if polygon is not None:
-        log.info("Watershed union loaded.")
+    # ── Station set ────────────────────────────────────────────────────────
+    if target_sites:
+        # Targeted refresh: reuse the EXISTING inventory for metadata; never
+        # re-query NWIS for the full inventory and never overwrite it.
+        log.info("Targeted refresh for site(s) %s — inventory NOT refreshed.", target_sites)
+        inv = _read_parquet_s3(bucket, f"{prefix}precip/usgs/stations.parquet")
+        if inv is not None:
+            inv["site_no"] = inv["site_no"].astype(str)
+            stations = inv[inv["site_no"].isin(target_sites)].reset_index(drop=True)
+        else:
+            stations = pd.DataFrame(columns=["site_no", "station_nm", "latitude", "longitude"])
+        missing = [s for s in target_sites if s not in set(stations.get("site_no", []))]
+        if missing:
+            log.warning("Site(s) %s not in stations.parquet — querying NWIS for their metadata.",
+                        missing)
+            extra = fetch_usgs_precip_stations()
+            extra["site_no"] = extra["site_no"].astype(str)
+            stations = pd.concat(
+                [stations, extra[extra["site_no"].isin(missing)]], ignore_index=True
+            ).drop_duplicates("site_no").reset_index(drop=True)
+        if stations.empty:
+            log.error("No metadata found for %s — aborting.", target_sites)
+            return
+        log.info("Refreshing %d site(s): %s", len(stations), list(stations["site_no"]))
     else:
-        log.info("No watershed files — using Indiana bounding box.")
+        # ── Full inventory refresh (default) ───────────────────────────────
+        log.info("Building watershed union from S3...")
+        polygon = build_watershed_union(bucket, prefix)
+        if polygon is not None:
+            log.info("Watershed union loaded.")
+        else:
+            log.info("No watershed files — using Indiana bounding box.")
 
-    # ── Station inventory ──────────────────────────────────────────────────
-    log.info("Fetching USGS precipitation site inventory...")
-    all_stations = fetch_usgs_precip_stations()
-    stations = filter_by_polygon(all_stations, polygon, fallback_bbox=INDIANA_BBOX)
-    log.info("Precipitation sites in watershed: %d / %d", len(stations), len(all_stations))
+        log.info("Fetching USGS precipitation site inventory...")
+        all_stations = fetch_usgs_precip_stations()
+        stations = filter_by_polygon(all_stations, polygon, fallback_bbox=INDIANA_BBOX)
+        log.info("Precipitation sites in watershed: %d / %d", len(stations), len(all_stations))
 
-    if stations.empty:
-        log.warning("No USGS precipitation sites found — exiting.")
-        return
+        if stations.empty:
+            log.warning("No USGS precipitation sites found — exiting.")
+            return
 
-    write_parquet_to_s3(stations, bucket, f"{prefix}precip/usgs/stations.parquet")
-    log.info("Wrote station inventory: s3://%s/%sprecip/usgs/stations.parquet", bucket, prefix)
+        write_parquet_to_s3(stations, bucket, f"{prefix}precip/usgs/stations.parquet")
+        log.info("Wrote station inventory: s3://%s/%sprecip/usgs/stations.parquet", bucket, prefix)
 
-    geojson_key = f"{prefix}precip/usgs/stations.geojson"
-    write_bytes_to_s3(stations_to_geojson(stations), bucket, geojson_key)
-    log.info("Wrote station GeoJSON:   s3://%s/%s", bucket, geojson_key)
+        geojson_key = f"{prefix}precip/usgs/stations.geojson"
+        write_bytes_to_s3(stations_to_geojson(stations), bucket, geojson_key)
+        log.info("Wrote station GeoJSON:   s3://%s/%s", bucket, geojson_key)
 
     # ── Data download (concurrent) ─────────────────────────────────────────
     existing = _read_parquet_s3(bucket, f"{prefix}precip/usgs/precip_iv.parquet")
@@ -381,7 +415,8 @@ def main() -> None:
         final_df = combined
 
     # ── Active stations (stations with any record in 2026) ────────────────
-    if final_df is not None and not final_df.empty:
+    # Skipped in targeted (--site) mode so the full stations_active list is preserved.
+    if final_df is not None and not final_df.empty and not target_sites:
         final_df["datetime_utc"] = pd.to_datetime(final_df["datetime_utc"], utc=True)
         active_site_nos = set(
             final_df.loc[final_df["datetime_utc"].dt.year >= 2026, "site_no"].unique()
