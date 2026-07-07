@@ -2,12 +2,14 @@
 
 Matched-ARI version of 09a_tc_summary_figures.py.
 
-Where 09a draws ONE figure per flood target with bars over ALL precipitation ARIs,
-this draws a SINGLE figure showing only the MATCHED precip ARI per target:
+09a draws ONE figure per flood target with bars over ALL precipitation ARIs.  This
+draws the SAME thing — one figure per flood target — but keeps only the MATCHED
+precip ARI:
 
-    P10 → Q10 ,  P50 → Q50 ,  P100 → Q100      (nearest-MRMS source, global pool)
+    Q10 figure → P10 bars ,  Q50 figure → P50 bars ,  Q100 figure → P100 bars
+    (nearest-MRMS source, accumulation at the station Kirpich Tc, global pool)
 
-Each flood target shows four bars, with the same definitions as 09a:
+Each figure shows four bars, identical definitions to 09a:
     POD, FAR, CSI  → left y-axis   (bounded skill scores)
     FAF            → right y-axis  (false alarms per station-year, log scale)
 
@@ -17,8 +19,8 @@ Each flood target shows four bars, with the same definitions as 09a:
 Reads:
     s3://<bucket>/<prefix>analysis/event_confusion_matrix_tc.parquet   (08c)
 
-Writes:
-    s3://<bucket>/<prefix>analysis/figures/tc_matched_summary_bars.{png,svg}
+Writes (one per flood target):
+    s3://<bucket>/<prefix>analysis/figures/tc_matched_bars_Q{10,50,100}.{png,svg}
 
 Usage:
     python scripts/09a2_tc_matched_bars.py
@@ -54,63 +56,59 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("09a2_matched")
 
 FLOW_RPS    = [10, 50, 100]
-OUTPUT_STEM = "analysis/figures/tc_matched_summary_bars"
+OUTPUT_STEM = "analysis/figures/tc_matched_bars_Q"
 
 
-def make_figure(rows: list[dict], bucket: str, prefix: str) -> None:
-    rps   = [r["rp"] for r in rows]
-    x     = np.arange(len(rps))
+def make_figure(rp: int, m: dict, bucket: str, prefix: str) -> None:
+    """One figure for one flood target: POD/FAR/CSI (left) + FAF (right, log) for
+    the matched precip ARI, same layout as a single 09a bar group."""
+    x = np.array([0.0])
     width = 0.20
-    fig, ax = plt.subplots(figsize=(9, 5.6))
+    fig, ax = plt.subplots(figsize=(6.5, 5.6))
     ax2 = ax.twinx()
 
     # left-axis skill bars: POD, FAR, CSI
     for k, (metric, color) in enumerate(m09a.LEFT_METRICS):
-        off  = (k - 1.5) * width
-        vals = [r[metric] for r in rows]
-        ax.bar(x + off, vals, width, color=color)
-        for xi, v in zip(x + off, vals):
-            ax.text(xi, v + 0.015, f"{v:.2f}", ha="center", va="bottom",
-                    fontsize=11, rotation=90)
+        off = (k - 1.5) * width
+        v = m[metric]
+        ax.bar(x + off, [v], width, color=color)
+        ax.text(x[0] + off, v + 0.015, f"{v:.2f}", ha="center", va="bottom",
+                fontsize=12, rotation=90)
 
-    # right-axis FAF bar (log), drawn from a small floor so bars are visible
-    faf = np.array([r["FAF"] for r in rows])
-    pos = faf[faf > 0]
-    floor = max(pos.min() / 5.0, 1e-3) if pos.size else 1e-3
+    # right-axis FAF bar (log), from a small floor so it is visible
+    faf = m["FAF"]
+    floor = max(faf / 5.0, 1e-3) if faf > 0 else 1e-3
     ax2.set_yscale("log")
     off_faf = 1.5 * width
-    ax2.bar(x + off_faf, np.where(faf > 0, faf, floor) - floor, width, bottom=floor,
-            color=m09a.FAF_COLOR)
-    for xi, v in zip(x + off_faf, faf):
-        if v > 0:
-            ax2.annotate(m09a._fmt(v), (xi, v), textcoords="offset points", xytext=(0, 3),
-                         ha="center", fontsize=10, color=m09a.FAF_COLOR, rotation=90)
-    ax2.set_ylim(floor, (pos.max() * 4 if pos.size else 1))
+    ax2.bar(x + off_faf, [max(faf, floor) - floor], width, bottom=floor, color=m09a.FAF_COLOR)
+    if faf > 0:
+        ax2.annotate(m09a._fmt(faf), (x[0] + off_faf, faf), textcoords="offset points",
+                     xytext=(0, 3), ha="center", fontsize=11, color=m09a.FAF_COLOR, rotation=90)
+    ax2.set_ylim(floor, max(faf * 4, floor * 10))
 
     ax.set_ylim(0, 1.18)
+    ax.set_xlim(-0.6, 0.6)
     ax.set_zorder(ax2.get_zorder() + 1); ax.patch.set_visible(False)
     ax.set_ylabel("Skill score", fontsize=15)
     ax2.set_ylabel("FAF (false alarms / station-yr)", fontsize=15, color=m09a.FAF_COLOR)
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"Q{r['rp']}\n(P{r['rp']})" for r in rows], fontsize=14)
+    ax.set_xticks([0]); ax.set_xticklabels([f"P{rp} @ Tc"], fontsize=14)
     ax.tick_params(axis="y", labelsize=13)
     ax2.tick_params(axis="y", labelsize=13, colors=m09a.FAF_COLOR)
-    ax.set_xlabel("Flood target  (matched precipitation ARI)", fontsize=15)
     ax.grid(axis="y", ls=":", alpha=0.4)
 
-    handles = [Patch(color=c, label=mname) for mname, c in m09a.LEFT_METRICS] + \
+    handles = [Patch(color=c, label=mn) for mn, c in m09a.LEFT_METRICS] + \
               [Patch(color=m09a.FAF_COLOR, label="FAF")]
-    ax.legend(handles=handles, ncol=4, loc="upper right", fontsize=13, framealpha=0.9)
-    n_ev = "  ".join(f"Q{r['rp']}: {r['n_events']} ev" for r in rows)
-    ax.set_title(f"Matched precip-ARI trigger (P = Q) — global pool, MRMS nearest\n"
-                 f"{rows[0]['n_stations']} stations   |   {n_ev}", fontsize=15)
+    ax.legend(handles=handles, ncol=4, loc="upper right", fontsize=11, framealpha=0.9)
+    ax.set_title(f"Q{rp} flood target — matched precip ARI P{rp} @ Tc\n"
+                 f"{m['n_events']} events across {m['n_stations']} stations "
+                 f"(global pool, MRMS nearest)", fontsize=13)
     fig.tight_layout()
 
     for ext in ("png", "svg"):
         buf = io.BytesIO()
         fig.savefig(buf, format=ext, dpi=150, bbox_inches="tight")
-        write_bytes_to_s3(buf.getvalue(), bucket, f"{prefix}{OUTPUT_STEM}.{ext}")
-        log.info("Saved s3://%s/%s%s.%s", bucket, prefix, OUTPUT_STEM, ext)
+        write_bytes_to_s3(buf.getvalue(), bucket, f"{prefix}{OUTPUT_STEM}{rp}.{ext}")
+        log.info("Saved s3://%s/%s%s%d.%s", bucket, prefix, OUTPUT_STEM, rp, ext)
     plt.close(fig)
 
 
@@ -126,7 +124,6 @@ def main() -> None:
         log.error("No %s rows in %s", m09a.SOURCE, m09a.INPUT_KEY)
         return
 
-    rows: list[dict] = []
     for rp in FLOW_RPS:
         sub = df[(df["flow_rp_yr"] == rp) & (df["precip_rp_yr"] == rp)]
         if sub.empty:
@@ -134,22 +131,17 @@ def main() -> None:
             continue
         tp = float(sub["tp"].sum()); fp = float(sub["fp"].sum()); fn = float(sub["fn"].sum())
         station_years = float(sub.groupby("site_no")["n_common_hours"].first().sum()) / m09a.HOURS_PER_YEAR
-        rows.append({
-            "rp":         rp,
+        m = {
             "POD":        tp / (tp + fn + m09a.EPS),
             "FAR":        fp / (tp + fp + m09a.EPS),
             "CSI":        tp / (tp + fp + fn + m09a.EPS),
             "FAF":        fp / (station_years + m09a.EPS),
             "n_events":   int(sub.groupby("site_no")["n_flow_events"].first().sum()),
             "n_stations": int(sub["site_no"].nunique()),
-        })
+        }
         log.info("Q%d (P%d): POD=%.2f FAR=%.2f CSI=%.2f FAF=%.2f/stn-yr",
-                 rp, rp, rows[-1]["POD"], rows[-1]["FAR"], rows[-1]["CSI"], rows[-1]["FAF"])
-
-    if not rows:
-        log.error("No matched (P=Q) rows found.")
-        return
-    make_figure(rows, bucket, prefix)
+                 rp, rp, m["POD"], m["FAR"], m["CSI"], m["FAF"])
+        make_figure(rp, m, bucket, prefix)
     log.info("Done.")
 
 
