@@ -62,6 +62,7 @@ log = logging.getLogger("09k_obs_rp")
 
 RP_PTS      = [2, 5, 10, 25, 50, 100, 200, 500]
 OBS_FWD_H   = 24                       # look for the flood in [alarm_start, alarm_end + 24 h]
+DISP_CAP    = 500.0                    # winsorize the figure so a few >Q500 alarms don't blow up the axis
 MRMS_PRPS   = [10, 50, 100]            # MRMS ARI boxes (matched to Q10/Q50/Q100 flood targets)
 INV_KEY     = "stations/indiana_streamflow_sites.parquet"
 FS_04B_KEY  = "flow_stats/per_gauge_flow_stats.parquet"       # USGS-peak LP3 (RP conversion + A&A alarm)
@@ -228,29 +229,39 @@ def make_figure(rp_by_trigger: dict[str, list[float]], bucket: str, prefix: str)
     keys   = [b[0] for b in BOXES]
     ticks  = [b[1] for b in BOXES]
     colors = [b[2] for b in BOXES]
-    data   = [rp_by_trigger[k] if rp_by_trigger[k] else [np.nan] for k in keys]
 
     fig, ax = plt.subplots(figsize=(11, 6))
-    bp = ax.boxplot(data, showfliers=False, patch_artist=True,
-                    widths=0.62, medianprops=dict(color="black", lw=1.6),
-                    whiskerprops=dict(color="0.4"), capprops=dict(color="0.4"))
-    ax.set_xticks(range(1, len(ticks) + 1))
-    ax.set_xticklabels(ticks)
-    for patch, c in zip(bp["boxes"], colors):
-        patch.set_facecolor(c); patch.set_alpha(0.75); patch.set_edgecolor("0.3")
 
-    ax.set_yscale("log")
-    ax.set_ylabel("Observed USGS return period when the trigger fires", fontsize=13)
-    for rp, lab in [(2, "Q2"), (10, "Q10"), (50, "Q50"), (100, "Q100")]:
-        ax.axhline(rp, color="0.6", ls=":", lw=0.9)
-        ax.text(0.35, rp, lab, fontsize=9, color="0.4", va="center", ha="right")
-    # n_alarms above each box
-    for i, k in enumerate(keys, 1):
-        n = len(rp_by_trigger[k])
-        ax.text(i, ax.get_ylim()[1] * 0.9, f"n={n}", ha="center", fontsize=9, color="0.25")
+    # Violins on log10(RP), winsorized at DISP_CAP so the tail stays readable but the
+    # Q50/Q100 mass (hidden as box outliers) is fully visible. n<2 → a single marker.
+    vpos, vdata, vcolors = [], [], []
+    for i, k in enumerate(keys):
+        rps = np.asarray(rp_by_trigger[k], dtype=float)
+        if rps.size >= 2:
+            vpos.append(i); vdata.append(np.log10(np.minimum(rps, DISP_CAP))); vcolors.append(colors[i])
+        elif rps.size == 1:
+            ax.scatter([i], [np.log10(min(rps[0], DISP_CAP))], color=colors[i], s=45, zorder=5)
+    if vdata:
+        parts = ax.violinplot(vdata, positions=vpos, widths=0.85, showmedians=True, showextrema=True)
+        for pc, c in zip(parts["bodies"], vcolors):
+            pc.set_facecolor(c); pc.set_alpha(0.8); pc.set_edgecolor("0.3"); pc.set_linewidth(0.8)
+        for kk in ("cmins", "cmaxes", "cbars"):
+            parts[kk].set_edgecolor("0.45"); parts[kk].set_linewidth(1.0)
+        parts["cmedians"].set_edgecolor("black"); parts["cmedians"].set_linewidth(2.0)
+
+    ytick_rp = [2, 10, 50, 100]
+    ax.set_yticks(np.log10(ytick_rp)); ax.set_yticklabels([str(v) for v in ytick_rp])
+    ax.set_ylim(np.log10(0.95), np.log10(DISP_CAP * 1.05))
+    ax.set_xticks(range(len(keys))); ax.set_xticklabels(ticks)
+    ax.set_xlim(-0.6, len(keys) - 0.4)
+    ax.grid(axis="y", ls=":", alpha=0.5)
     ax.tick_params(axis="both", labelsize=11)
+    ax.set_ylabel("Observed USGS Return Period", fontsize=13)
+    for i, k in enumerate(keys):
+        ax.text(i, np.log10(DISP_CAP * 1.05) - 0.06, f"n={len(rp_by_trigger[k])}",
+                ha="center", fontsize=9, color="0.25")
     ax.set_title("Observed flood severity when each trigger fires\n"
-                 "(box = distribution of observed USGS return period per alarm; higher = fires on real floods)",
+                 "(violin = distribution of observed USGS return period per alarm; higher = fires on real floods)",
                  fontsize=13, fontweight="bold")
     fig.tight_layout()
     for ext in ("png", "svg"):
