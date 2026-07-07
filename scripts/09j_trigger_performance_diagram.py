@@ -122,7 +122,7 @@ def collect_points() -> list[dict]:
 # ── Diagram ────────────────────────────────────────────────────────────────────
 
 def performance_diagram(pts: list[dict], bucket: str, prefix: str) -> None:
-    fig, ax = plt.subplots(figsize=(8.6, 8.0))
+    fig, ax = plt.subplots(figsize=(6.4, 6.0))
 
     # CSI shading + contours
     g = np.linspace(0.001, 1, 400)
@@ -130,7 +130,7 @@ def performance_diagram(pts: list[dict], bucket: str, prefix: str) -> None:
     CSI = 1.0 / (1.0 / SR + 1.0 / POD - 1.0)
     cf = ax.contourf(SR, POD, CSI, levels=np.arange(0, 1.01, 0.1), cmap="Blues", alpha=0.75)
     cl = ax.contour(SR, POD, CSI, levels=np.arange(0.1, 1.0, 0.1), colors="0.45", linewidths=0.6)
-    ax.clabel(cl, fmt="%.1f", fontsize=8, inline=True)
+    ax.clabel(cl, fmt="%.1f", fontsize=9, inline=True)
     for b in [0.3, 0.5, 1, 1.5, 2, 3, 5]:                 # frequency-bias lines POD = b·SR
         x = np.linspace(0, 1, 10)
         ax.plot(x, np.minimum(b * x, 1), ls="--", color="0.5", lw=0.7)
@@ -151,7 +151,7 @@ def performance_diagram(pts: list[dict], bucket: str, prefix: str) -> None:
                        edgecolors=color, lw=2.0, zorder=7)
         if p["label"]:                                     # tag the NWM stars
             ax.annotate(p["label"], (p["sr"], p["pod"]), textcoords="offset points",
-                        xytext=(9, -2), fontsize=9, fontweight="bold", color=color)
+                        xytext=(9, -2), fontsize=12, fontweight="bold", color=color)
 
     # ── Legends ────────────────────────────────────────────────────────────────
     group_handles = [
@@ -164,23 +164,21 @@ def performance_diagram(pts: list[dict], bucket: str, prefix: str) -> None:
     ]
     q_handles = [Line2D([], [], marker="s", ls="", mfc=c, mec="black", ms=11, label=f"Q{rp}")
                  for rp, c in Q_COLOR.items()]
-    leg1 = ax.legend(handles=group_handles, loc="upper right", fontsize=9,
-                     title="Symbol = trigger source", framealpha=0.95)
+    leg1 = ax.legend(handles=group_handles, loc="upper right", fontsize=11, framealpha=0.95)
     ax.add_artist(leg1)
-    ax.legend(handles=q_handles, loc="lower right", fontsize=9,
-              title="Colour = flood RP", framealpha=0.95)
+    ax.legend(handles=q_handles, loc="lower right", fontsize=11, framealpha=0.95)
     ax.text(0.985, 0.52, "NWM: filled = A&A · open = Open-loop", transform=ax.transAxes,
-            fontsize=8, color="0.25", ha="right", style="italic")
+            fontsize=10, color="0.25", ha="right", style="italic")
 
     ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-    ax.set_xlabel("Success ratio  (1 − FAR)", fontsize=12)
-    ax.set_ylabel("Probability of detection (POD)", fontsize=12)
-    ax.text(0.985, 0.03, "frequency-bias lines", fontsize=8, color="0.4",
-            ha="right", style="italic")
-    ax.set_title("Flood-inspection trigger performance — stations / MRMS / NWM\n"
-                 "symbol = source · colour = flood return period",
-                 fontsize=12.5, fontweight="bold")
-    plt.colorbar(cf, ax=ax, label="Critical success index (CSI)", shrink=0.85)
+    ax.tick_params(labelsize=12)
+    ax.set_xlabel("Success ratio  (1 − FAR)", fontsize=14)
+    ax.set_ylabel("Probability of detection (POD)", fontsize=14)
+    ax.set_title("Flood-inspection trigger performance",
+                 fontsize=14, fontweight="bold", pad=12)
+    cb = plt.colorbar(cf, ax=ax, label="Critical success index (CSI)", shrink=0.85)
+    cb.set_label("Critical success index (CSI)", fontsize=13)
+    cb.ax.tick_params(labelsize=11)
     fig.tight_layout()
 
     for ext in ("png", "svg"):
