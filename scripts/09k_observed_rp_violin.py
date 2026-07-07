@@ -257,12 +257,10 @@ def make_figure(rp_by_trigger: dict[str, list[float]], bucket: str, prefix: str)
     ax.grid(axis="y", ls=":", alpha=0.5)
     ax.tick_params(axis="both", labelsize=11)
     ax.set_ylabel("Observed USGS Return Period", fontsize=13)
+    # n above the top spine (axis-fraction y) so it never overlaps the violins
     for i, k in enumerate(keys):
-        ax.text(i, np.log10(DISP_CAP * 1.05) - 0.06, f"n={len(rp_by_trigger[k])}",
-                ha="center", fontsize=9, color="0.25")
-    ax.set_title("Observed flood severity when each trigger fires\n"
-                 "(violin = distribution of observed USGS return period per alarm; higher = fires on real floods)",
-                 fontsize=13, fontweight="bold")
+        ax.text(i, 1.015, f"n={len(rp_by_trigger[k])}", transform=ax.get_xaxis_transform(),
+                ha="center", va="bottom", fontsize=9, color="0.3", clip_on=False)
     fig.tight_layout()
     for ext in ("png", "svg"):
         buf = io.BytesIO()
