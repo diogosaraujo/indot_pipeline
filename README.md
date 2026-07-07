@@ -315,7 +315,7 @@ python scripts/13_download_usgs_precip.py        # ~5-10 min (USGS param 00045, 
 ### Updated bridge coverage figure
 
 After uploading the Indiana bridge-location table to
-`s3://indot-bridge-pipeline/v1/bridge_data/bridge_location_csv`, run:
+`s3://indot-bridge-pipeline/v1/bridge_data/bridge_location.csv`, run:
 
 ```bash
 python scripts/14_bridge_coverage_figure.py --bucket indot-bridge-pipeline --prefix v1

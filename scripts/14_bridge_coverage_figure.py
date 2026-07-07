@@ -2,7 +2,7 @@
 
 This script updates the bridge coverage accounting using the project S3 bucket:
 
-* Bridges come from ``bridge_data/bridge_location_csv`` by default.
+* Bridges come from ``bridge_data/bridge_location.csv`` by default.
 * Bridges over waterways are NBI item 113 values 0..8.
 * Scour critical bridges are NBI item 113 values <= 3.
 * USGS streamflow stations are counted only if the local streamflow parquet has
@@ -54,7 +54,7 @@ from utils import load_config, s3_client, write_bytes_to_s3, write_parquet_to_s3
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("14_bridge_coverage")
 
-BRIDGE_KEY_DEFAULT = "bridge_data/bridge_location_csv"
+BRIDGE_KEY_DEFAULT = "bridge_data/bridge_location.csv"
 STREAMFLOW_KEY = "streamflow/instantaneous/all_gauges_long.parquet"
 STATION_KEY = "stations/indiana_streamflow_sites.parquet"
 FLAGS_KEY = "analysis/bridge_coverage/bridge_coverage_flags.parquet"
@@ -84,6 +84,11 @@ def _resolve_bridge_key(bucket: str, prefix: str, rel_key: str) -> str:
         return key
 
     base = key.rstrip("/")
+    if base.lower().endswith("_csv"):
+        alt = f"{base[:-4]}.csv"
+        if _object_exists(bucket, alt):
+            return alt
+
     for suffix in [".csv", ".CSV", ".parquet", ".geojson", ".json"]:
         if _object_exists(bucket, f"{base}{suffix}"):
             return f"{base}{suffix}"
