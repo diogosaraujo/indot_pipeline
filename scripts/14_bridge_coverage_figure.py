@@ -115,7 +115,7 @@ def _read_table_from_s3(bucket: str, key: str) -> pd.DataFrame:
         return pq.read_table(io.BytesIO(body)).to_pandas()
     if lower.endswith(".geojson") or lower.endswith(".json"):
         return gpd.read_file(io.BytesIO(body))
-    return pd.read_csv(io.BytesIO(body))
+    return pd.read_csv(io.BytesIO(body), low_memory=False)
 
 
 def _normalize_col(name: str) -> str:
@@ -237,17 +237,26 @@ def read_active_usgs_stations(bucket: str, prefix: str) -> gpd.GeoDataFrame:
 
     obj = s3_client().get_object(Bucket=bucket, Key=f"{prefix}{STREAMFLOW_KEY}")
     body = obj["Body"].read()
+    pf = pq.ParquetFile(io.BytesIO(body))
+    schema_cols = set(pf.schema_arrow.names)
+    dt_col = "datetime_utc" if "datetime_utc" in schema_cols else "datetime"
+    if dt_col not in schema_cols:
+        raise ValueError(
+            f"{STREAMFLOW_KEY} must contain either datetime_utc or datetime; "
+            f"found columns: {sorted(schema_cols)}"
+        )
+
     try:
         table = pq.read_table(
             io.BytesIO(body),
-            columns=["site_no", "datetime_utc"],
-            filters=[("datetime_utc", ">=", pd.Timestamp("2026-01-01", tz="UTC"))],
+            columns=["site_no", dt_col],
+            filters=[(dt_col, ">=", pd.Timestamp("2026-01-01", tz="UTC"))],
         )
     except Exception:
-        table = pq.read_table(io.BytesIO(body), columns=["site_no", "datetime_utc"])
+        table = pq.read_table(io.BytesIO(body), columns=["site_no", dt_col])
     flow = table.to_pandas()
-    flow["datetime_utc"] = pd.to_datetime(flow["datetime_utc"], utc=True, errors="coerce")
-    flow = flow[flow["datetime_utc"] >= pd.Timestamp("2026-01-01", tz="UTC")]
+    flow[dt_col] = pd.to_datetime(flow[dt_col], utc=True, errors="coerce")
+    flow = flow[flow[dt_col] >= pd.Timestamp("2026-01-01", tz="UTC")]
     flow["site_no"] = flow["site_no"].astype(str)
     active_sites = set(flow["site_no"].unique())
     log.info("USGS streamflow stations with 2026 records: %d", len(active_sites))
