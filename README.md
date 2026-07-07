@@ -312,6 +312,54 @@ python scripts/12_download_noaa_precip.py        # ~30-60 min (COOP + GHCNh, wat
 python scripts/13_download_usgs_precip.py        # ~5-10 min (USGS param 00045, ~120-day window)
 ```
 
+### Updated bridge coverage figure
+
+After uploading the Indiana bridge-location table to
+`s3://indot-bridge-pipeline/v1/bridge_data/bridge_location_csv`, run:
+
+```bash
+python scripts/14_bridge_coverage_figure.py --bucket indot-bridge-pipeline --prefix v1
+```
+
+The script recognizes these bridge CSV columns by default:
+
+| Field | CSV column |
+|---|---|
+| Bridge ID | `Asset Name` |
+| Latitude | `(B.L.05 ) Latitude` |
+| Longitude | `(B.L.06 ) Longitude` |
+| NBI item 113 | `(113) Scour Critical Bridges` |
+
+If a future CSV uses different names, pass them explicitly:
+
+```bash
+python scripts/14_bridge_coverage_figure.py \
+  --bucket indot-bridge-pipeline --prefix v1 \
+  --lat-col "(B.L.05 ) Latitude" \
+  --lon-col "(B.L.06 ) Longitude" \
+  --id-col "Asset Name" \
+  --scour-col "(113) Scour Critical Bridges"
+```
+
+For the most efficient and complete NWM stream coverage calculation, provide an
+Indiana NWM/NHDPlus flowline file with COMID geometry:
+
+```bash
+python scripts/14_bridge_coverage_figure.py \
+  --bucket indot-bridge-pipeline --prefix v1 \
+  --nwm-flowlines s3://indot-bridge-pipeline/v1/bridge_data/indiana_nwm_flowlines.gpkg
+```
+
+Without `--nwm-flowlines`, the script uses the USGS NLDI nearest-COMID service
+for each bridge and verifies the 200 ft distance against the returned flowline
+geometry. Outputs are written to:
+
+| Output | Description |
+|---|---|
+| `analysis/bridge_coverage/bridge_coverage_flags.parquet` | Per-bridge flags for waterway, scour-critical, USGS coverage, NWM COMID, and NWM distance |
+| `analysis/bridge_coverage/bridge_coverage_summary.csv` | Counts used in the updated figure |
+| `analysis/figures/bridge_coverage_updated.png` | Updated coverage figure |
+
 Steps 03 and 04 cannot be meaningfully sped up by adding cores — StreamStats limits you to 4 concurrent requests. Steps 05 and 06 *do* scale with CPU; bigger instance = faster. Steps 02, 03, and 04 can run concurrently in three terminals if you want to overlap them.
 
 ### 6.6 Run script 08 — instance resize required
