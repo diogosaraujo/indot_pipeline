@@ -98,7 +98,7 @@ GHCNH_KEY         = "precip/noaa/ghcnh_hourly.parquet"  # NOAA GHCNh hourly prec
 GHCNH_MM_TO_IN    = 25.4                                # GHCNh precip is stored in mm
 ATLAS14_KEY       = "atlas14/precipitation_frequency.parquet"
 INV_KEY           = "stations/indiana_streamflow_sites.parquet"
-ARI_DURATIONS     = [1, 3, 6, 12, 24]                   # hours checked for the event ARI
+ARI_DURATIONS     = [1]                                 # ARI + peak reported from HOURLY precip (1-h)
 MAX_HOURLY_IN     = 12.0                                # drop implausible hourly totals / sentinels
 HYETO_COLOR       = "#1f78b4"
 
@@ -566,18 +566,21 @@ def make_animation(
     norm_nwm = mcolors.LogNorm(vmin=NWM_Q_VMIN, vmax=NWM_Q_VMAX)
     nwm_cmap = plt.get_cmap("plasma_r")   # dark-purple (low) → yellow (high); always visible
 
-    # ── Figure layout: panels 0 & 2 are maps, panel 1 is the hyetograph ─────────
-    fig, axes = plt.subplots(1, 3, figsize=(22, 7), gridspec_kw={"wspace": 0.30})
+    # ── Figure layout: three equal-size panels (~13 × 5 in). Maps use 'auto'
+    #    aspect so they fill their cells like the hyetograph. ──────────────────
+    TITLE_FS, LABEL_FS, TICK_FS, ANNO_FS, TIME_FS, CBAR_FS = 12, 12, 11, 12.5, 16, 11
+    fig, axes = plt.subplots(1, 3, figsize=(13, 5), constrained_layout=True)
     map_titles = {0: "MRMS QPE — 1-h (in)", 2: "NWM streamflow (m³/s)"}
     for i in (0, 2):
         ax = axes[i]
         ax.set_xlim(LON_MIN, LON_MAX)
         ax.set_ylim(LAT_MIN, LAT_MAX)
-        ax.set_xlabel("Longitude")
+        ax.set_xlabel("Longitude", fontsize=LABEL_FS)
         if i == 0:
-            ax.set_ylabel("Latitude")
-        ax.set_title(map_titles[i], fontsize=11)
-        ax.set_aspect("equal")
+            ax.set_ylabel("Latitude", fontsize=LABEL_FS)
+        ax.set_title(map_titles[i], fontsize=TITLE_FS)
+        ax.set_aspect("auto")               # fill the cell → same size as the hyetograph
+        ax.tick_params(labelsize=TICK_FS)
 
     # Basemap tiles on the map panels only (added once)
     if HAS_CTX:
@@ -585,12 +588,9 @@ def make_animation(
         for ax in (axes[0], axes[2]):
             try:
                 ctx.add_basemap(
-                    ax,
-                    crs="EPSG:4326",
+                    ax, crs="EPSG:4326",
                     source=ctx.providers.OpenStreetMap.Mapnik,
-                    zoom=12,
-                    attribution=False,
-                    zorder=0,
+                    zoom=12, attribution=False, zorder=0,
                 )
             except Exception as e:
                 print(f"  Basemap warning: {e}")
@@ -602,10 +602,12 @@ def make_animation(
         cmap=precip_cmap, norm=norm_1h,
         alpha=ALPHA_PRECIP, zorder=2, interpolation="nearest",
     )
-    fig.colorbar(im_1h, ax=axes[0], fraction=0.035, pad=0.08, label="Rainfall (in)")
+    cb1 = fig.colorbar(im_1h, ax=axes[0], fraction=0.046, pad=0.03)
+    cb1.set_label("Rainfall (in)", fontsize=CBAR_FS)
+    cb1.ax.tick_params(labelsize=TICK_FS)
     if station_info is not None:
         axes[0].scatter([station_info["lon"]], [station_info["lat"]], marker="*",
-                        s=190, color="black", edgecolors="white", lw=0.9, zorder=6)
+                        s=220, color="black", edgecolors="white", lw=1.0, zorder=6)
 
     # ── Panel 1: hyetograph of the nearest precip station (moving marker) ────────
     hour_ts = [pd.Timestamp(EVENT_DATE, tz="UTC") + pd.Timedelta(hours=h) for h in HOURS]
@@ -613,30 +615,30 @@ def make_animation(
           if (hyeto is not None and not hyeto.empty) else np.zeros(len(HOURS)))
     xh = np.arange(len(HOURS))
     axh = axes[1]
-    axh.bar(xh, hy, width=0.8, color=HYETO_COLOR, alpha=0.55, zorder=2)
+    axh.bar(xh, hy, width=0.8, color=HYETO_COLOR, alpha=0.6, zorder=2)
     axh.set_ylim(0, max(hy.max() * 1.30, 0.2))
     axh.set_xlim(-0.6, len(HOURS) - 0.4)
-    axh.set_xticks(xh[::2])
-    axh.set_xticklabels([f"{h:02d}" for h in HOURS[::2]])
-    axh.set_xlabel("Hour (UTC)")
-    axh.set_ylabel("Hourly precip (in)")
+    axh.set_xticks(xh[::3])
+    axh.set_xticklabels([f"{h:02d}" for h in HOURS[::3]])
+    axh.set_xlabel("Hour (UTC)", fontsize=LABEL_FS)
+    axh.set_ylabel("Hourly precip (in)", fontsize=LABEL_FS)
+    axh.tick_params(labelsize=TICK_FS)
     axh.grid(axis="y", ls=":", alpha=0.4)
     if station_info is not None:
-        axh.set_title(f"Rain gauge {station_info['site_no']} — {station_info['name'][:32]}\n"
-                      f"nearest to map centre ({station_info['dist_km']:.0f} km)", fontsize=10)
+        axh.set_title(f"{station_info['site_no']} · {station_info['name'][:20]} "
+                      f"({station_info['dist_km']:.0f} km)", fontsize=TITLE_FS)
     else:
-        axh.set_title("Nearest GHCNh precip station — NO DATA near this location/date",
-                      fontsize=10, color="firebrick")
-    hyeto_line = axh.axvline(xh[0], color="0.35", ls="--", lw=1.2, zorder=4)
-    hyeto_dot, = axh.plot([xh[0]], [hy[0]], "o", ms=13, color="#e31a1c",
-                          mec="white", mew=1.2, zorder=6)
+        axh.set_title("Nearest GHCNh station — NO DATA", fontsize=TITLE_FS, color="firebrick")
+    hyeto_line = axh.axvline(xh[0], color="0.35", ls="--", lw=1.4, zorder=4)
+    hyeto_dot, = axh.plot([xh[0]], [hy[0]], "o", ms=14, color="#e31a1c",
+                          mec="white", mew=1.4, zorder=6)
     if ari is not None:
-        cap = " (≥ published max)" if ari.get("capped") else ""
+        cap = " (≥max)" if ari.get("capped") else ""
         axh.text(0.03, 0.97,
-                 f"Peak {ari['depth']:.2f} in / {ari['dur']} h\n≈ {ari['ari']:.0f}-yr ARI{cap}",
-                 transform=axh.transAxes, va="top", ha="left", fontsize=10, fontweight="bold",
-                 color="#6a0dad",
-                 bbox=dict(boxstyle="round", fc="white", alpha=0.85, ec="#6a0dad"))
+                 f"Peak hourly {ari['depth']:.2f} in\n≈ {ari['ari']:.0f}-yr ARI{cap}",
+                 transform=axh.transAxes, va="top", ha="left", fontsize=ANNO_FS,
+                 fontweight="bold", color="#6a0dad",
+                 bbox=dict(boxstyle="round", fc="white", alpha=0.88, ec="#6a0dad"))
 
     # ── Panel 2: NWM streamflow on flowlines ────────────────────────────────────
     # LineCollection — attach cmap/norm so set_array() always uses the fixed LogNorm.
@@ -648,15 +650,12 @@ def make_animation(
     axes[2].add_collection(lc)
     sm_nwm = plt.cm.ScalarMappable(cmap=nwm_cmap, norm=norm_nwm)
     sm_nwm.set_array([])
-    fig.colorbar(sm_nwm, ax=axes[2], fraction=0.035, pad=0.08,
-                 label="Streamflow (m³/s)")
+    cb2 = fig.colorbar(sm_nwm, ax=axes[2], fraction=0.046, pad=0.03)
+    cb2.set_label("Streamflow (m³/s)", fontsize=CBAR_FS)
+    cb2.ax.tick_params(labelsize=TICK_FS)
 
-    # Timestamp text (centred above all panels)
-    time_text = fig.text(
-        0.5, 0.97,
-        "",
-        ha="center", va="top", fontsize=13, fontweight="bold",
-    )
+    # Timestamp as a figure suptitle (constrained_layout reserves space for it)
+    time_text = fig.suptitle("", fontsize=TIME_FS, fontweight="bold")
 
     # ── Update function ────────────────────────────────────────────────────────
     # FuncAnimation iterates over frame indices (0, 1, …); map to UTC hour via HOURS.
