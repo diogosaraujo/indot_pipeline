@@ -1,4 +1,4 @@
-"""09k_observed_rp_boxplot.py
+"""09k_observed_rp_violin.py
 
 "When a trigger fires, how big was the flood that actually happened?"
 
@@ -23,11 +23,11 @@ by log-log interpolation of the station's 04b Q2..Q500 quantiles (extrapolated, 
 to [1, 1000]).  Event grouping (±24 h merge) is 08's group_wet_events.
 
 Writes:
-    s3://<bucket>/<prefix>analysis/figures/observed_rp_boxplot.{png,svg}
+    s3://<bucket>/<prefix>analysis/figures/observed_rp_violin.{png,svg}
     s3://<bucket>/<prefix>analysis/observed_rp_per_alarm.csv   (trigger, site_no, observed_rp)
 
 Usage:
-    python scripts/09k_observed_rp_boxplot.py
+    python scripts/09k_observed_rp_violin.py
 """
 from __future__ import annotations
 
@@ -69,16 +69,16 @@ FS_04B_KEY  = "flow_stats/per_gauge_flow_stats.parquet"       # USGS-peak LP3 (R
 FS_04C_KEY  = "flow_stats/nwm_per_gauge_flow_stats.parquet"   # NWM-retro LP3 (open-loop alarm)
 TC_KEY      = "analysis/event_confusion_matrix_tc.parquet"
 CSV_KEY     = "analysis/observed_rp_per_alarm.csv"
-FIG_KEY     = "analysis/figures/observed_rp_boxplot"
+FIG_KEY     = "analysis/figures/observed_rp_violin"
 
 # (trigger label, x-tick, colour)
 BOXES = [
     ("INDOT",      "INDOT\n2.5 in / 24 h", "#8c564b"),
-    ("MRMS-P10",   "MRMS P10\n@ Tc",       "#9ecae1"),
-    ("MRMS-P50",   "MRMS P50\n@ Tc",       "#4292c6"),
-    ("MRMS-P100",  "MRMS P100\n@ Tc",      "#08519c"),
-    ("NWM-AA",     "NWM A&A\n≥ Q10 (04b)", "#e6550d"),
-    ("NWM-OL",     "NWM OL\n≥ Q10 (04c)",  "#fdae6b"),
+    ("MRMS-P10",   "MRMS\nP10 / Tc",       "#9ecae1"),
+    ("MRMS-P50",   "MRMS\nP50 / Tc",       "#4292c6"),
+    ("MRMS-P100",  "MRMS\nP100 / Tc",      "#08519c"),
+    ("NWM-AA",     "NWM A&A\n≥ Q10",       "#e6550d"),
+    ("NWM-OL",     "NWM OL\n≥ Q10",        "#fdae6b"),
 ]
 
 
