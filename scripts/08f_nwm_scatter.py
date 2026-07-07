@@ -221,7 +221,8 @@ def main() -> None:
     # Threshold panel: only gauges with a valid 04c fit AND in the 08c set.
     nwm_thr = nwm_fs[nwm_fs[[f"Q{rp}" for rp in FLOW_RPS]].notna().any(axis=1)]
     nwm_thr = nwm_thr.loc[[s for s in nwm_thr.index if s in stations_08c]]
-    usgs_thr = usgs_fs.loc[[s for s in usgs_fs.index if s in nwm_thr.index]]
+    # Align to the SAME index (order + membership) so element-wise ratio/compare work.
+    usgs_thr = usgs_fs.reindex(nwm_thr.index)
 
     peaks = compute_peaks(bucket, prefix, stations_08c, flow_by_site, usgs_fs, nwm_fs)
     if peaks.empty:
