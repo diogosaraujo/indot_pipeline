@@ -52,6 +52,7 @@ import argparse
 import importlib.util
 import io
 import logging
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -67,6 +68,7 @@ from utils import load_config, s3_client, write_bytes_to_s3
 def _load(name: str, filename: str):
     spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod          # register BEFORE exec so module-level @dataclass resolves
     spec.loader.exec_module(mod)
     return mod
 
