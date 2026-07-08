@@ -2,16 +2,17 @@
 
 3-panel animated GIF for the Lanesville, IN flash flood — June 9, 2026.
 
-  Panel 1: MRMS QPE 1-hour (Pass2) — hourly rainfall depth (nearest precip station starred)
-  Panel 2: Hyetograph of the nearest USGS precip station to the map centre, with a
-           marker that advances hour-by-hour in sync with panels 1 and 3, plus the
-           Atlas-14 return period (ARI) of the station's peak accumulation for the event
+  Panel 1: MRMS QPE 1-hour (Pass2) — hourly rainfall depth (precip station = yellow dot)
+  Panel 2: 24-h accumulated precip at USGS 03294500, with a marker that advances
+           hour-by-hour in sync with panels 1 and 3, plus the Atlas-14 return period
+           (ARI) of the station's peak 24-h accumulation for the event
   Panel 3: NWM analysis streamflow on NHD flowlines
 
-Note: the nearest-station hyetograph uses NOAA GHCNh hourly precip
-(precip/noaa/ghcnh_hourly.parquet, already downloaded by script 12).  GHCNh is in
-MILLIMETRES and its sub-hourly reports are running 1-hour totals, so the hourly value
-is the per-hour MAX ÷ 25.4 (the pipeline convention, cf. 08d).
+Note: the hyetograph uses USGS instantaneous-values precip (param 00045) for the pinned
+gauge 03294500, read from precip/usgs/precip_iv.parquet.  Download it first with
+    python scripts/13_download_usgs_precip.py --site 03294500
+USGS 00045 is already in INCHES and reports INCREMENTAL depth per 15-min bin, so the
+hourly value is the SUM of increments in the hour (bin labeled by END, like MRMS QPE).
 
 Before running (if not already installed):
     pip install contextily pillow
@@ -93,12 +94,14 @@ NWM_Q_VMIN   = 0.5
 NWM_Q_VMAX   = 500.0
 
 # ── Precip station hyetograph (panel 2) + event ARI ─────────────────────────────
-# The precip station location is fixed (marked with a yellow dot); its hyetograph is
-# the nearest GHCNh gauge to this point.
+# Pinned to USGS 03294500 (OHIO RIVER AT LOUISVILLE, KY), the nearest USGS precip
+# gauge; its location is marked with the yellow dot.  Its instantaneous-values (IV)
+# precip (param 00045) is downloaded by scripts/13_download_usgs_precip.py --site.
+PRECIP_SITE_NO = "03294500"
 PRECIP_REF_LAT = 38.280347
 PRECIP_REF_LON = -85.799131
-GHCNH_KEY         = "precip/noaa/ghcnh_hourly.parquet"  # NOAA GHCNh hourly precip (millimetres)
-GHCNH_MM_TO_IN    = 25.4                                # GHCNh precip is stored in mm
+USGS_PRECIP_KEY   = "precip/usgs/precip_iv.parquet"    # USGS IV precip (param 00045, INCHES, 15-min increments)
+USGS_NODATA       = -999999.0                          # USGS IV noDataValue sentinel
 ATLAS14_KEY       = "atlas14/precipitation_frequency.parquet"
 INV_KEY           = "stations/indiana_streamflow_sites.parquet"
 ACCUM_HR          = 24                                  # hyetograph shows 24-h accumulation
@@ -159,50 +162,53 @@ def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     return 2 * R * math.asin(math.sqrt(max(0.0, min(1.0, a))))
 
 
-# ── Nearest USGS precip station → hyetograph (panel 2) ──────────────────────────
+# ── USGS precip station (03294500) → hyetograph (panel 2) ───────────────────────
 
-def load_nearest_precip_station() -> tuple[Optional[dict], Optional[pd.Series]]:
-    """Nearest GHCNh precip station to the fixed precip point (PRECIP_REF) and its
-    HOURLY series (in) over the event day ±1 day, so a trailing 24-h accumulation is
-    fully defined for the event hours.  GHCNh sub-hourly reports are running 1-hour
-    totals in MILLIMETRES → hourly value = per-hour MAX ÷ 25.4 (cf. 08d); missing hours
-    are dry.  Returns (info, hourly) or (None, None)."""
-    print(f"\n── Nearest GHCNh precip station to ({PRECIP_REF_LAT:.4f}, {PRECIP_REF_LON:.4f}) ──")
+def load_precip_station() -> tuple[Optional[dict], Optional[pd.Series]]:
+    """USGS gauge PRECIP_SITE_NO (03294500) and its HOURLY precip series (in) over the
+    event day ±1 day, so a trailing 24-h accumulation is fully defined for the event
+    hours.  USGS IV param 00045 is already in INCHES and reports INCREMENTAL depth per
+    15-min bin → hourly value = SUM of increments in the hour; label = bin END to match
+    MRMS QPE_01H.  Returns (info, hourly) or (None, None)."""
+    print(f"\n── USGS precip station {PRECIP_SITE_NO} (from {USGS_PRECIP_KEY}) ──")
     day0 = pd.Timestamp(EVENT_DATE, tz="UTC") - pd.Timedelta(days=1)
     day1 = pd.Timestamp(EVENT_DATE, tz="UTC") + pd.Timedelta(days=1)
     try:
         df = _read_pipeline_filtered(
-            GHCNH_KEY,
-            columns=["station_id", "datetime_utc", "precip_in", "name", "latitude", "longitude"],
-            filters=[("datetime_utc", ">=", day0.to_pydatetime()),
-                     ("datetime_utc", "<",  day1.to_pydatetime()),
-                     ("latitude",  ">=", PRECIP_REF_LAT - 1.0), ("latitude",  "<=", PRECIP_REF_LAT + 1.0),
-                     ("longitude", ">=", PRECIP_REF_LON - 1.0), ("longitude", "<=", PRECIP_REF_LON + 1.0)],
+            USGS_PRECIP_KEY,
+            columns=["site_no", "datetime_utc", "precip_in", "station_nm", "latitude", "longitude"],
+            filters=[("site_no", "=", PRECIP_SITE_NO),
+                     ("datetime_utc", ">=", day0.to_pydatetime()),
+                     ("datetime_utc", "<",  day1.to_pydatetime())],
         )
     except Exception as e:
-        print(f"  GHCNh read failed: {e}")
+        print(f"  USGS precip read failed: {e}")
         return None, None
     if df.empty:
-        print(f"  No GHCNh precip near the precip point around {EVENT_DATE}.")
+        print(f"  No USGS precip for site {PRECIP_SITE_NO} around {EVENT_DATE}. "
+              f"Run: python scripts/13_download_usgs_precip.py --site {PRECIP_SITE_NO}")
         return None, None
 
     df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
-    df["station_id"]   = df["station_id"].astype(str)
-    df["precip_in"]    = pd.to_numeric(df["precip_in"], errors="coerce") / GHCNH_MM_TO_IN   # mm → in
-    meta = df.groupby("station_id").agg(lat=("latitude", "first"),
-                                        lon=("longitude", "first"),
-                                        nm=("name", "first")).reset_index()
-    meta["dist_km"] = [_haversine_km(PRECIP_REF_LAT, PRECIP_REF_LON, r.lat, r.lon) for r in meta.itertuples()]
-    nearest = meta.sort_values("dist_km").iloc[0]
+    df["precip_in"]    = pd.to_numeric(df["precip_in"], errors="coerce")
+    # Drop the USGS noDataValue sentinel and any negatives (increments are >= 0).
+    s = df.set_index("datetime_utc")["precip_in"].astype(float)
+    s = s[(s > USGS_NODATA + 1.0) & (s >= 0)].sort_index()
+    # Incremental 15-min depth → hourly SUM; bin labeled by END (right-closed) like MRMS.
+    hourly = s.resample("1h", label="right", closed="right").sum().fillna(0.0)
+    hourly = hourly[hourly <= MAX_HOURLY_IN]          # guard against sentinel-inflated hours
 
-    s = df.loc[df["station_id"] == nearest.station_id].set_index("datetime_utc")["precip_in"].astype(float)
-    s = s[(s >= 0) & (s <= MAX_HOURLY_IN)].sort_index()
-    # Per-hour MAX (running-1h-total convention); label = bin END to match MRMS QPE_01H.
-    hourly = s.resample("1h", label="right", closed="right").max().fillna(0.0)
-    info = {"site_no": nearest.station_id, "name": str(nearest.nm),
-            "lat": float(nearest.lat), "lon": float(nearest.lon), "dist_km": float(nearest.dist_km)}
-    print(f"  Nearest: {info['site_no']} {info['name']} ({info['dist_km']:.1f} km); "
-          f"{int((hourly > 0).sum())} wet hours over {day0.date()}..{day1.date()}.")
+    lat = float(pd.to_numeric(df["latitude"], errors="coerce").dropna().iloc[0]) \
+        if df["latitude"].notna().any() else PRECIP_REF_LAT
+    lon = float(pd.to_numeric(df["longitude"], errors="coerce").dropna().iloc[0]) \
+        if df["longitude"].notna().any() else PRECIP_REF_LON
+    nm = str(df["station_nm"].dropna().iloc[0]) if df["station_nm"].notna().any() \
+        else f"USGS {PRECIP_SITE_NO}"
+    info = {"site_no": PRECIP_SITE_NO, "name": nm, "lat": lat, "lon": lon,
+            "dist_km": _haversine_km(PRECIP_REF_LAT, PRECIP_REF_LON, lat, lon)}
+    print(f"  {info['site_no']} {info['name']}: {len(s)} IV obs → "
+          f"{int((hourly > 0).sum())} wet hours over {day0.date()}..{day1.date()} "
+          f"(24-h peak {float(s.resample('1h').sum().rolling(ACCUM_HR, min_periods=1).sum().max()):.2f} in).")
     return info, hourly
 
 
@@ -686,10 +692,10 @@ def make_animation(
     axh.tick_params(labelsize=TICK_FS)
     axh.grid(axis="y", ls=":", alpha=0.4)
     if station_info is not None:
-        axh.set_title(f"{station_info['site_no']} · {station_info['name'][:20]} "
-                      f"({station_info['dist_km']:.0f} km)", fontsize=TITLE_FS)
+        axh.set_title(f"USGS {station_info['site_no']} · {station_info['name'][:26]}",
+                      fontsize=TITLE_FS)
     else:
-        axh.set_title("Nearest GHCNh station — NO DATA", fontsize=TITLE_FS, color="firebrick")
+        axh.set_title(f"USGS {PRECIP_SITE_NO} — NO DATA", fontsize=TITLE_FS, color="firebrick")
     hyeto_line = axh.axvline(xh[0], color="0.35", ls="--", lw=1.4, zorder=4)
     hyeto_dot, = axh.plot([xh[0]], [hy[0]], "o", ms=14, color="#e31a1c",
                           mec="white", mew=1.4, zorder=6)
@@ -798,8 +804,8 @@ def main() -> None:
     # 1. MRMS
     frames_1h, lats, lons = load_all_mrms(fs_anon)
 
-    # 1b. Nearest GHCNh precip station hyetograph + event ARI (panel 2)
-    station_info, hyeto = load_nearest_precip_station()
+    # 1b. USGS 03294500 precip station hyetograph + event ARI (panel 2)
+    station_info, hyeto = load_precip_station()
     ari = None
     if station_info is not None and hyeto is not None and not hyeto.empty:
         try:
