@@ -206,14 +206,22 @@ def _nwm_aa_key(ts: pd.Timestamp) -> str:
 
 
 def nwm_aa_at_comid(fs, hours: list[pd.Timestamp], comid: int) -> np.ndarray:
-    """Hourly NWM A&A streamflow (m3/s) at `comid` (tm00 nowcast per hour)."""
+    """Hourly NWM A&A streamflow (m3/s) at `comid` (tm00 nowcast per hour).
+
+    NWM channel_rt `streamflow` is stored as PACKED INTEGERS with a scale_factor
+    (0.01) and add_offset.  xarray applies these automatically (so the retrospective
+    is already in m3/s), but h5py returns the RAW ints — they must be unpacked by
+    hand: value = raw * scale_factor + add_offset.  Skipping this inflates flow ~100x.
+    """
     import h5py
     out = np.full(len(hours), np.nan)
     idx = None
+    sf, ao = 1.0, 0.0
     for k, ts in enumerate(hours):
         key = _nwm_aa_key(ts)
         try:
             with fs.open(key, "rb") as fobj, h5py.File(fobj, "r") as h:
+                dset = h["streamflow"]
                 if idx is None:
                     ids = h["feature_id"][:].astype(np.int64)
                     hit = np.where(ids == comid)[0]
@@ -221,11 +229,18 @@ def nwm_aa_at_comid(fs, hours: list[pd.Timestamp], comid: int) -> np.ndarray:
                         log.warning("COMID %d absent from NWM feature_id list.", comid)
                         return out
                     idx = int(hit[0])
-                q = float(h["streamflow"][idx])
+                    # netCDF attrs come back as 1-element arrays via h5py — ravel to scalar.
+                    sf = float(np.asarray(dset.attrs.get("scale_factor", 1.0)).ravel()[0])
+                    ao = float(np.asarray(dset.attrs.get("add_offset", 0.0)).ravel()[0])
+                    log.info("NWM streamflow packing: scale_factor=%s add_offset=%s", sf, ao)
+                raw = float(dset[idx])
+                q = raw * sf + ao
                 out[k] = np.nan if q < 0 else q
         except Exception:
             continue
-    log.info("NWM A&A: %d/%d hours retrieved", int(np.isfinite(out).sum()), len(hours))
+    peak = float(np.nanmax(out)) if np.isfinite(out).any() else float("nan")
+    log.info("NWM A&A: %d/%d hours retrieved; peak=%.1f m3/s",
+             int(np.isfinite(out).sum()), len(hours), peak)
     return out
 
 
@@ -305,7 +320,8 @@ def retro_lp3_flows(bucket: str, prefix: str, m04c, comid: int, lat: float,
 
 def load_or_build_series(bucket, prefix, b04b, fs, hours, lat, lon, comid,
                          asset, event, refresh):
-    key = f"{prefix}events/bridge_{_safe(asset)}_{event:%Y%m%d}/series.parquet"
+    # _v2: v1 stored raw (unscaled) NWM streamflow — bump so stale caches are ignored.
+    key = f"{prefix}events/bridge_{_safe(asset)}_{event:%Y%m%d}/series_v2.parquet"
     if not refresh and s3_object_exists(bucket, key):
         log.info("Reading cached series: s3://%s/%s", bucket, key)
         df = b04b._read_parquet_s3(bucket, key)
@@ -406,8 +422,14 @@ def main() -> None:
                     help="override the NLDI-resolved crossing COMID")
     ap.add_argument("--refresh", action="store_true",
                     help="ignore all caches (re-download series + re-fit LP3)")
+    ap.add_argument("--refresh-series", action="store_true",
+                    help="rebuild only the MRMS+A&A series cache (keeps the LP3 fit)")
+    ap.add_argument("--refresh-lp3", action="store_true",
+                    help="re-fit only the retrospective LP3 (re-opens the Zarr; slow)")
     args = ap.parse_args()
     event = date.fromisoformat(args.event_date)
+    refresh_series = args.refresh or args.refresh_series
+    refresh_lp3    = args.refresh or args.refresh_lp3
 
     cfg = load_config()
     bucket, prefix = cfg["aws"]["output_bucket"], cfg["aws"]["output_prefix"]
@@ -430,11 +452,11 @@ def main() -> None:
 
     mrms_in, aa_cms = load_or_build_series(bucket, prefix, b04b, fs, hours,
                                            bridge["lat"], bridge["lon"], comid,
-                                           args.asset, event, args.refresh)
+                                           args.asset, event, refresh_series)
     a14 = atlas14_1h_depths(bucket, prefix, b04b, bridge["lat"], bridge["lon"])
     log.info("Atlas-14 1-h depths (in): %s",
              {r: round(v, 2) for r, v in sorted(a14.items())})
-    lp3 = retro_lp3_flows(bucket, prefix, m04c, comid, bridge["lat"], args.refresh)
+    lp3 = retro_lp3_flows(bucket, prefix, m04c, comid, bridge["lat"], refresh_lp3)
     if lp3:
         log.info("Retro LP3 Q (cfs): %s | %d WY %d-%d",
                  {r: round(v) for r, v in lp3["q_cfs"].items()},

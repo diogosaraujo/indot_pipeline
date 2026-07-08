@@ -549,8 +549,14 @@ def load_nwm_frame(
         with fs.open(f"{NWM_BUCKET}/{key}", "rb") as fobj:
             with h5py.File(fobj, "r") as h:
                 all_ids = h["feature_id"][:].astype(np.int64)
-                q_arr   = h["streamflow"][:].astype(np.float32)
-                # scale factor / fill — NWM stores raw float32, no extra scale needed
+                dset    = h["streamflow"]
+                # NWM channel_rt streamflow is a PACKED int (scale_factor ~0.01,
+                # add_offset 0); h5py returns raw ints — xarray would auto-apply, we
+                # must unpack by hand or flows come out ~100x too big. attrs are
+                # 1-element arrays, so ravel to a scalar.
+                sf = float(np.asarray(dset.attrs.get("scale_factor", 1.0)).ravel()[0])
+                ao = float(np.asarray(dset.attrs.get("add_offset", 0.0)).ravel()[0])
+                q_arr   = dset[:].astype(np.float64) * sf + ao
                 q_arr   = np.where(q_arr < 0, np.nan, q_arr)
                 idx = np.where(np.isin(all_ids, target_comids))[0]
                 return {int(all_ids[i]): float(q_arr[i]) for i in idx}
