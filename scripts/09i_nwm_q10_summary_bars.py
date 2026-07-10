@@ -37,6 +37,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from matplotlib.patches import Patch
 
 from utils import load_config, s3_client, write_bytes_to_s3
 
@@ -85,7 +86,7 @@ def _metrics(df: pd.DataFrame, source: str, thresh_src: str) -> dict | None:
 def make_figure(results: list[dict], bucket: str, prefix: str) -> None:
     """Two products per metric, formatted like 09g: metric names as the x labels and
     09g's 0.62 group footprint / bar spacing.  The two products are distinguished by
-    fill (solid vs hatched) and named in the title — no legend."""
+    fill (solid vs hatched) with an explicit legend of neutral grey patches."""
     metrics = [name for name, _ in LEFT_METRICS] + ["FAF"]      # POD, FAR, CSI, FAF
     colors  = [c for _, c in LEFT_METRICS] + [FAF_COLOR]
     hatches = [None, "////"]                                    # product A solid, product B hatched
@@ -117,9 +118,20 @@ def make_figure(results: list[dict], bucket: str, prefix: str) -> None:
     ax2.tick_params(axis="y", labelsize=15)
     ax2.set_ylabel("FAF (per station-yr)", fontsize=16)
 
-    key = f"solid = {results[0]['label_flat']}      hatched = {results[1]['label_flat']}"
-    ax.set_title(f"Q{FLOW_RP} NWM streamflow trigger  (truth: USGS ≥ Q{FLOW_RP}, 04b)\n{key}",
-                 fontsize=13)
+    # Legend keys the fill pattern (product), not colour (which encodes the metric),
+    # so use neutral grey patches: solid = product A, hatched = product B.  Placed
+    # above the axes so it never overlaps the bars whatever the values.
+    handles = [
+        Patch(facecolor="0.62", label=results[0]["label_flat"]),
+        Patch(facecolor="0.62", hatch="////", edgecolor="white",
+              label=results[1]["label_flat"]),
+    ]
+    ax.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 1.005),
+              ncol=2, fontsize=12, frameon=True, handlelength=1.9, handleheight=1.5,
+              columnspacing=1.8, borderaxespad=0.0)
+
+    ax.set_title(f"Q{FLOW_RP} NWM streamflow trigger  (truth: USGS ≥ Q{FLOW_RP}, 04b)",
+                 fontsize=14, pad=36)
     fig.tight_layout()
 
     for ext in ("png", "svg"):
