@@ -50,10 +50,10 @@ EPS            = 1e-9
 INPUT_KEY      = "analysis/event_confusion_matrix_nwm.parquet"
 OUTPUT_STEM    = "analysis/figures/nwm_q10_summary_bars"
 
-# (x-axis label, source, thresh_src, short tag)
+# (legend label, source, thresh_src, short tag)
 SCENARIOS = [
-    ("A&A\nUSGS-Q (04b)",       "nwm_analysis_assim", "usgs_peak_04b", "gauged"),
-    ("Open-loop\nNWM-Q (04c)",  "nwm_open_loop",      "nwm_retro_04c", "gauge-free"),
+    ("Analysis & Assimilation (A&A)", "nwm_analysis_assim", "usgs_peak_04b", "gauged"),
+    ("Open-Loop",                     "nwm_open_loop",      "nwm_retro_04c", "gauge-free"),
 ]
 LEFT_METRICS = [("POD", "#2c7fb8"), ("FAR", "#d95f0e"), ("CSI", "#31a354")]
 FAF_COLOR    = "#6a51a3"
@@ -130,8 +130,7 @@ def make_figure(results: list[dict], bucket: str, prefix: str) -> None:
               ncol=2, fontsize=12, frameon=True, handlelength=1.9, handleheight=1.5,
               columnspacing=1.8, borderaxespad=0.0)
 
-    ax.set_title(f"Q{FLOW_RP} NWM streamflow trigger  (truth: USGS ≥ Q{FLOW_RP}, 04b)",
-                 fontsize=14, pad=36)
+    ax.set_title(f"Q{FLOW_RP} NWM streamflow trigger", fontsize=15, pad=36)
     fig.tight_layout()
 
     for ext in ("png", "svg"):
