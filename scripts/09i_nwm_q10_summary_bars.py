@@ -37,7 +37,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from matplotlib.patches import Patch
 
 from utils import load_config, s3_client, write_bytes_to_s3
 
@@ -84,50 +83,42 @@ def _metrics(df: pd.DataFrame, source: str, thresh_src: str) -> dict | None:
 
 
 def make_figure(results: list[dict], bucket: str, prefix: str) -> None:
-    names = [r["label"] for r in results]
-    x = np.arange(len(names))
-    width = 0.20
-    fig, ax = plt.subplots(figsize=(9.2, 5.8))
+    """Two products per metric, formatted like 09g: metric names as the x labels and
+    09g's 0.62 group footprint / bar spacing.  The two products are distinguished by
+    fill (solid vs hatched) and named in the title — no legend."""
+    metrics = [name for name, _ in LEFT_METRICS] + ["FAF"]      # POD, FAR, CSI, FAF
+    colors  = [c for _, c in LEFT_METRICS] + [FAF_COLOR]
+    hatches = [None, "////"]                                    # product A solid, product B hatched
+    x = np.arange(len(metrics))
+    n = len(results)
+    width = 0.62 / n                                            # group footprint == 09g's single-bar width
+    offs  = [(i - (n - 1) / 2) * width for i in range(n)]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
     ax2 = ax.twinx()
 
-    # left-axis skill bars: POD, FAR, CSI
-    for k, (metric, color) in enumerate(LEFT_METRICS):
-        off = (k - 1.5) * width
-        vals = [r[metric] for r in results]
-        ax.bar(x + off, vals, width, color=color)
-        for xi, v in zip(x + off, vals):
-            ax.text(xi, v + 0.015, f"{v:.2f}", ha="center", va="bottom",
-                    fontsize=12, rotation=90)
+    for gi, (metric, color) in enumerate(zip(metrics, colors)):
+        for pi, r in enumerate(results):
+            axis = ax2 if metric == "FAF" else ax
+            v = r["FAF"] if metric == "FAF" else r[metric]
+            xpos = x[gi] + offs[pi]
+            axis.bar(xpos, v, width, color=color, hatch=hatches[pi],
+                     edgecolor="white" if hatches[pi] else "none", linewidth=0.0)
+            axis.text(xpos, v, f"{v:.2f}", ha="center", va="bottom", fontsize=12)
 
-    # right-axis FAF bar (log), drawn from a small floor so bars are visible
-    faf = np.array([r["FAF"] for r in results])
-    pos = faf[faf > 0]
-    floor = max(pos.min() / 5.0, 1e-3) if pos.size else 1e-3
-    ax2.set_yscale("log")
-    off_faf = 1.5 * width
-    ax2.bar(x + off_faf, np.where(faf > 0, faf, floor) - floor, width, bottom=floor,
-            color=FAF_COLOR)
-    for xi, v in zip(x + off_faf, faf):
-        if v > 0:
-            ax2.annotate(f"{v:.2f}", (xi, v), textcoords="offset points", xytext=(0, 3),
-                         ha="center", fontsize=11, color=FAF_COLOR, rotation=90)
-    ax2.set_ylim(floor, (pos.max() * 4 if pos.size else 1))
+    left_max = max(r[k] for r in results for k in ("POD", "FAR", "CSI"))
+    faf_max  = max(r["FAF"] for r in results)
+    ax.set_ylim(0, (left_max if left_max > 0 else 1.0) * 1.22)
+    ax2.set_ylim(0, (faf_max if faf_max > 0 else 1.0) * 1.30)
 
-    ax.set_ylim(0, 1.18)
-    ax.set_zorder(ax2.get_zorder() + 1)
-    ax.patch.set_visible(False)
-    ax.set_ylabel("Skill score", fontsize=14)
-    ax2.set_ylabel("FAF (false alarms / station-yr)", fontsize=13, color=FAF_COLOR)
     ax.set_xticks(x)
-    ax.set_xticklabels(names, fontsize=12)
-    ax.tick_params(axis="y", labelsize=12)
-    ax2.tick_params(axis="y", labelsize=12, colors=FAF_COLOR)
-    ax.grid(axis="y", ls=":", alpha=0.4)
+    ax.set_xticklabels(metrics, fontsize=18)
+    ax.tick_params(axis="y", labelsize=15)
+    ax2.tick_params(axis="y", labelsize=15)
+    ax2.set_ylabel("FAF (per station-yr)", fontsize=16)
 
-    handles = [Patch(color=c, label=m) for m, c in LEFT_METRICS] + [Patch(color=FAF_COLOR, label="FAF")]
-    ax.legend(handles=handles, ncol=4, loc="upper right", fontsize=12, framealpha=0.9)
-    sub = "  |  ".join(f"{r['tag']}: {r['n_events']} events / {r['n_stations']} stns" for r in results)
-    ax.set_title(f"Q10 flood target — NWM streamflow trigger (truth: USGS ≥ Q10 04b)\n{sub}",
+    key = f"solid = {results[0]['label_flat']}      hatched = {results[1]['label_flat']}"
+    ax.set_title(f"Q{FLOW_RP} NWM streamflow trigger  (truth: USGS ≥ Q{FLOW_RP}, 04b)\n{key}",
                  fontsize=13)
     fig.tight_layout()
 
@@ -156,7 +147,7 @@ def main() -> None:
             log.error("No rows for scenario %s (source=%s, thresh_src=%s, flow_rp=%d) — "
                       "is 08f's 4-scenario output present?", label, source, thresh_src, FLOW_RP)
             return
-        m.update(label=label, tag=tag)
+        m.update(label=label, tag=tag, label_flat=label.replace("\n", " / "))
         results.append(m)
         log.info("%-22s POD=%.3f FAR=%.3f CSI=%.3f FAF=%.2f/stn-yr (%d events, %d stns)",
                  label.replace("\n", " "), m["POD"], m["FAR"], m["CSI"], m["FAF"],

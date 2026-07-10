@@ -36,8 +36,6 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.patches import Patch
 
 from utils import load_config, write_bytes_to_s3
 
@@ -60,48 +58,38 @@ OUTPUT_STEM = "analysis/figures/tc_matched_bars_Q"
 
 
 def make_figure(rp: int, m: dict, bucket: str, prefix: str) -> None:
-    """One figure for one flood target: POD/FAR/CSI (left) + FAF (right, log) for
-    the matched precip ARI, same layout as a single 09a bar group."""
-    x = np.array([0.0])
-    width = 0.20
-    fig, ax = plt.subplots(figsize=(6.5, 5.6))
+    """One figure per flood target, formatted identically to 09g: four bars
+    (POD, FAR, CSI on the left axis; FAF on the right, linear), metric names as the
+    x labels, no legend."""
+    fig, ax = plt.subplots(figsize=(10, 6))
     ax2 = ax.twinx()
 
-    # left-axis skill bars: POD, FAR, CSI
-    for k, (metric, color) in enumerate(m09a.LEFT_METRICS):
-        off = (k - 1.5) * width
-        v = m[metric]
-        ax.bar(x + off, [v], width, color=color)
-        ax.text(x[0] + off, v + 0.015, f"{v:.2f}", ha="center", va="bottom",
-                fontsize=12, rotation=90)
-
-    # right-axis FAF bar (log), from a small floor so it is visible
+    x = [0, 1, 2, 3]
+    left_vals = [m["POD"], m["FAR"], m["CSI"]]
     faf = m["FAF"]
-    floor = max(faf / 5.0, 1e-3) if faf > 0 else 1e-3
-    ax2.set_yscale("log")
-    off_faf = 1.5 * width
-    ax2.bar(x + off_faf, [max(faf, floor) - floor], width, bottom=floor, color=m09a.FAF_COLOR)
-    if faf > 0:
-        ax2.annotate(m09a._fmt(faf), (x[0] + off_faf, faf), textcoords="offset points",
-                     xytext=(0, 3), ha="center", fontsize=11, color=m09a.FAF_COLOR, rotation=90)
-    ax2.set_ylim(floor, max(faf * 4, floor * 10))
+    width = 0.62
 
-    ax.set_ylim(0, 1.18)
-    ax.set_xlim(-0.6, 0.6)
-    ax.set_zorder(ax2.get_zorder() + 1); ax.patch.set_visible(False)
-    ax.set_ylabel("Skill score", fontsize=15)
-    ax2.set_ylabel("FAF (false alarms / station-yr)", fontsize=15, color=m09a.FAF_COLOR)
-    ax.set_xticks([0]); ax.set_xticklabels([f"P{rp} @ Tc"], fontsize=14)
-    ax.tick_params(axis="y", labelsize=13)
-    ax2.tick_params(axis="y", labelsize=13, colors=m09a.FAF_COLOR)
-    ax.grid(axis="y", ls=":", alpha=0.4)
+    # left-axis bars: POD, FAR, CSI
+    for xi, v, (_, color) in zip(x[:3], left_vals, m09a.LEFT_METRICS):
+        ax.bar(xi, v, width, color=color)
+        ax.text(xi, v + 0.015, f"{v:.2f}", ha="center", va="bottom", fontsize=17)
 
-    handles = [Patch(color=c, label=mn) for mn, c in m09a.LEFT_METRICS] + \
-              [Patch(color=m09a.FAF_COLOR, label="FAF")]
-    ax.legend(handles=handles, ncol=4, loc="upper right", fontsize=11, framealpha=0.9)
-    ax.set_title(f"Q{rp} flood target — matched precip ARI P{rp} @ Tc\n"
-                 f"{m['n_events']} events across {m['n_stations']} stations "
-                 f"(global pool, MRMS nearest)", fontsize=13)
+    # right-axis bar: FAF
+    ax2.bar(x[3], faf, width, color=m09a.FAF_COLOR)
+    ax2.text(x[3], faf, f"{faf:.2f}", ha="center", va="bottom", fontsize=17)
+
+    top = max(left_vals) if max(left_vals) > 0 else 1.0
+    ax.set_ylim(0, top * 1.22)
+    ax2.set_ylim(0, (faf if faf > 0 else 1.0) * 1.30)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(["POD", "FAR", "CSI", "FAF"], fontsize=18)
+    ax.tick_params(axis="y", labelsize=15)
+    ax2.tick_params(axis="y", labelsize=15)
+    ax2.set_ylabel("FAF (per station-yr)", fontsize=16)
+
+    ax.set_title(f"Skill Metrics of matched MRMS P{rp} @ Tc to trigger Q{rp}",
+                 fontsize=17)
     fig.tight_layout()
 
     for ext in ("png", "svg"):
