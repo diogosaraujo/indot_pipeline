@@ -3,29 +3,19 @@
 Summary bar charts for the fixed-Tc trigger analysis (08c).
 
 Reads analysis/event_confusion_matrix_tc.parquet, pools TP/FP/FN GLOBALLY (all
-stations together, no clusters) for the MRMS nearest-pixel source, and draws a
-3×1 multipanel figure — one row per flood target Q10 / Q50 / Q100.  Each panel is
-a grouped bar chart over the precipitation ARI thresholds; every ARI shows two
-bounded skill bars — POD, CSI — with the value written above each bar.  A
-secondary (log) axis overlays the false-alarm RATE as two lines.
+stations, no clusters) for the MRMS nearest-pixel source, and draws ONE figure
+per flood target (Q10, Q50, Q100).  Each is a grouped bar chart over the
+precipitation ARI thresholds; every ARI shows four bars:
 
-FAR (false alarm RATIO) is deliberately NOT shown: it is a ratio that stays
-nearly flat across thresholds and hides that the absolute number of false alarms
-collapses as the threshold rises.  The false-alarm RATE (per time) on the
-secondary axis is the operational replacement — it shows the alarm burden
-directly and, unlike any bounded ratio, retains the per-year frequency.
+    POD, FAR, CSI  → left y-axis   (bounded skill scores)
+    FAF            → right y-axis  (False Alarm Frequency = false alarms per
+                     station-year, log scale — an unbounded rate)
 
-Metrics from pooled counts:
-    POD = TP / (TP + FN)      CSI = TP / (TP + FP + FN)
-    False alarms / station-year = Σ FP / Σ station-years   (Σ n_common_hours / 8766)
-        — the transferable per-station rate (the 106 gauges are a calibration
-          sample; this is what scales to any deployed fleet).
-    Projected fleet false alarms / year = (per-station-year) × 758 scour-critical
-          bridges — the nuisance-inspection volume INDOT would run statewide
-          (assumes scour-critical bridges share the gauged basins' alarm rate).
+    POD = TP / (TP + FN)      FAR = FP / (TP + FP)      CSI = TP / (TP + FP + FN)
+    FAF = Σ FP / Σ (n_common_hours / 8766)     [false alarms per station-year]
 
-Output:
-    s3://<bucket>/<prefix>analysis/figures/tc_summary_bars.png (+ .svg)
+Output (one per flood target):
+    s3://<bucket>/<prefix>analysis/figures/tc_summary_bars_Q{10,50,100}.{png,svg}
 
 Usage:
     python scripts/09a_tc_summary_figures.py
@@ -41,38 +31,100 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from matplotlib.patches import Patch
 
 from utils import load_config, s3_client, write_bytes_to_s3
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("09a_tc")
 
-SOURCE = "nearest"                 # MRMS nearest pixel (global pool)
+SOURCE = "nearest"
 FLOW_RPS = [10, 50, 100]
 EPS = 1e-9
-HOURS_PER_YEAR = 8766.0            # 365.25 d → station-years from window hours
-SCOUR_CRITICAL_BRIDGES = 758       # Indiana scour-critical bridges (fleet projection)
+HOURS_PER_YEAR = 8766.0
 INPUT_KEY = "analysis/event_confusion_matrix_tc.parquet"
-OUTPUT_KEY = "analysis/figures/tc_summary_bars"
+OUTPUT_STEM = "analysis/figures/tc_summary_bars_Q"
 
-# FAR (false alarm RATIO) dropped — it is a ratio that stays flat across
-# thresholds and hides the alarm burden.  The false-alarm RATE (per time) on the
-# secondary axis replaces it.  Bars keep only the bounded 0-1 skill scores.
-METRICS = [("POD", "#2c7fb8"), ("CSI", "#31a354")]
-FA_COLOR = "#000000"               # false-alarm rate (secondary axis)
+LEFT_METRICS = [("POD", "#2c7fb8"), ("FAR", "#d95f0e"), ("CSI", "#31a354")]
+FAF_COLOR = "#6a51a3"
 
 
-def _read_parquet(bucket: str, key: str, columns=None) -> pd.DataFrame:
+def _read_parquet(bucket, key, columns=None):
     obj = s3_client().get_object(Bucket=bucket, Key=key)
     return pq.read_table(io.BytesIO(obj["Body"].read()), columns=columns).to_pandas()
 
 
+def _fmt(v: float) -> str:
+    return f"{v:.0f}" if v >= 10 else (f"{v:.1f}" if v >= 1 else f"{v:.2g}")
+
+
+def make_figure(flow_rp, sub, precip_rps, bucket, prefix):
+    pooled = (sub.groupby("precip_rp_yr")[["tp", "fp", "fn"]].sum()
+                 .reindex(precip_rps).fillna(0.0))
+    tp, fp, fn = pooled["tp"], pooled["fp"], pooled["fn"]
+    vals = {
+        "POD": (tp / (tp + fn + EPS)).to_numpy(),
+        "FAR": (fp / (tp + fp + EPS)).to_numpy(),
+        "CSI": (tp / (tp + fp + fn + EPS)).to_numpy(),
+    }
+    station_years = float(sub.groupby("site_no")["n_common_hours"].first().sum()) / HOURS_PER_YEAR
+    faf = (fp / (station_years + EPS)).to_numpy()          # false alarms / station-yr
+    n_events = int(sub.groupby("site_no")["n_flow_events"].first().sum())
+    n_stations = int(sub["site_no"].nunique())
+
+    x = np.arange(len(precip_rps))
+    width = 0.20
+    fig, ax = plt.subplots(figsize=(11.5, 5.4))
+    ax2 = ax.twinx()
+
+    # left-axis skill bars: POD, FAR, CSI
+    for k, (metric, color) in enumerate(LEFT_METRICS):
+        off = (k - 1.5) * width
+        ax.bar(x + off, vals[metric], width, color=color)
+        for xi, v in zip(x + off, vals[metric]):
+            ax.text(xi, v + 0.015, f"{v:.2f}", ha="center", va="bottom",
+                    fontsize=11, rotation=90)
+
+    # right-axis FAF bar (log), drawn from a small floor so all bars are visible
+    pos = faf[faf > 0]
+    floor = max(pos.min() / 5.0, 1e-3) if pos.size else 1e-3
+    ax2.set_yscale("log")
+    off_faf = 1.5 * width
+    tops = np.where(faf > 0, faf, floor)
+    ax2.bar(x + off_faf, tops - floor, width, bottom=floor, color=FAF_COLOR)
+    for xi, v in zip(x + off_faf, faf):
+        if v > 0:
+            ax2.annotate(_fmt(v), (xi, v), textcoords="offset points", xytext=(0, 3),
+                         ha="center", fontsize=10, color=FAF_COLOR, rotation=90)
+    ax2.set_ylim(floor, (pos.max() * 4 if pos.size else 1))
+
+    ax.set_ylim(0, 1.18)
+    ax.set_zorder(ax2.get_zorder() + 1); ax.patch.set_visible(False)
+    ax.set_ylabel("Skill score", fontsize=15)
+    ax2.set_ylabel("FAF (false alarms / station-yr)", fontsize=15, color=FAF_COLOR)
+    ax.set_xticks(x); ax.set_xticklabels([f"P{int(r)}" for r in precip_rps], fontsize=14)
+    ax.tick_params(axis="y", labelsize=13)
+    ax2.tick_params(axis="y", labelsize=13, colors=FAF_COLOR)
+    ax.set_xlabel("Precipitation ARI threshold (return period, yr)", fontsize=15)
+    ax.grid(axis="y", ls=":", alpha=0.4)
+
+    handles = [Patch(color=c, label=m) for m, c in LEFT_METRICS] + [Patch(color=FAF_COLOR, label="FAF")]
+    ax.legend(handles=handles, ncol=4, loc="upper right", fontsize=13, framealpha=0.9)
+    ax.set_title(f"Q{flow_rp} flood target  —  {n_events} events across "
+                 f"{n_stations} stations (global pool, MRMS nearest)", fontsize=17)
+    fig.tight_layout()
+
+    for ext in ("png", "svg"):
+        buf = io.BytesIO()
+        fig.savefig(buf, format=ext, dpi=150, bbox_inches="tight")
+        write_bytes_to_s3(buf.getvalue(), bucket, f"{prefix}{OUTPUT_STEM}{flow_rp}.{ext}")
+        log.info("Saved s3://%s/%s%s%d.%s", bucket, prefix, OUTPUT_STEM, flow_rp, ext)
+    plt.close(fig)
+
+
 def main() -> None:
     cfg = load_config()
-    bucket = cfg["aws"]["output_bucket"]
-    prefix = cfg["aws"]["output_prefix"]
-
+    bucket, prefix = cfg["aws"]["output_bucket"], cfg["aws"]["output_prefix"]
     df = _read_parquet(bucket, f"{prefix}{INPUT_KEY}",
                        ["site_no", "source", "precip_rp_yr", "flow_rp_yr",
                         "tp", "fp", "fn", "n_flow_events", "n_common_hours"])
@@ -80,96 +132,13 @@ def main() -> None:
     if df.empty:
         log.error("No %s rows in %s", SOURCE, INPUT_KEY)
         return
-
     precip_rps = sorted(df["precip_rp_yr"].unique())
-    x = np.arange(len(precip_rps))
-    width = 0.36
-
-    fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
-
-    for row, flow_rp in enumerate(FLOW_RPS):
-        ax = axes[row]
+    for flow_rp in FLOW_RPS:
         sub = df[df["flow_rp_yr"] == flow_rp]
         if sub.empty:
-            ax.set_visible(False)
+            log.warning("No rows for Q%d — skipping", flow_rp)
             continue
-        pooled = (sub.groupby("precip_rp_yr")[["tp", "fp", "fn"]].sum()
-                     .reindex(precip_rps).fillna(0.0))
-        tp, fp, fn = pooled["tp"], pooled["fp"], pooled["fn"]
-        vals = {
-            "POD": (tp / (tp + fn + EPS)).to_numpy(),
-            "CSI": (tp / (tp + fp + fn + EPS)).to_numpy(),
-        }
-        n_events = int(sub.groupby("site_no")["n_flow_events"].first().sum())
-        n_stations = int(sub["site_no"].nunique())
-
-        for k, (metric, color) in enumerate(METRICS):
-            offset = (k - (len(METRICS) - 1) / 2) * width
-            ax.bar(x + offset, vals[metric], width, label=metric, color=color)
-            for xi, v in zip(x + offset, vals[metric]):
-                ax.text(xi, v + 0.012, f"{v:.2f}", ha="center", va="bottom",
-                        fontsize=7, rotation=90)
-
-        # ── false-alarm RATE (per time) on a secondary log axis ───────────────
-        # Replaces FAR.  Per-station-year rate = ΣFP / Σ station-years is the
-        # transferable unit; project to the scour-critical fleet by ×758.
-        station_years = float(
-            sub.groupby("site_no")["n_common_hours"].first().sum()) / HOURS_PER_YEAR
-        fa_station = (fp / (station_years + EPS)).to_numpy()        # per station-yr
-        fa_fleet = fa_station * SCOUR_CRITICAL_BRIDGES              # 758-bridge fleet
-
-        def _fmt(v: float) -> str:
-            return f"{v:.0f}" if v >= 10 else (f"{v:.1f}" if v >= 1 else f"{v:.2g}")
-
-        ax2 = ax.twinx()
-        line, = ax2.plot(x, np.where(fa_station > 0, fa_station, np.nan),
-                         color=FA_COLOR, marker="o", ms=5, lw=1.6,
-                         label="False alarms / station-yr")
-        line_fleet, = ax2.plot(x, np.where(fa_fleet > 0, fa_fleet, np.nan),
-                               color=FA_COLOR, marker="s", ms=4, lw=1.4, ls="--",
-                               label=f"Projected to {SCOUR_CRITICAL_BRIDGES} "
-                                     "scour-critical bridges / yr")
-        ax2.set_yscale("log")
-        ax2.set_ylabel("False alarms per year (log)")
-        for xi, vs, vf in zip(x, fa_station, fa_fleet):
-            if vs > 0:
-                ax2.annotate(_fmt(vs), (xi, vs), textcoords="offset points",
-                             xytext=(7, 0), fontsize=6.5, color=FA_COLOR, va="center")
-            if vf > 0:
-                ax2.annotate(_fmt(vf), (xi, vf), textcoords="offset points",
-                             xytext=(7, 0), fontsize=6.5, color=FA_COLOR, va="center")
-
-        ax.set_ylim(0, 1.12)
-        ax.set_zorder(ax2.get_zorder() + 1)   # bars/labels above the line
-        ax.patch.set_visible(False)
-        ax.set_ylabel("Skill score")
-        ax.set_title(f"Q{flow_rp} flood target  —  {n_events} events across "
-                     f"{n_stations} stations (global pool, MRMS nearest)",
-                     fontsize=11)
-        ax.grid(axis="y", ls=":", alpha=0.4)
-        if row == 0:
-            from matplotlib.patches import Patch
-            handles = ([Patch(color=c, label=mname) for mname, c in METRICS]
-                       + [line, line_fleet])
-            ax.legend(handles=handles, ncol=3, loc="upper right", fontsize=8,
-                      framealpha=0.9)
-
-    axes[-1].set_xticks(x)
-    axes[-1].set_xticklabels([f"P{int(r)}" for r in precip_rps])
-    axes[-1].set_xlabel("Precipitation ARI threshold (return period, yr)")
-
-    fig.suptitle(
-        "Fixed-Tc trigger skill vs precipitation ARI threshold\n"
-        "accumulation duration = round(Kirpich Tc) per station; pooled over all stations",
-        fontsize=13, y=0.995)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
-
-    for ext in ("png", "svg"):
-        buf = io.BytesIO()
-        fig.savefig(buf, format=ext, dpi=150, bbox_inches="tight")
-        write_bytes_to_s3(buf.getvalue(), bucket, f"{prefix}{OUTPUT_KEY}.{ext}")
-        log.info("Saved s3://%s/%s%s.%s", bucket, prefix, OUTPUT_KEY, ext)
-    plt.close(fig)
+        make_figure(flow_rp, sub, precip_rps, bucket, prefix)
 
 
 if __name__ == "__main__":

@@ -30,5 +30,6 @@ dependencies:
   - requests
   - matplotlib
   - seaborn
+  - openpyxl
   - pip:
       - dataretrieval>=1.0.10

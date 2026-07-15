@@ -499,8 +499,14 @@ def load_nwm_at_comid(fs: s3fs.S3FileSystem,
                         return None
                     _NWM_IDX = int(matches[0])
                     print(f"\n  NWM: COMID {comid} at array index {_NWM_IDX}")
-                q = float(hf["streamflow"][_NWM_IDX])
-                return q if q >= 0 else None   # native m³/s — matches regression units after conversion
+                # NWM channel_rt streamflow is a packed int (scale_factor ~0.01);
+                # h5py returns raw ints, so unpack by hand (xarray would auto-apply)
+                # or the flow comes out ~100x too big. attrs are 1-element arrays.
+                dset = hf["streamflow"]
+                sf = float(np.asarray(dset.attrs.get("scale_factor", 1.0)).ravel()[0])
+                ao = float(np.asarray(dset.attrs.get("add_offset", 0.0)).ravel()[0])
+                q = float(dset[_NWM_IDX]) * sf + ao
+                return q if q >= 0 else None   # m³/s — matches regression units after conversion
     except Exception as e:
         print(f"\n  NWM {dt:%H}z: {e}")
         return None

@@ -2,9 +2,17 @@
 
 3-panel animated GIF for the Lanesville, IN flash flood — June 9, 2026.
 
-  Panel 1: MRMS QPE 1-hour (Pass2) — hourly rainfall depth
-  Panel 2: MRMS QPE 3-hour rolling accumulation (Pass2)
+  Panel 1: MRMS QPE 1-hour (Pass2) — hourly rainfall depth (precip station = yellow dot)
+  Panel 2: 24-h accumulated precip at USGS 03294500, with a marker that advances
+           hour-by-hour in sync with panels 1 and 3, plus the Atlas-14 return period
+           (ARI) of the station's peak 24-h accumulation for the event
   Panel 3: NWM analysis streamflow on NHD flowlines
+
+Note: the hyetograph uses USGS instantaneous-values precip (param 00045) for the pinned
+gauge 03294500, read from precip/usgs/precip_iv.parquet.  Download it first with
+    python scripts/13_download_usgs_precip.py --site 03294500
+USGS 00045 is already in INCHES and reports INCREMENTAL depth per 15-min bin, so the
+hourly value is the SUM of increments in the hour (bin labeled by END, like MRMS QPE).
 
 Before running (if not already installed):
     pip install contextily pillow
@@ -35,11 +43,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 import requests
 import s3fs
 from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.collections import LineCollection
+from scipy.interpolate import griddata
 
 # Pipeline utilities (script lives alongside utils.py)
 sys.path.insert(0, str(Path(__file__).parent))
@@ -55,8 +65,9 @@ except ImportError:
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 EVENT_DATE   = date(2026, 6, 9)
-LON_MIN, LON_MAX = -86.06, -85.88
-LAT_MIN, LAT_MAX = 38.15, 38.31
+# Zoomed-out view so the precip station, bridges and streams all fit.
+LON_MIN, LON_MAX = -86.10, -85.72
+LAT_MIN, LAT_MAX = 38.12, 38.34
 HOURS        = list(range(6, 23))   # 06–22 UTC (EDT = UTC-4, so 02:00–18:00 local)
 
 MRMS_BUCKET     = "noaa-mrms-pds"
@@ -81,6 +92,31 @@ QPE_3H_VMAX  = 5.0
 # NWM streamflow colour scale (m³/s, log)
 NWM_Q_VMIN   = 0.5
 NWM_Q_VMAX   = 500.0
+
+# ── Precip station hyetograph (panel 2) + event ARI ─────────────────────────────
+# Pinned to USGS 03294500 (OHIO RIVER AT LOUISVILLE, KY), the nearest USGS precip
+# gauge; its location is marked with the yellow dot.  Its instantaneous-values (IV)
+# precip (param 00045) is downloaded by scripts/13_download_usgs_precip.py --site.
+PRECIP_SITE_NO = "03294500"
+PRECIP_REF_LAT = 38.280347
+PRECIP_REF_LON = -85.799131
+USGS_PRECIP_KEY   = "precip/usgs/precip_iv.parquet"    # USGS IV precip (param 00045, INCHES, 15-min increments)
+USGS_NODATA       = -999999.0                          # USGS IV noDataValue sentinel
+ATLAS14_KEY       = "atlas14/precipitation_frequency.parquet"
+INV_KEY           = "stations/indiana_streamflow_sites.parquet"
+ACCUM_HR          = 24                                  # hyetograph shows 24-h accumulation
+ARI_DURATIONS     = [ACCUM_HR]                          # ARI + peak reported from the 24-h accumulation
+MAX_HOURLY_IN     = 12.0                                # drop implausible hourly totals / sentinels
+HYETO_COLOR       = "#1f78b4"
+PRECIP_DOT_COLOR  = "#ffd400"                           # yellow dot for the precip station
+
+# ── Bridges (from the processed bridge_location.csv) ────────────────────────────
+BRIDGE_KEY        = "analysis/bridge_coverage/bridge_coverage_flags.parquet"
+BRIDGE_LAT_COL    = "(16) Latitude:"
+BRIDGE_LON_COL    = "(17) Longitude:"
+BRIDGE_SCOUR_COL  = "scour_critical"
+BRIDGE_COLOR      = "#2ca02c"                           # green — regular bridges
+SCOUR_COLOR       = "#e377c2"                           # pink  — scour-critical bridges
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -108,6 +144,141 @@ def _read_pipeline_parquet(key: str) -> pd.DataFrame:
     s3 = boto3.client("s3", region_name="us-east-1")
     obj = s3.get_object(Bucket=PIPELINE_BUCKET, Key=key)
     return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
+
+
+def _read_pipeline_filtered(key: str, columns=None, filters=None) -> pd.DataFrame:
+    """Predicate-pushdown read from the pipeline bucket (avoids pulling the whole file)."""
+    path = f"{PIPELINE_BUCKET}/{PIPELINE_PREFIX}{key}"
+    return pq.read_table(path, filesystem=pafs.S3FileSystem(),
+                         columns=columns, filters=filters).to_pandas()
+
+
+def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+    import math
+    R = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1); dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(max(0.0, min(1.0, a))))
+
+
+# ── USGS precip station (03294500) → hyetograph (panel 2) ───────────────────────
+
+def load_precip_station() -> tuple[Optional[dict], Optional[pd.Series]]:
+    """USGS gauge PRECIP_SITE_NO (03294500) and its HOURLY precip series (in) over the
+    event day ±1 day, so a trailing 24-h accumulation is fully defined for the event
+    hours.  USGS IV param 00045 is already in INCHES and reports INCREMENTAL depth per
+    15-min bin → hourly value = SUM of increments in the hour; label = bin END to match
+    MRMS QPE_01H.  Returns (info, hourly) or (None, None)."""
+    print(f"\n── USGS precip station {PRECIP_SITE_NO} (from {USGS_PRECIP_KEY}) ──")
+    day0 = pd.Timestamp(EVENT_DATE, tz="UTC") - pd.Timedelta(days=1)
+    day1 = pd.Timestamp(EVENT_DATE, tz="UTC") + pd.Timedelta(days=1)
+    try:
+        df = _read_pipeline_filtered(
+            USGS_PRECIP_KEY,
+            columns=["site_no", "datetime_utc", "precip_in", "station_nm", "latitude", "longitude"],
+            filters=[("site_no", "=", PRECIP_SITE_NO),
+                     ("datetime_utc", ">=", day0.to_pydatetime()),
+                     ("datetime_utc", "<",  day1.to_pydatetime())],
+        )
+    except Exception as e:
+        print(f"  USGS precip read failed: {e}")
+        return None, None
+    if df.empty:
+        print(f"  No USGS precip for site {PRECIP_SITE_NO} around {EVENT_DATE}. "
+              f"Run: python scripts/13_download_usgs_precip.py --site {PRECIP_SITE_NO}")
+        return None, None
+
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+    df["precip_in"]    = pd.to_numeric(df["precip_in"], errors="coerce")
+    # Drop the USGS noDataValue sentinel and any negatives (increments are >= 0).
+    s = df.set_index("datetime_utc")["precip_in"].astype(float)
+    s = s[(s > USGS_NODATA + 1.0) & (s >= 0)].sort_index()
+    # Incremental 15-min depth → hourly SUM; bin labeled by END (right-closed) like MRMS.
+    hourly = s.resample("1h", label="right", closed="right").sum().fillna(0.0)
+    hourly = hourly[hourly <= MAX_HOURLY_IN]          # guard against sentinel-inflated hours
+
+    lat = float(pd.to_numeric(df["latitude"], errors="coerce").dropna().iloc[0]) \
+        if df["latitude"].notna().any() else PRECIP_REF_LAT
+    lon = float(pd.to_numeric(df["longitude"], errors="coerce").dropna().iloc[0]) \
+        if df["longitude"].notna().any() else PRECIP_REF_LON
+    nm = str(df["station_nm"].dropna().iloc[0]) if df["station_nm"].notna().any() \
+        else f"USGS {PRECIP_SITE_NO}"
+    info = {"site_no": PRECIP_SITE_NO, "name": nm, "lat": lat, "lon": lon,
+            "dist_km": _haversine_km(PRECIP_REF_LAT, PRECIP_REF_LON, lat, lon)}
+    print(f"  {info['site_no']} {info['name']}: {len(s)} IV obs → "
+          f"{int((hourly > 0).sum())} wet hours over {day0.date()}..{day1.date()} "
+          f"(24-h peak {float(s.resample('1h').sum().rolling(ACCUM_HR, min_periods=1).sum().max()):.2f} in).")
+    return info, hourly
+
+
+# ── Bridges (green = regular, pink = scour critical) ────────────────────────────
+
+def load_bridges() -> tuple[np.ndarray, np.ndarray]:
+    """(regular_lonlat, scour_lonlat) point arrays within the view bbox, from the
+    processed bridge_location.csv (scour critical = NBI item 113 <= 3)."""
+    try:
+        df = _read_pipeline_filtered(BRIDGE_KEY,
+                                     columns=[BRIDGE_LAT_COL, BRIDGE_LON_COL, BRIDGE_SCOUR_COL])
+    except Exception as e:                                   # noqa: BLE001
+        print(f"  Bridge read failed: {e}")
+        return np.empty((0, 2)), np.empty((0, 2))
+    df = df.rename(columns={BRIDGE_LAT_COL: "lat", BRIDGE_LON_COL: "lon", BRIDGE_SCOUR_COL: "scour"})
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    df = df.dropna(subset=["lat", "lon"])
+    df = df[df["lat"].between(LAT_MIN, LAT_MAX) & df["lon"].between(LON_MIN, LON_MAX)]
+    scour = df["scour"].fillna(False).astype(bool)
+    reg = df.loc[~scour, ["lon", "lat"]].to_numpy(float)
+    sc  = df.loc[scour,  ["lon", "lat"]].to_numpy(float)
+    print(f"  Bridges in view: {len(df)} ({int(scour.sum())} scour-critical)")
+    return reg, sc
+
+
+# ── Event ARI from Atlas-14 interpolated to the station ─────────────────────────
+
+def atlas14_at_point(lat: float, lon: float) -> dict[tuple[int, int], float]:
+    """Interpolate Atlas-14 depth (in) to a point → {(return_period_yr, duration_hr): depth}."""
+    a14 = _read_pipeline_filtered(ATLAS14_KEY)
+    a14["site_no"] = a14["site_no"].astype(str)
+    inv = _read_pipeline_filtered(INV_KEY, columns=["site_no", "dec_lat_va", "dec_long_va"])
+    inv["site_no"] = inv["site_no"].astype(str)
+    a14 = a14.merge(inv, on="site_no", how="left").dropna(subset=["dec_lat_va", "dec_long_va", "depth_in"])
+    out: dict[tuple[int, int], float] = {}
+    for (rp, dur), g in a14.groupby(["return_period_yr", "duration_hr"]):
+        if int(dur) not in ARI_DURATIONS or len(g) < 3:
+            continue
+        src = g[["dec_lat_va", "dec_long_va"]].to_numpy(float)
+        val = g["depth_in"].to_numpy(float)
+        d = griddata(src, val, [[lat, lon]], method="linear")[0]
+        if not np.isfinite(d):
+            d = griddata(src, val, [[lat, lon]], method="nearest")[0]
+        if np.isfinite(d):
+            out[(int(rp), int(dur))] = float(d)
+    return out
+
+
+def event_ari(hourly: pd.Series, a14_pt: dict[tuple[int, int], float]) -> Optional[dict]:
+    """Peak rolling accumulation over ARI_DURATIONS and its (log-log interpolated)
+    Atlas-14 return period.  Returns the duration giving the most extreme ARI."""
+    if hourly is None or hourly.empty or not a14_pt:
+        return None
+    per_dur: dict[int, list] = {}
+    for (rp, dur), depth in a14_pt.items():
+        per_dur.setdefault(dur, []).append((depth, rp))
+    best: Optional[dict] = None
+    for dur in ARI_DURATIONS:
+        pts = sorted((d, rp) for d, rp in per_dur.get(dur, []) if d > 0)
+        if len(pts) < 2:
+            continue
+        obs = float(hourly.rolling(dur, min_periods=1).sum().max())
+        depths = np.array([d for d, _ in pts]); rps = np.array([rp for _, rp in pts])
+        ari = float(np.exp(np.interp(np.log(max(obs, 1e-6)), np.log(depths), np.log(rps))))
+        if obs < depths[0]:                       # below the smallest published RP
+            ari = min(ari, rps[0])
+        if best is None or ari > best["ari"]:
+            best = {"ari": ari, "dur": dur, "depth": obs, "capped": obs >= depths[-1]}
+    return best
 
 
 
@@ -378,8 +549,14 @@ def load_nwm_frame(
         with fs.open(f"{NWM_BUCKET}/{key}", "rb") as fobj:
             with h5py.File(fobj, "r") as h:
                 all_ids = h["feature_id"][:].astype(np.int64)
-                q_arr   = h["streamflow"][:].astype(np.float32)
-                # scale factor / fill — NWM stores raw float32, no extra scale needed
+                dset    = h["streamflow"]
+                # NWM channel_rt streamflow is a PACKED int (scale_factor ~0.01,
+                # add_offset 0); h5py returns raw ints — xarray would auto-apply, we
+                # must unpack by hand or flows come out ~100x too big. attrs are
+                # 1-element arrays, so ravel to a scalar.
+                sf = float(np.asarray(dset.attrs.get("scale_factor", 1.0)).ravel()[0])
+                ao = float(np.asarray(dset.attrs.get("add_offset", 0.0)).ravel()[0])
+                q_arr   = dset[:].astype(np.float64) * sf + ao
                 q_arr   = np.where(q_arr < 0, np.nan, q_arr)
                 idx = np.where(np.isin(all_ids, target_comids))[0]
                 return {int(all_ids[i]): float(q_arr[i]) for i in idx}
@@ -407,13 +584,16 @@ def load_all_nwm(
 
 def make_animation(
     frames_1h: list,
-    frames_3h: list,
+    station_info: Optional[dict],
+    hyeto: Optional[pd.Series],
+    ari: Optional[dict],
     lats: Optional[np.ndarray],
     lons: Optional[np.ndarray],
     flowlines: gpd.GeoDataFrame,
     nwm_frames: list[dict[int, float]],
     all_segs: list,
     seg_comids: np.ndarray,
+    bridges: tuple[np.ndarray, np.ndarray] = (np.empty((0, 2)), np.empty((0, 2))),
 ) -> None:
     extent = [LON_MIN, LON_MAX, LAT_MIN, LAT_MAX]
 
@@ -432,69 +612,114 @@ def make_animation(
     precip_cmap.set_under("none")
 
     norm_1h  = mcolors.Normalize(vmin=0.01, vmax=QPE_1H_VMAX)
-    norm_3h  = mcolors.Normalize(vmin=0.01, vmax=QPE_3H_VMAX)
     norm_nwm = mcolors.LogNorm(vmin=NWM_Q_VMIN, vmax=NWM_Q_VMAX)
     nwm_cmap = plt.get_cmap("plasma_r")   # dark-purple (low) → yellow (high); always visible
 
-    # ── Figure layout ──────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(
-        1, 3,
-        figsize=(22, 7),
-        gridspec_kw={"wspace": 0.45},
-    )
-    titles = [
-        "MRMS QPE — 1-h (in)",
-        "MRMS QPE — 3-h rolling (in)",
-        "NWM streamflow (m³/s)",
-    ]
-    for i, (ax, title) in enumerate(zip(axes, titles)):
+    # ── Figure layout: three equal-size panels (~13 × 5 in). Maps use 'auto'
+    #    aspect so they fill their cells like the hyetograph. ──────────────────
+    TITLE_FS, LABEL_FS, TICK_FS, ANNO_FS, TIME_FS, CBAR_FS = 12, 12, 11, 12.5, 16, 11
+    fig, axes = plt.subplots(1, 3, figsize=(13, 5), constrained_layout=True)
+    map_titles = {0: "MRMS QPE — 1-h (in)", 2: "NWM streamflow (m³/s)"}
+    for i in (0, 2):
+        ax = axes[i]
         ax.set_xlim(LON_MIN, LON_MAX)
         ax.set_ylim(LAT_MIN, LAT_MAX)
-        ax.set_xlabel("Longitude")
+        ax.set_xlabel("Longitude", fontsize=LABEL_FS)
         if i == 0:
-            ax.set_ylabel("Latitude")   # y-label only on leftmost panel
-        ax.set_title(title, fontsize=11)
-        ax.set_aspect("equal")
+            ax.set_ylabel("Latitude", fontsize=LABEL_FS)
+        ax.set_title(map_titles[i], fontsize=TITLE_FS)
+        ax.set_aspect("auto")               # fill the cell → same size as the hyetograph
+        ax.tick_params(labelsize=TICK_FS)
 
-    # Basemap tiles (added once; won't change between frames)
+    # Basemap tiles on the map panels only (added once)
     if HAS_CTX:
         print("\nAdding basemap tiles (requires internet)...")
-        for ax in axes:
+        for ax in (axes[0], axes[2]):
             try:
                 ctx.add_basemap(
-                    ax,
-                    crs="EPSG:4326",
+                    ax, crs="EPSG:4326",
                     source=ctx.providers.OpenStreetMap.Mapnik,
-                    zoom=12,
-                    attribution=False,
-                    zorder=0,
+                    zoom=12, attribution=False, zorder=0,
                 )
             except Exception as e:
                 print(f"  Basemap warning: {e}")
 
-    # ── Initialise artists ─────────────────────────────────────────────────────
+    # ── Panel 0: MRMS 1-h QPE (station location starred) ────────────────────────
     blank = np.zeros((2, 2))
-
-    # MRMS panels: imshow (origin='upper' because lats are descending)
     im_1h = axes[0].imshow(
         blank, origin="upper", extent=extent,
-        cmap=precip_cmap, norm=norm_1h,
+        cmap=precip_cmap, norm=norm_1h, aspect="auto",   # 'auto' → fills the cell (imshow otherwise forces 'equal')
         alpha=ALPHA_PRECIP, zorder=2, interpolation="nearest",
     )
-    im_3h = axes[1].imshow(
-        blank, origin="upper", extent=extent,
-        cmap=precip_cmap, norm=norm_3h,
-        alpha=ALPHA_PRECIP, zorder=2, interpolation="nearest",
-    )
+    cb1 = fig.colorbar(im_1h, ax=axes[0], fraction=0.046, pad=0.03)
+    cb1.set_label("Rainfall (in)", fontsize=CBAR_FS)
+    cb1.ax.tick_params(labelsize=TICK_FS)
 
-    # Colourbars for precipitation
-    fig.colorbar(im_1h, ax=axes[0], fraction=0.035, pad=0.08,
-                 label="Rainfall (in)")
-    fig.colorbar(im_3h, ax=axes[1], fraction=0.035, pad=0.08,
-                 label="Rainfall (in)")
+    # ── Static map overlays (precip station dot + bridges) on BOTH map panels ────
+    reg_xy, sc_xy = bridges
+    for ax in (axes[0], axes[2]):
+        if len(reg_xy):
+            ax.scatter(reg_xy[:, 0], reg_xy[:, 1], marker="o", s=26,
+                       facecolor=BRIDGE_COLOR, edgecolors="black", lw=0.4, zorder=5,
+                       label="Bridge")
+        if len(sc_xy):
+            ax.scatter(sc_xy[:, 0], sc_xy[:, 1], marker="o", s=34,
+                       facecolor=SCOUR_COLOR, edgecolors="black", lw=0.5, zorder=6,
+                       label="Scour-critical bridge")
+        # yellow precip-station dot at the requested reference coordinate
+        ax.scatter([PRECIP_REF_LON], [PRECIP_REF_LAT], marker="o", s=140,
+                   facecolor=PRECIP_DOT_COLOR, edgecolors="black", lw=1.2, zorder=7,
+                   label="Precip station")
+    # single legend on the first map panel
+    axes[0].legend(loc="upper left", fontsize=8, framealpha=0.9, markerscale=0.9)
 
-    # NWM: LineCollection — attach cmap/norm so set_array() always uses the
-    # fixed LogNorm (avoids colour drift from frame-to-frame autoscaling).
+    # ── Panel 1: hyetograph of the nearest precip station (moving marker) ────────
+    hour_ts = [pd.Timestamp(EVENT_DATE, tz="UTC") + pd.Timedelta(hours=h) for h in HOURS]
+
+    def _accum24(t: pd.Timestamp) -> float:
+        """Trailing 24-h accumulation ending at hour t (the station series spans
+        event_date ± 1 day, so the leading window is fully covered)."""
+        if hyeto is None or hyeto.empty:
+            return 0.0
+        lo = t - pd.Timedelta(hours=ACCUM_HR - 1)
+        window = hyeto[(hyeto.index >= lo) & (hyeto.index <= t)]
+        return float(window.sum())
+
+    hy = np.array([_accum24(t) for t in hour_ts])
+    xh = np.arange(len(HOURS))
+    axh = axes[1]
+    axh.bar(xh, hy, width=0.8, color=HYETO_COLOR, alpha=0.6, zorder=2)
+    axh.set_ylim(0, max(hy.max() * 1.30, 0.2))
+    axh.set_xlim(-0.6, len(HOURS) - 0.4)
+    axh.set_xticks(xh[::3])
+    axh.set_xticklabels([f"{h:02d}" for h in HOURS[::3]])
+    axh.set_xlabel("Hour (UTC)", fontsize=LABEL_FS)
+    axh.set_ylabel(f"{ACCUM_HR}-h accumulated precip (in)", fontsize=LABEL_FS)
+    axh.tick_params(labelsize=TICK_FS)
+    axh.grid(axis="y", ls=":", alpha=0.4)
+    if station_info is not None:
+        axh.set_title(f"USGS {station_info['site_no']} · {station_info['name'][:26]}",
+                      fontsize=TITLE_FS)
+    else:
+        axh.set_title(f"USGS {PRECIP_SITE_NO} — NO DATA", fontsize=TITLE_FS, color="firebrick")
+    hyeto_line = axh.axvline(xh[0], color="0.35", ls="--", lw=1.4, zorder=4)
+    hyeto_dot, = axh.plot([xh[0]], [hy[0]], "o", ms=14, color="#e31a1c",
+                          mec="white", mew=1.4, zorder=6)
+    if ari is not None:
+        cap = " (≥max)" if ari.get("capped") else ""
+        axh.text(0.03, 0.97,
+                 f"Peak {ari['dur']}-h {ari['depth']:.2f} in\n≈ {ari['ari']:.0f}-yr ARI{cap}",
+                 transform=axh.transAxes, va="top", ha="left", fontsize=ANNO_FS,
+                 fontweight="bold", color="#6a0dad",
+                 bbox=dict(boxstyle="round", fc="white", alpha=0.88, ec="#6a0dad"))
+
+    # ── Panel 2: NWM streamflow on flowlines ────────────────────────────────────
+    # Grey base: every flowline drawn faintly so the drainage network is always
+    # visible even on hours/reaches with no NWM value (colour rides on top).
+    if all_segs:
+        base_lc = LineCollection(all_segs, colors="0.72", linewidths=1.4, zorder=2)
+        axes[2].add_collection(base_lc)
+    # LineCollection — attach cmap/norm so set_array() always uses the fixed LogNorm.
     lc = LineCollection(
         all_segs if all_segs else [[[LON_MIN, LAT_MIN], [LON_MAX, LAT_MAX]]],
         cmap=nwm_cmap, norm=norm_nwm, linewidths=4.0, zorder=3,
@@ -503,15 +728,12 @@ def make_animation(
     axes[2].add_collection(lc)
     sm_nwm = plt.cm.ScalarMappable(cmap=nwm_cmap, norm=norm_nwm)
     sm_nwm.set_array([])
-    fig.colorbar(sm_nwm, ax=axes[2], fraction=0.035, pad=0.08,
-                 label="Streamflow (m³/s)")
+    cb2 = fig.colorbar(sm_nwm, ax=axes[2], fraction=0.046, pad=0.03)
+    cb2.set_label("Streamflow (m³/s)", fontsize=CBAR_FS)
+    cb2.ax.tick_params(labelsize=TICK_FS)
 
-    # Timestamp text (centred above all panels)
-    time_text = fig.text(
-        0.5, 0.97,
-        "",
-        ha="center", va="top", fontsize=13, fontweight="bold",
-    )
+    # Timestamp as a figure suptitle (constrained_layout reserves space for it)
+    time_text = fig.suptitle("", fontsize=TIME_FS, fontweight="bold")
 
     # ── Update function ────────────────────────────────────────────────────────
     # FuncAnimation iterates over frame indices (0, 1, …); map to UTC hour via HOURS.
@@ -530,14 +752,9 @@ def make_animation(
             im_1h.set_data(np.zeros((2, 2)))
         im_1h.set_clim(0.01, QPE_1H_VMAX)
 
-        # -- MRMS 3h rolling --
-        f3 = frames_3h[frame_idx]
-        if f3 is not None:
-            im_3h.set_data(f3)
-            im_3h.set_extent(extent)
-        else:
-            im_3h.set_data(np.zeros((2, 2)))
-        im_3h.set_clim(0.01, QPE_3H_VMAX)
+        # -- Hyetograph: advance the current-hour marker + time line --
+        hyeto_line.set_xdata([xh[frame_idx], xh[frame_idx]])
+        hyeto_dot.set_data([xh[frame_idx]], [hy[frame_idx]])
 
         # -- NWM streamflow --
         q_map = nwm_frames[frame_idx]
@@ -566,7 +783,7 @@ def make_animation(
             f"{EVENT_DATE:%Y-%m-%d}  {h:02d}:00 UTC  "
             f"({edt_dt:%I:%M %p} EDT)"
         )
-        return [im_1h, im_3h, lc, time_text]
+        return [im_1h, lc, hyeto_dot, hyeto_line, time_text]
 
     # ── Render ─────────────────────────────────────────────────────────────────
     anim = FuncAnimation(
@@ -592,7 +809,19 @@ def main() -> None:
 
     # 1. MRMS
     frames_1h, lats, lons = load_all_mrms(fs_anon)
-    frames_3h = compute_3h_rolling(frames_1h)
+
+    # 1b. USGS 03294500 precip station hyetograph + event ARI (panel 2)
+    station_info, hyeto = load_precip_station()
+    ari = None
+    if station_info is not None and hyeto is not None and not hyeto.empty:
+        try:
+            a14_pt = atlas14_at_point(station_info["lat"], station_info["lon"])
+            ari = event_ari(hyeto, a14_pt)
+            if ari:
+                print(f"  Event ARI at station: peak {ari['depth']:.2f} in / {ari['dur']} h "
+                      f"≈ {ari['ari']:.0f}-yr")
+        except Exception as e:
+            print(f"  ARI computation failed: {e}")
 
     # 2. NHD flowlines
     try:
@@ -612,11 +841,34 @@ def main() -> None:
         print("  No COMIDs found — skipping NWM download.")
         nwm_frames = [{} for _ in HOURS]
 
-    # 4. Animate
+    # 3b. NWM colour diagnostic — why might reaches look uniform?
+    seg_set = {int(c) for c in seg_comids if c >= 0}
+    all_keys = set().union(*[set(f.keys()) for f in nwm_frames]) if nwm_frames else set()
+    matched = seg_set & all_keys
+    print("\n── NWM colour diagnostic ──────────────────────────────────────────────")
+    print(f"  flowline segments: {len(seg_comids)}  (unique COMIDs: {len(seg_set)})")
+    print(f"  NWM COMIDs returned across all hours: {len(all_keys)}")
+    print(f"  segments matched to an NWM value: {len(matched)}")
+    per_frame = [len(f) for f in nwm_frames]
+    print(f"  values/hour: min={min(per_frame) if per_frame else 0} "
+          f"max={max(per_frame) if per_frame else 0}")
+    all_q = [v for f in nwm_frames for v in f.values()]
+    if all_q:
+        print(f"  streamflow range over event: {min(all_q):.2f} – {max(all_q):.2f} m3/s "
+              f"(colour scale {NWM_Q_VMIN}-{NWM_Q_VMAX})")
+    if not matched:
+        print("  WARNING: no COMID overlap — reaches will be uniform. Check NHD comid "
+              "vs NWM feature_id, or that noaa-nwm-pds still has this date.")
+
+    # 4. Bridges (green regular / pink scour-critical) overlaid on both map panels
+    bridges = load_bridges()
+
+    # 5. Animate
     make_animation(
-        frames_1h, frames_3h, lats, lons,
+        frames_1h, station_info, hyeto, ari, lats, lons,
         flowlines, nwm_frames,
         all_segs, seg_comids,
+        bridges=bridges,
     )
 
     print("\nDone.")

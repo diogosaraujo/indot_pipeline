@@ -307,13 +307,24 @@ def _extract_one_hour(
                     return None
                 # Sort indices — required for efficient HDF5 reads
                 idx = np.sort(idx)
+
+                # NWM channel_rt variables are PACKED ints (scale_factor ~0.01,
+                # add_offset 0).  h5py returns raw ints (unlike xarray, which
+                # auto-applies), so decode by hand or values come out ~100x too big.
+                # Mirrors 10_download_nwm_gcp.py::_decode.  attrs are 1-element arrays.
+                def _decode(name: str) -> np.ndarray:
+                    dset = h[name]
+                    sf = float(np.asarray(dset.attrs.get("scale_factor", 1.0)).ravel()[0])
+                    off = float(np.asarray(dset.attrs.get("add_offset", 0.0)).ravel()[0])
+                    return dset[idx].astype(float) * sf + off
+
                 df = pd.DataFrame({
                     "comid":          all_ids[idx].astype(int),
-                    "streamflow_cms": h["streamflow"][idx].astype(float),
-                    "velocity_ms":    h["velocity"][idx].astype(float),
+                    "streamflow_cms": _decode("streamflow"),
+                    "velocity_ms":    _decode("velocity"),
                 })
                 if product == "analysis_assim" and "nudge" in h:
-                    df["nudge_cms"] = h["nudge"][idx].astype(float)
+                    df["nudge_cms"] = _decode("nudge")
                 df["datetime_utc"] = ts
                 return df
     except Exception as e:
