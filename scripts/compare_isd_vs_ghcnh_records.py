@@ -151,7 +151,7 @@ def main() -> None:
 
     print("=== Per-station distribution ===")
     print(f"  median ISD/GHCNh overlap frac : {df.overlap_frac_isd.median():.3f}")
-    print(f"  median corr on shared hours   : {df.corr.median():.3f}")
+    print(f"  median corr on shared hours   : {df['corr'].median():.3f}")
     print(f"  median MAE on shared hours    : {df.mae_in.median():.4f} in")
     print(f"  median wet-hour detect agree  : {df.wet_detect_agree.median():.3f}")
     print(f"  stations ISD starts earlier   : {(df.isd_first < df.ghcnh_first).sum()}")
