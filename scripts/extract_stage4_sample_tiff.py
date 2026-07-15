@@ -1,34 +1,40 @@
 """extract_stage4_sample_tiff.py
 
 Download a single NOAA Stage IV hourly QPE record, clip it to Indiana, and
-write a GeoTIFF that opens directly in ArcGIS.
+write a GeoTIFF (to S3) that opens directly in ArcGIS.
 
-This is a standalone inspection utility (not part of the S3 pipeline). It pulls
-one hour from the Iowa State University / Iowa Environmental Mesonet Stage IV
-archive — the same source script 05b uses:
+This is a standalone inspection utility. It pulls one hour from the Iowa State
+University / Iowa Environmental Mesonet Stage IV archive — the same source
+script 05b uses:
 
     https://mesonet.agron.iastate.edu/archive/data/{YYYY}/{MM}/{DD}/stage4/
         ST4.{YYYYMMDDHH}.01h.grb[2]
 
 Stage IV lives on a 4-km HRAP polar-stereographic grid in millimetres; the GRIB
 message carries 2-D (curvilinear) latitude/longitude arrays. We read it with
-cfgrib (same as pipeline script 05b — this avoids depending on GDAL's GRIB
-plugin, which is a separate conda package), then resample the curvilinear field
-onto a regular EPSG:4326 (lon/lat) grid over Indiana with a nearest-neighbour
-KDTree — the easiest thing to overlay in ArcGIS. Only GeoTIFF *writing* uses
+cfgrib (same as pipeline script 05b — avoids depending on GDAL's GRIB plugin),
+then resample the curvilinear field onto a regular EPSG:4326 (lon/lat) grid over
+Indiana with a nearest-neighbour KDTree. The GeoTIFF is built in memory and
+uploaded to S3 (bucket/prefix from config.yaml); only GeoTIFF *writing* uses
 GDAL/rasterio (the always-present GTiff driver), not GRIB reading.
 
-Usage:
-    python extract_stage4_sample_tiff.py                       # default sample hour
-    python extract_stage4_sample_tiff.py --datetime "2021-06-26 12"
-    python extract_stage4_sample_tiff.py --units in --out indiana_st4.tif
+Output S3 key (default):
+    s3://<output_bucket>/<output_prefix>samples/stage4_indiana_<stamp>_<units>.tif
 
-Requires: cfgrib, scipy, rasterio, numpy, requests  (all in the conda env).
+Usage:
+    python extract_stage4_sample_tiff.py                        # -> S3, default hour
+    python extract_stage4_sample_tiff.py --datetime "2021-06-26 12" --units in
+    python extract_stage4_sample_tiff.py --s3-key custom/key.tif
+    python extract_stage4_sample_tiff.py --local ./st4.tif      # also drop a local copy
+
+Requires: cfgrib, scipy, rasterio, numpy, requests, boto3  (all in the conda env).
+Run from the repo root (loads config.yaml), or pass --config.
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +42,11 @@ from pathlib import Path
 import numpy as np
 import rasterio
 import requests
+from rasterio.io import MemoryFile
 from rasterio.transform import from_bounds
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from utils import load_config, write_bytes_to_s3  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -135,7 +145,8 @@ def clip_to_indiana(grib_path: Path, units: str, res_deg: float) -> tuple:
     return vals.astype("float32"), transform
 
 
-def write_geotiff(array: np.ndarray, transform, out_path: Path, units: str) -> None:
+def geotiff_bytes(array: np.ndarray, transform, units: str) -> bytes:
+    """Build a single-band GeoTIFF entirely in memory and return its bytes."""
     filled = np.where(np.isfinite(array), array, NODATA_OUT).astype("float32")
     profile = {
         "driver": "GTiff",
@@ -148,15 +159,18 @@ def write_geotiff(array: np.ndarray, transform, out_path: Path, units: str) -> N
         "nodata": NODATA_OUT,
         "compress": "lzw",
     }
-    with rasterio.open(out_path, "w", **profile) as dst:
-        dst.write(filled, 1)
-        dst.update_tags(1, UNITS=units, PRODUCT="NOAA Stage IV 1h QPE")
+    with MemoryFile() as mem:
+        with mem.open(**profile) as dst:
+            dst.write(filled, 1)
+            dst.update_tags(1, UNITS=units, PRODUCT="NOAA Stage IV 1h QPE")
+        data = mem.read()
     valid = np.isfinite(array)
     log.info(
-        "Wrote %s  (%dx%d, EPSG:4326; valid pixels=%d, max=%.3f %s)",
-        out_path, array.shape[1], array.shape[0],
-        int(valid.sum()), float(np.nanmax(array)) if valid.any() else 0.0, units,
+        "Built GeoTIFF (%dx%d, EPSG:4326; valid pixels=%d, max=%.3f %s, %d bytes)",
+        array.shape[1], array.shape[0], int(valid.sum()),
+        float(np.nanmax(array)) if valid.any() else 0.0, units, len(data),
     )
+    return data
 
 
 def main() -> None:
@@ -168,13 +182,15 @@ def main() -> None:
                    help="Output units (default: mm, the Stage IV native unit)")
     p.add_argument("--res", type=float, default=0.03,
                    help="Output pixel size in degrees (default 0.03 ~ 3 km)")
-    p.add_argument("--out", default=None,
-                   help="Output GeoTIFF path (default: stage4_indiana_<stamp>.tif)")
+    p.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    p.add_argument("--s3-key", default=None,
+                   help="Override S3 key (default: <prefix>samples/stage4_indiana_<stamp>_<units>.tif)")
+    p.add_argument("--local", default=None,
+                   help="Also write a local copy to this path")
     args = p.parse_args()
 
     dt = datetime.strptime(args.datetime, "%Y-%m-%d %H").replace(tzinfo=timezone.utc)
-    out_path = Path(args.out) if args.out else Path(
-        f"stage4_indiana_{dt:%Y%m%d%H}_{args.units}.tif")
+    fname = f"stage4_indiana_{dt:%Y%m%d%H}_{args.units}.tif"
 
     raw = fetch_stage4(dt)
     with tempfile.TemporaryDirectory() as tmp:
@@ -182,8 +198,20 @@ def main() -> None:
         grib_path.write_bytes(raw)
         array, transform = clip_to_indiana(grib_path, args.units, args.res)
 
-    write_geotiff(array, transform, out_path, args.units)
-    log.info("Done. Open %s in ArcGIS (EPSG:4326 / WGS84).", out_path)
+    data = geotiff_bytes(array, transform, args.units)
+
+    cfg = load_config(args.config)
+    bucket = cfg["aws"]["output_bucket"]
+    prefix = cfg["aws"]["output_prefix"]
+    key = args.s3_key or f"{prefix}samples/{fname}"
+    write_bytes_to_s3(data, bucket, key)
+    log.info("Uploaded to s3://%s/%s", bucket, key)
+
+    if args.local:
+        Path(args.local).write_bytes(data)
+        log.info("Also wrote local copy: %s", args.local)
+
+    log.info("Done. Open in ArcGIS (EPSG:4326 / WGS84).")
 
 
 if __name__ == "__main__":

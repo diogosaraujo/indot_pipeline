@@ -39,6 +39,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 import requests
+from rasterio.io import MemoryFile
 from rasterio.transform import from_bounds
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -46,7 +47,9 @@ from utils import (  # noqa: E402
     apply_units,
     canonicalize_mrms_grid,
     decompress_gz,
+    load_config,
     open_mrms_grib,
+    write_bytes_to_s3,
 )
 
 logging.basicConfig(
@@ -134,7 +137,8 @@ def clip_to_indiana(arr: np.ndarray, lats: np.ndarray, lons: np.ndarray) -> tupl
     return sub.astype("float32"), transform
 
 
-def write_geotiff(array: np.ndarray, transform, out_path: Path, units: str) -> None:
+def geotiff_bytes(array: np.ndarray, transform, units: str) -> bytes:
+    """Build a single-band GeoTIFF entirely in memory and return its bytes."""
     filled = np.where(np.isfinite(array), array, NODATA_OUT).astype("float32")
     profile = {
         "driver": "GTiff", "dtype": "float32", "count": 1,
@@ -142,15 +146,18 @@ def write_geotiff(array: np.ndarray, transform, out_path: Path, units: str) -> N
         "crs": "EPSG:4326", "transform": transform,
         "nodata": NODATA_OUT, "compress": "lzw",
     }
-    with rasterio.open(out_path, "w", **profile) as dst:
-        dst.write(filled, 1)
-        dst.update_tags(1, UNITS=units, PRODUCT="NOAA MRMS MultiSensor QPE 01H Pass2")
+    with MemoryFile() as mem:
+        with mem.open(**profile) as dst:
+            dst.write(filled, 1)
+            dst.update_tags(1, UNITS=units, PRODUCT="NOAA MRMS MultiSensor QPE 01H Pass2")
+        data = mem.read()
     valid = np.isfinite(array)
     log.info(
-        "Wrote %s  (%dx%d, EPSG:4326; valid pixels=%d, max=%.3f %s)",
-        out_path, array.shape[1], array.shape[0], int(valid.sum()),
-        float(np.nanmax(array)) if valid.any() else 0.0, units,
+        "Built GeoTIFF (%dx%d, EPSG:4326; valid pixels=%d, max=%.3f %s, %d bytes)",
+        array.shape[1], array.shape[0], int(valid.sum()),
+        float(np.nanmax(array)) if valid.any() else 0.0, units, len(data),
     )
+    return data
 
 
 def main() -> None:
@@ -162,13 +169,15 @@ def main() -> None:
                    help="Output units (default: mm, the MRMS native unit)")
     p.add_argument("--folder", default=DEFAULT_FOLDER,
                    help=f"MRMS product folder (default: {DEFAULT_FOLDER})")
-    p.add_argument("--out", default=None,
-                   help="Output GeoTIFF path (default: mrms_indiana_<stamp>.tif)")
+    p.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    p.add_argument("--s3-key", default=None,
+                   help="Override S3 key (default: <prefix>samples/mrms_indiana_<stamp>_<units>.tif)")
+    p.add_argument("--local", default=None,
+                   help="Also write a local copy to this path")
     args = p.parse_args()
 
     dt = datetime.strptime(args.datetime, "%Y-%m-%d %H").replace(tzinfo=timezone.utc)
-    out_path = Path(args.out) if args.out else Path(
-        f"mrms_indiana_{dt:%Y%m%d%H}_{args.units}.tif")
+    fname = f"mrms_indiana_{dt:%Y%m%d%H}_{args.units}.tif"
 
     raw = fetch_mrms(dt, args.folder)
     with tempfile.TemporaryDirectory() as tmp:
@@ -183,8 +192,20 @@ def main() -> None:
 
     arr = apply_units(arr, kind="qpe", units=args.units)
     sub, transform = clip_to_indiana(arr, lats, lons)
-    write_geotiff(sub, transform, out_path, args.units)
-    log.info("Done. Open %s in ArcGIS (EPSG:4326 / WGS84).", out_path)
+    data = geotiff_bytes(sub, transform, args.units)
+
+    cfg = load_config(args.config)
+    bucket = cfg["aws"]["output_bucket"]
+    prefix = cfg["aws"]["output_prefix"]
+    key = args.s3_key or f"{prefix}samples/{fname}"
+    write_bytes_to_s3(data, bucket, key)
+    log.info("Uploaded to s3://%s/%s", bucket, key)
+
+    if args.local:
+        Path(args.local).write_bytes(data)
+        log.info("Also wrote local copy: %s", args.local)
+
+    log.info("Done. Open in ArcGIS (EPSG:4326 / WGS84).")
 
 
 if __name__ == "__main__":
