@@ -10,17 +10,20 @@ archive — the same source script 05b uses:
     https://mesonet.agron.iastate.edu/archive/data/{YYYY}/{MM}/{DD}/stage4/
         ST4.{YYYYMMDDHH}.01h.grb[2]
 
-Stage IV lives on a 4-km HRAP polar-stereographic grid in millimetres. GDAL's
-GRIB driver (via rasterio) reads that grid definition and georeferences it
-automatically, so we let it do the projection math, then warp/clip to a small
-Indiana window in EPSG:4326 (lon/lat) — the easiest thing to overlay in ArcGIS.
+Stage IV lives on a 4-km HRAP polar-stereographic grid in millimetres; the GRIB
+message carries 2-D (curvilinear) latitude/longitude arrays. We read it with
+cfgrib (same as pipeline script 05b — this avoids depending on GDAL's GRIB
+plugin, which is a separate conda package), then resample the curvilinear field
+onto a regular EPSG:4326 (lon/lat) grid over Indiana with a nearest-neighbour
+KDTree — the easiest thing to overlay in ArcGIS. Only GeoTIFF *writing* uses
+GDAL/rasterio (the always-present GTiff driver), not GRIB reading.
 
 Usage:
     python extract_stage4_sample_tiff.py                       # default sample hour
     python extract_stage4_sample_tiff.py --datetime "2021-06-26 12"
     python extract_stage4_sample_tiff.py --units in --out indiana_st4.tif
 
-Requires: rasterio, requests, numpy  (all in requirements.txt / the conda env).
+Requires: cfgrib, scipy, rasterio, numpy, requests  (all in the conda env).
 """
 from __future__ import annotations
 
@@ -34,7 +37,6 @@ import numpy as np
 import rasterio
 import requests
 from rasterio.transform import from_bounds
-from rasterio.warp import Resampling, reproject
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +52,10 @@ INDIANA_BOUNDS = (-88.35, 37.55, -84.55, 42.00)
 
 MM_TO_IN = 1.0 / 25.4
 NODATA_OUT = -9999.0
+# Null out target cells with no Stage IV source pixel within this many degrees
+# (~0.1 deg ~ 8-11 km, a bit over the 4-km grid spacing). Indiana is fully
+# inside the CONUS domain, so this only guards the very edges.
+MAX_NEIGHBOR_DEG = 0.10
 
 
 def fetch_stage4(dt: datetime) -> bytes:
@@ -74,42 +80,59 @@ def fetch_stage4(dt: datetime) -> bytes:
     )
 
 
+def open_stage4_grib(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Open a Stage IV GRIB with cfgrib; return (data_mm, lats_2d, lons_2d).
+
+    cfgrib handles both GRIB1 and GRIB2. The HRAP grid lat/lon are 2-D arrays
+    stored in the message; lons are normalized to -180..180. (Same logic as
+    pipeline script 05b.)"""
+    import cfgrib
+    datasets = cfgrib.open_datasets(str(path), indexpath="")
+    for ds in datasets:
+        for var in ds.data_vars:
+            da = ds[var]
+            lat_key = next((k for k in da.coords if "lat" in k.lower()), None)
+            lon_key = next((k for k in da.coords if "lon" in k.lower()), None)
+            if lat_key and lon_key:
+                data = da.values.astype(float)
+                lats = da.coords[lat_key].values
+                lons = da.coords[lon_key].values
+                lons = np.where(lons > 180, lons - 360, lons)
+                return data, lats, lons
+    raise ValueError(f"No lat/lon variables found in Stage IV file: {path}")
+
+
 def clip_to_indiana(grib_path: Path, units: str, res_deg: float) -> tuple:
-    """Reproject the Stage IV grid to EPSG:4326 clipped to Indiana.
+    """Resample the curvilinear Stage IV grid onto a regular EPSG:4326 grid over
+    Indiana via nearest-neighbour KDTree. Returns (array, transform). Nearest
+    keeps the native pixel values (no smoothing of the precip field)."""
+    from scipy.spatial import KDTree
 
-    Returns (array, transform, profile-crs). Nearest-neighbour resampling keeps
-    the native pixel values (no smoothing of the precip field)."""
-    west, south, east, north = INDIANA_BOUNDS
-    width = int(round((east - west) / res_deg))
-    height = int(round((north - south) / res_deg))
-    dst_transform = from_bounds(west, south, east, north, width, height)
-    dst = np.full((height, width), np.nan, dtype="float32")
+    data_mm, lats_2d, lons_2d = open_stage4_grib(grib_path)
+    log.info("Source Stage IV grid: %s points", data_mm.size)
 
-    with rasterio.open(grib_path) as src:
-        if src.crs is None:
-            raise RuntimeError(
-                "GDAL could not georeference this GRIB (no CRS). "
-                "Check that the GDAL GRIB driver is available."
-            )
-        log.info("Source grid: %s, %dx%d, CRS=%s",
-                 src.driver, src.width, src.height, src.crs.to_string())
-        reproject(
-            source=rasterio.band(src, 1),
-            destination=dst,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            dst_transform=dst_transform,
-            dst_crs="EPSG:4326",
-            src_nodata=src.nodata,
-            dst_nodata=np.nan,
-            resampling=Resampling.nearest,
-        )
+    # Regular Indiana target grid (row 0 = north so the GeoTIFF is north-up).
+    west, south0, east0, north = INDIANA_BOUNDS
+    width = int(round((east0 - west) / res_deg))
+    height = int(round((north - south0) / res_deg))
+    east = west + width * res_deg
+    south = north - height * res_deg
+    tlons = west + (np.arange(width) + 0.5) * res_deg
+    tlats = north - (np.arange(height) + 0.5) * res_deg
+    glon, glat = np.meshgrid(tlons, tlats)
+
+    tree = KDTree(np.column_stack([lats_2d.ravel(), lons_2d.ravel()]))
+    dist, idx = tree.query(np.column_stack([glat.ravel(), glon.ravel()]), workers=-1)
+    vals = data_mm.ravel()[idx].reshape(height, width)
+    vals = np.where(dist.reshape(height, width) > MAX_NEIGHBOR_DEG, np.nan, vals)
 
     # Mask Stage IV missing/negative sentinels, then optionally convert mm -> in.
-    dst = np.where(np.isfinite(dst) & (dst >= 0), dst, np.nan)
+    vals = np.where(np.isfinite(vals) & (vals >= 0), vals, np.nan)
     if units == "in":
-        dst = dst * MM_TO_IN
-    return dst, dst_transform
+        vals = vals * MM_TO_IN
+
+    transform = from_bounds(west, south, east, north, width, height)
+    return vals.astype("float32"), transform
 
 
 def write_geotiff(array: np.ndarray, transform, out_path: Path, units: str) -> None:
@@ -130,8 +153,8 @@ def write_geotiff(array: np.ndarray, transform, out_path: Path, units: str) -> N
         dst.update_tags(1, UNITS=units, PRODUCT="NOAA Stage IV 1h QPE")
     valid = np.isfinite(array)
     log.info(
-        "Wrote %s  (%dx%d, %s; valid pixels=%d, max=%.3f %s)",
-        out_path, array.shape[1], array.shape[0], "EPSG:4326",
+        "Wrote %s  (%dx%d, EPSG:4326; valid pixels=%d, max=%.3f %s)",
+        out_path, array.shape[1], array.shape[0],
         int(valid.sum()), float(np.nanmax(array)) if valid.any() else 0.0, units,
     )
 
