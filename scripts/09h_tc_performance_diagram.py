@@ -55,22 +55,34 @@ ARI_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
               "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#000000"]
 ARI_IDX    = {a: i for i, a in enumerate(ARIS)}
 
-# source key → parquet, marker, marker size, legend label
+# source key → parquet, default marker, default legend label
 SOURCES = {
     "watershed":       {"key": "analysis/event_confusion_matrix_tc_areal.parquet",
-                        "marker": "o", "size": 26, "label": "Watershed-mean MRMS"},
+                        "marker": "o", "label": "Watershed-mean MRMS"},
     "station_nearest": {"key": "analysis/event_confusion_matrix_tc_station.parquet",
-                        "marker": "^", "size": 32, "label": "Station gauge"},
+                        "marker": "^", "label": "Station gauge"},
     "nearest":         {"key": "analysis/event_confusion_matrix_tc.parquet",
-                        "marker": "*", "size": 90, "label": "Nearest-pixel MRMS"},
+                        "marker": "*", "label": "Nearest-pixel MRMS"},
 }
 
-# (source order, output stem) for each figure
+
+def marker_size(m):
+    return {"*": 90, "^": 34, "o": 26}.get(m, 30)
+
+
+# Per-figure config; optional `markers`/`labels`/`ari_label` override the defaults.
 FIGS = [
-    (["watershed", "station_nearest", "nearest"], "analysis/figures/tc_performance_3source"),
-    (["watershed", "station_nearest"],            "analysis/figures/tc_performance_watershed_station"),
-    (["station_nearest", "nearest"],              "analysis/figures/tc_performance_station_nearest"),
-    (["watershed", "nearest"],                    "analysis/figures/tc_performance_watershed_nearest"),
+    dict(order=["watershed", "station_nearest", "nearest"],
+         stem="analysis/figures/tc_performance_3source"),
+    dict(order=["watershed", "station_nearest"],
+         stem="analysis/figures/tc_performance_watershed_station"),
+    dict(order=["station_nearest", "nearest"],
+         stem="analysis/figures/tc_performance_station_nearest",
+         markers={"nearest": "o"},                        # circles for MRMS, not stars
+         labels={"station_nearest": "Precipitation Station"},
+         ari_label="Precipitation ARI"),
+    dict(order=["watershed", "nearest"],
+         stem="analysis/figures/tc_performance_watershed_nearest"),
 ]
 
 
@@ -94,14 +106,16 @@ def draw_background(ax):
 
 
 def label_bias(ax):
-    """Label each frequency-bias line with its value at the line end (in the margin)."""
+    """Label each frequency-bias line with its value at the line end, just INSIDE
+    the panel (so it works on every panel) with a light background for legibility."""
+    bbox = dict(boxstyle="round,pad=0.12", fc="white", alpha=0.6, ec="none")
     for b in BIAS:
         if b * SR_MAX <= 1.0:                                # exits the right edge
-            ax.text(SR_MAX * 1.02, b * SR_MAX, f"{b:g}", fontsize=7, color="0.4",
-                    ha="left", va="center", clip_on=False)
-        else:                                                # exits the top edge
-            ax.text(1.0 / b, 1.015, f"{b:g}", fontsize=7, color="0.4",
-                    ha="center", va="bottom", clip_on=False)
+            ax.text(SR_MAX * 0.98, b * SR_MAX, f"{b:g}", fontsize=7, color="0.35",
+                    ha="right", va="center", bbox=bbox, zorder=5)
+        else:                                                # exits the top → sit below the title
+            ax.text(1.0 / b, 0.96, f"{b:g}", fontsize=7, color="0.35",
+                    ha="center", va="top", bbox=bbox, zorder=5)
 
 
 def pod_sr(sub):
@@ -128,18 +142,25 @@ def load_sources(bucket, prefix, order):
     return out
 
 
-def make_combined(loaded, order, out_stem, bucket, prefix):
+def make_combined(loaded, fig_cfg, bucket, prefix):
+    order     = fig_cfg["order"]
+    out_stem  = fig_cfg["stem"]
+    markers   = fig_cfg.get("markers", {})                  # per-source marker overrides
+    labels    = fig_cfg.get("labels", {})                   # per-source legend-label overrides
+    ari_label = fig_cfg.get("ari_label", "ARI (yr)")
+    mk = lambda s: markers.get(s, SOURCES[s]["marker"])
+
     fig = plt.figure(figsize=(6.5, 6.5))
-    # Panels fill the upper area (right margin left for the rightmost panel's
-    # frequency-bias labels); the bottom band holds the ARI colorbar (full width)
-    # over a row with the CSI colorbar (left) beside the symbol legend (right).
-    gs = fig.add_gridspec(1, 3, left=0.085, right=0.90, top=0.955, bottom=0.30, wspace=0.13)
+    # Panels fill the upper area; the bottom band holds the ARI colorbar (full
+    # width) over a row with the CSI colorbar (left) beside the symbol legend.
+    gs = fig.add_gridspec(1, 3, left=0.085, right=0.98, top=0.955, bottom=0.30, wspace=0.13)
     axes = [fig.add_subplot(gs[0, i]) for i in range(3)]
 
     cf = None
     for ax, flow_rp in zip(axes, FLOW_RPS):
         cf, cs = draw_background(ax)
-        ax.clabel(cs, fmt="%.2f", fontsize=7, inline=True, inline_spacing=2)
+        for t in ax.clabel(cs, fmt="%.2f", fontsize=7, inline=True, inline_spacing=2):
+            t.set_bbox(dict(boxstyle="round,pad=0.05", fc="white", alpha=0.6, ec="none"))
         for s in order:
             df = loaded.get(s)
             if df is None:
@@ -149,9 +170,10 @@ def make_combined(loaded, order, out_stem, bucket, prefix):
                 continue
             rps, sr, pod = pod_sr(sub)
             colors = [ARI_COLORS[ARI_IDX[int(round(r))]] for r in rps]
-            ax.plot(sr, pod, color="0.5", lw=0.6, zorder=4)
-            ax.scatter(sr, pod, c=colors, marker=SOURCES[s]["marker"],
-                       s=SOURCES[s]["size"], edgecolor="k", linewidth=0.4, zorder=6)
+            ax.plot(sr, pod, color="black", lw=1.4, zorder=5)
+            ax.scatter(sr, pod, c=colors, marker=mk(s), s=marker_size(mk(s)),
+                       edgecolor="k", linewidth=0.4, zorder=6)
+        label_bias(ax)                                       # bias values on EVERY panel
         ax.set_xlim(0, SR_MAX)
         ax.set_ylim(0, 1)
         ax.set_xticks([0, 0.1, 0.2, 0.3])
@@ -162,10 +184,9 @@ def make_combined(loaded, order, out_stem, bucket, prefix):
         ax.tick_params(labelsize=7)
         if ax is not axes[0]:
             ax.set_yticklabels([])
-    label_bias(axes[-1])       # frequency-bias values in the rightmost panel's margin
 
     # Shared axis labels — x-label sits clearly BELOW the tick labels.
-    fig.text(0.49, 0.255, "Success ratio  (1 − FAR)", ha="center", fontsize=8)
+    fig.text(0.53, 0.255, "Success ratio  (1 − FAR)", ha="center", fontsize=8)
     fig.text(0.020, 0.63, "Probability of detection (POD)", rotation=90, va="center", fontsize=8)
 
     # ── ARI discrete colorbar (full width) ────────────────────────────────────
@@ -177,7 +198,7 @@ def make_combined(loaded, order, out_stem, bucket, prefix):
                           ticks=np.arange(len(ARIS)) + 0.5)
     cb_ari.ax.set_xticklabels([str(a) for a in ARIS])
     cb_ari.ax.tick_params(labelsize=7, length=0)
-    fig.text(0.16, 0.169, "ARI (yr)", ha="right", va="center", fontsize=7)
+    fig.text(0.16, 0.169, ari_label, ha="right", va="center", fontsize=7)
 
     # ── CSI colorbar (left) beside the symbol legend (right) ──────────────────
     cax_csi = fig.add_axes([0.17, 0.065, 0.34, 0.028])
@@ -185,8 +206,8 @@ def make_combined(loaded, order, out_stem, bucket, prefix):
     cb_csi.ax.tick_params(labelsize=7)
     fig.text(0.16, 0.079, "CSI", ha="right", va="center", fontsize=7)
 
-    handles = [Line2D([0], [0], marker=SOURCES[s]["marker"], color="0.3", ls="",
-                      ms=7, mec="k", mew=0.4, label=SOURCES[s]["label"]) for s in order]
+    handles = [Line2D([0], [0], marker=mk(s), color="0.3", ls="", ms=7, mec="k", mew=0.4,
+                      label=labels.get(s, SOURCES[s]["label"])) for s in order]
     fig.legend(handles=handles, loc="center left", bbox_to_anchor=(0.58, 0.08),
                ncol=1, fontsize=7, frameon=False, handletextpad=0.3, labelspacing=0.6)
     fig.text(0.985, 0.015, "dashed = frequency bias", ha="right", fontsize=7,
@@ -207,8 +228,8 @@ def main() -> None:
     cfg = load_config()
     bucket, prefix = cfg["aws"]["output_bucket"], cfg["aws"]["output_prefix"]
     loaded = load_sources(bucket, prefix, ["watershed", "station_nearest", "nearest"])
-    for order, out_stem in FIGS:
-        make_combined(loaded, order, out_stem, bucket, prefix)
+    for fig_cfg in FIGS:
+        make_combined(loaded, fig_cfg, bucket, prefix)
 
 
 if __name__ == "__main__":
