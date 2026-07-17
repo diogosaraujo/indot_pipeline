@@ -140,7 +140,7 @@ def plot_manuscript(site_no, annual_max, params, q_estimates, gof) -> plt.Figure
     ax.yaxis.set_minor_formatter(mticker.NullFormatter())
     ax.grid(True, which="both", alpha=0.25, ls="--")
 
-    leg = ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+    leg = ax.legend(loc="lower right", fontsize=6, framealpha=0.9)
     fig.tight_layout()
 
     # ── Stats block just ABOVE the legend, right-aligned to it ────────────────
@@ -166,7 +166,7 @@ def plot_manuscript(site_no, annual_max, params, q_estimates, gof) -> plt.Figure
     (lx0, ly0) = inv.transform((bb.x0, bb.y0))
     (lx1, ly1) = inv.transform((bb.x1, bb.y1))
     ax.text(lx1, ly1 + 0.025, txt, transform=ax.transAxes,
-            va="bottom", ha="right", fontsize=8, family="monospace",
+            va="bottom", ha="right", fontsize=6, family="monospace",
             bbox=dict(boxstyle="round", fc="white", alpha=0.9, ec="lightgrey"))
     return fig
 
