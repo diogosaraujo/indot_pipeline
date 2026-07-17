@@ -12,13 +12,14 @@ Method (mirrors Atlas 14's own approach where feasible)
      per-year completeness screen so MRMS gaps don't deflate the annual max).
   2. Fit a GEV by the method of L-moments (Hosking 1990) — Atlas 14's distribution
      and estimator.
-  3. REGIONAL FREQUENCY ANALYSIS (index-flood; Hosking & Wallis 1997): pool all
-     stations into a region, average their L-moment ratios (record-length
-     weighted), fit ONE regional GEV growth curve, and scale it per station by
-     the at-site mean (index flood). This trades spatial replication (106 basins)
-     for the record length we don't have — giving stable P500/P1000.
-  4. Diagnostics: discordancy D_i per site; heterogeneity H per duration
-     (Monte-Carlo, simulated from the fitted regional GEV — see note below).
+  3. Estimate quantiles per station. Two modes (--method):
+       atsite   (default) — fit the GEV to each station's OWN AMS L-moments. Simple;
+                            the far tail (P200-P1000) is noisier on the ~24-yr record.
+       regional           — index-flood L-moment pooling (Hosking & Wallis 1997):
+                            one regional GEV growth curve scaled per station by the
+                            at-site mean, trading spatial replication for record
+                            length (more robust tail). Emits discordancy D_i per
+                            site and heterogeneity H per duration.
 
 Output (schema identical to Atlas 14 / script 07, so an areal 08c reads it):
     mrms/<PRODUCT>/areal_precip_frequency.parquet
@@ -171,6 +172,21 @@ def regional_fit(sites: list[dict], nsim: int, rng):
     return region, R, site_rows
 
 
+def atsite_fit(sites: list[dict]):
+    """At-site GEV per station (no pooling). Returns (per_site_rows, site_diag_df)."""
+    F = np.array([1.0 - 1.0 / T for T in RETURN_PERIODS])
+    recs, site_rows = [], []
+    for s in sites:
+        l1, l2, t, t3, t4 = sample_lmoments(s["ams"])
+        xi, alpha, k = gev_params_from_lmom(l1, l2, t3)
+        for T, dep in zip(RETURN_PERIODS, gev_quantile(F, xi, alpha, k)):
+            site_rows.append({"site_no": s["site_no"], "return_period_yr": T,
+                              "depth_in": round(float(dep), 4)})
+        recs.append({"site_no": s["site_no"], "mean": l1, "t": t, "t3": t3, "t4": t4,
+                     "gev_xi": xi, "gev_alpha": alpha, "gev_k": k, "n": len(s["ams"])})
+    return site_rows, pd.DataFrame(recs)
+
+
 # ══ AMS extraction ════════════════════════════════════════════════════════════
 
 def annual_maxima(series: pd.Series, d: int, min_frac: float):
@@ -222,7 +238,10 @@ def main() -> None:
     ap.add_argument("--product", default="QPE_01H_Pass2")
     ap.add_argument("--universe-key", default="analysis/event_confusion_matrix_tc.parquet")
     ap.add_argument("--all", action="store_true",
-                    help="pool ALL watershed-mean stations (bigger region) instead of the 106")
+                    help="use ALL watershed-mean stations instead of the 106")
+    ap.add_argument("--method", choices=["atsite", "regional"], default="atsite",
+                    help="atsite = GEV per station (no pooling, default); "
+                         "regional = index-flood L-moment pooling")
     ap.add_argument("--min-years", type=int, default=MIN_YEARS)
     ap.add_argument("--min-frac", type=float, default=MIN_FRAC)
     ap.add_argument("--nsim", type=int, default=NSIM)
@@ -252,19 +271,24 @@ def main() -> None:
             log.warning("D=%dh: only %d eligible stations — skipping", d, len(sites))
             continue
 
-        region, R, site_rows = regional_fit(sites, args.nsim, rng)
+        if args.method == "regional":
+            region, R, site_rows = regional_fit(sites, args.nsim, rng)
+            R["discordant"] = R["D"] > 3.0
+            region["duration_hr"] = d
+            region_diag.append(region)
+            log.info("D=%2dh | %3d sites | tR=%.3f t3R=%.3f k=%.3f | H=%.2f%s | median n=%d yr",
+                     d, region["n_sites"], region["tR"], region["t3R"], region["gev_k"],
+                     region["H"], "  (heterogeneous!)" if region["H"] >= 2 else "",
+                     region["n_years_median"])
+        else:  # atsite
+            site_rows, R = atsite_fit(sites)
+            log.info("D=%2dh | %3d sites | at-site GEV | median k=%.3f | median n=%d yr",
+                     d, len(R), float(R["gev_k"].median()), int(R["n"].median()))
         for row in site_rows:
             row["duration_hr"] = d
             ddf_rows.append(row)
         R["duration_hr"] = d
-        R["discordant"] = R["D"] > 3.0
         site_diag.append(R)
-        region["duration_hr"] = d
-        region_diag.append(region)
-        log.info("D=%2dh | %3d sites | tR=%.3f t3R=%.3f k=%.3f | H=%.2f%s | median n=%d yr",
-                 d, region["n_sites"], region["tR"], region["t3R"], region["gev_k"],
-                 region["H"], "  (heterogeneous!)" if region["H"] >= 2 else "",
-                 region["n_years_median"])
 
     if not ddf_rows:
         log.error("No DDF produced — check inputs.")
@@ -274,15 +298,16 @@ def main() -> None:
     write_parquet_to_s3(ddf, bucket, f"{prefix}mrms/{args.product}/areal_precip_frequency.parquet")
     write_parquet_to_s3(pd.concat(site_diag, ignore_index=True), bucket,
                         f"{prefix}analysis/areal_ddf_site_diag.parquet")
-    write_parquet_to_s3(pd.DataFrame(region_diag), bucket,
-                        f"{prefix}analysis/areal_ddf_region_diag.parquet")
-    log.info("Wrote areal DDF (%d rows) + diagnostics to s3://%s/%smrms/%s/",
-             len(ddf), bucket, prefix, args.product)
+    log.info("Wrote areal DDF (%d rows, method=%s) + site diagnostics to s3://%s/%smrms/%s/",
+             len(ddf), args.method, bucket, prefix, args.product)
 
-    het = [r["duration_hr"] for r in region_diag if r["H"] >= 2]
-    if het:
-        log.warning("Durations flagged HETEROGENEOUS (H>=2): %s — consider sub-regioning "
-                    "(e.g., by cluster) before trusting these growth curves.", het)
+    if region_diag:                                        # regional mode only
+        write_parquet_to_s3(pd.DataFrame(region_diag), bucket,
+                            f"{prefix}analysis/areal_ddf_region_diag.parquet")
+        het = [r["duration_hr"] for r in region_diag if r["H"] >= 2]
+        if het:
+            log.warning("Durations flagged HETEROGENEOUS (H>=2): %s — consider sub-regioning "
+                        "before trusting these growth curves.", het)
 
 
 # ══ Self-test ═════════════════════════════════════════════════════════════════
