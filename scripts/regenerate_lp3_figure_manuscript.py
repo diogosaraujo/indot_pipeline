@@ -110,25 +110,37 @@ def plot_manuscript(site_no, annual_max, params, q_estimates, gof) -> plt.Figure
             continue
         c = rp_colors.get(rp, "grey")
         ax.axvline(rp, color=c, ls="--", lw=0.8, alpha=0.7)
-        ax.scatter([rp], [q_val], marker="D", s=22, color=c, zorder=6)
-        ax.text(rp * 1.06, q_val * 1.1, f"Q{rp}\n{q_val:,.0f} cfs",
-                fontsize=5.5, color=c, va="bottom")
+        ax.scatter([rp], [q_val], marker="D", s=24, color=c, zorder=6)
+        # Label offset above the point cloud, drawn ON TOP of the dots (high
+        # zorder) with a white backing box so the value stays legible.
+        ax.annotate(
+            f"Q{rp}\n{q_val:,.0f} cfs",
+            xy=(rp, q_val), xytext=(rp * 1.08, q_val * 1.22),
+            fontsize=8, fontweight="bold", color=c, va="bottom", ha="left",
+            zorder=12,
+            bbox=dict(boxstyle="round,pad=0.15", fc="white", alpha=0.8, ec="none"),
+        )
 
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("Return Period (years)", fontsize=8)
-    ax.set_ylabel("Peak Discharge (cfs)", fontsize=8)
+    ax.set_xlabel("Return Period (years)", fontsize=10)
+    ax.set_ylabel("Peak Discharge (cfs)", fontsize=10)
     ax.set_title(
         f"LP3 Frequency Curve — Station {site_no}\n"
         f"Bulletin 17C {method}, weighted skew (at-site w={w_s:.2f} / regional w={w_r:.2f})",
-        fontsize=8,
+        fontsize=10,
     )
-    ax.tick_params(labelsize=7)
+    ax.tick_params(labelsize=8)
     ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
-    ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
+    # Y-axis: force consistent plain (non-scientific) labels on the log scale.
+    # matplotlib's default labels the decade tick plainly ("1000") but the
+    # intermediate ticks in sci notation ("2×10³", "6×10²") — hence the mix.
+    ax.yaxis.set_major_locator(mticker.LogLocator(base=10, subs=(1, 2, 3, 4, 6), numticks=15))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax.yaxis.set_minor_formatter(mticker.NullFormatter())
     ax.grid(True, which="both", alpha=0.25, ls="--")
 
-    leg = ax.legend(loc="lower right", fontsize=6, framealpha=0.9)
+    leg = ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
     fig.tight_layout()
 
     # ── Stats block just ABOVE the legend, right-aligned to it ────────────────
@@ -154,7 +166,7 @@ def plot_manuscript(site_no, annual_max, params, q_estimates, gof) -> plt.Figure
     (lx0, ly0) = inv.transform((bb.x0, bb.y0))
     (lx1, ly1) = inv.transform((bb.x1, bb.y1))
     ax.text(lx1, ly1 + 0.025, txt, transform=ax.transAxes,
-            va="bottom", ha="right", fontsize=6, family="monospace",
+            va="bottom", ha="right", fontsize=8, family="monospace",
             bbox=dict(boxstyle="round", fc="white", alpha=0.9, ec="lightgrey"))
     return fig
 
