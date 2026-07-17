@@ -55,7 +55,9 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s")
 log = logging.getLogger("07a_areal_pf")
 
-DURATIONS_HR    = [1, 2, 3, 6, 12, 24, 48, 72]
+# Atlas-14-style durations: sub-daily (hourly floor — MRMS is hourly) plus the
+# multi-day durations 1,2,3,4,7,10,20 day, so Kirpich Tc up to ~20 d is bracketed.
+DURATIONS_HR    = [1, 2, 3, 6, 12, 24, 48, 72, 96, 168, 240, 480]
 RETURN_PERIODS  = [2, 5, 10, 25, 50, 100, 200, 500, 1000]   # AMS GEV: T>=2 only
 MIN_YEARS       = 12       # min screened annual maxima for a station to enter
 MIN_FRAC        = 0.80     # min fraction of a water year's hours present to count it

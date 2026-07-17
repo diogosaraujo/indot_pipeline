@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import io
+import math
 from pathlib import Path
 
 import matplotlib
@@ -98,9 +99,15 @@ def plot_panel(ax, ams, duration):
 
 
 def make_station_figure(site, series, min_years, min_frac):
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8), sharex=True)
+    nd = len(m.DURATIONS_HR)
+    ncols = 4
+    nrows = math.ceil(nd / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 2.7 * nrows),
+                             sharex=True, squeeze=False)
+    flat = axes.ravel()
     rows = []
-    for ax, d in zip(axes.ravel(), m.DURATIONS_HR):
+    for j, d in enumerate(m.DURATIONS_HR):
+        ax = flat[j]
         ams = m.annual_maxima(series, d, min_frac)
         if len(ams) < min_years:
             ax.set_title(f"D={d}h  (n={len(ams)} < {min_years})", fontsize=8)
@@ -109,7 +116,9 @@ def make_station_figure(site, series, min_years, min_frac):
         row = plot_panel(ax, ams, d)
         row["site_no"] = site
         rows.append(row)
-    for ax in axes[1, :]:
+    for k in range(nd, nrows * ncols):          # hide any unused cells
+        flat[k].set_axis_off()
+    for ax in axes[-1, :]:
         ax.set_xlabel("Return period (yr)", fontsize=8)
     for ax in axes[:, 0]:
         ax.set_ylabel("Areal precip depth (in)", fontsize=8)
