@@ -6,11 +6,15 @@ triggers on the SAME 106 gauges:
     triangles = station gauge (ISD/GHCNh) (08h, event_confusion_matrix_tc_station)
     stars     = nearest-pixel MRMS       (08c, event_confusion_matrix_tc)
 
-Two figures, each 6.5 x 6.5 in, three panels in one row (Q10 / Q50 / Q100), CSI
-shading + frequency-bias lines behind, markers coloured by precipitation ARI, with
-two horizontal colorbars (ARI, CSI) below the panels:
-    Figure 1  tc_performance_3source   — all three sources
-    Figure 2  tc_performance_2source   — watershed + station only (no nearest-pixel)
+Four figures, each 6.5 x 6.5 in, three panels in one row (Q10 / Q50 / Q100), CSI
+shading + frequency-bias lines behind, markers coloured by precipitation ARI. The
+success-ratio axis is zoomed to 0–0.4 to separate the (clustered) points. Below
+the panels the bottom band holds the two horizontal colorbars (ARI, CSI) on the
+left and the symbol legend on the right:
+    tc_performance_3source            — all three sources
+    tc_performance_watershed_station  — watershed + station
+    tc_performance_station_nearest    — station + nearest-pixel
+    tc_performance_watershed_nearest  — watershed + nearest-pixel
 
 Each point is one ARI threshold, pooled TP/FP/FN over all stations:
     x = success ratio  SR = TP/(TP+FP) = 1 - FAR
@@ -52,10 +56,15 @@ SOURCES = {
     "nearest":         {"key": "analysis/event_confusion_matrix_tc.parquet",
                         "marker": "*", "size": 90, "label": "Nearest-pixel MRMS"},
 }
-FIG1_ORDER = ["watershed", "station_nearest", "nearest"]
-FIG2_ORDER = ["watershed", "station_nearest"]
-OUT1 = "analysis/figures/tc_performance_3source"
-OUT2 = "analysis/figures/tc_performance_2source"
+SR_MAX = 0.4       # zoom the success-ratio axis to separate the clustered points
+
+# (source order, output stem) for each figure
+FIGS = [
+    (["watershed", "station_nearest", "nearest"], "analysis/figures/tc_performance_3source"),
+    (["watershed", "station_nearest"],            "analysis/figures/tc_performance_watershed_station"),
+    (["station_nearest", "nearest"],              "analysis/figures/tc_performance_station_nearest"),
+    (["watershed", "nearest"],                    "analysis/figures/tc_performance_watershed_nearest"),
+]
 
 
 def _read(bucket, key, columns=None):
@@ -101,7 +110,9 @@ def load_sources(bucket, prefix, order):
 
 def make_combined(loaded, order, out_stem, bucket, prefix):
     fig = plt.figure(figsize=(6.5, 6.5))
-    gs = fig.add_gridspec(1, 3, left=0.09, right=0.975, top=0.85, bottom=0.24, wspace=0.16)
+    # Panels take the whole upper area; bottom band (below 0.28) holds the
+    # colorbars (left) and symbol legend (right), side by side.
+    gs = fig.add_gridspec(1, 3, left=0.085, right=0.985, top=0.95, bottom=0.28, wspace=0.12)
     axes = [fig.add_subplot(gs[0, i]) for i in range(3)]
 
     cf = None
@@ -118,40 +129,42 @@ def make_combined(loaded, order, out_stem, bucket, prefix):
             ax.plot(sr, pod, color="0.45", lw=0.7, zorder=4)
             ax.scatter(sr, pod, c=rps, cmap=CMAP, norm=ARI_NORM, marker=SOURCES[s]["marker"],
                        s=SOURCES[s]["size"], edgecolor="k", linewidth=0.4, zorder=6)
-        ax.set_xlim(0, 1)
+        ax.set_xlim(0, SR_MAX)
         ax.set_ylim(0, 1)
+        ax.set_xticks([0, 0.1, 0.2, 0.3, 0.4])
+        # Drop the rightmost "0.4" except on the last panel so it doesn't collide
+        # with the next panel's "0" when packed tight.
+        ax.set_xticklabels(["0", "0.1", "0.2", "0.3", "0.4" if ax is axes[-1] else ""])
         ax.set_title(f"Q{flow_rp}", fontsize=9)
         ax.tick_params(labelsize=7)
         if ax is not axes[0]:
             ax.set_yticklabels([])
 
-    fig.text(0.53, 0.205, "Success ratio  (1 − FAR)", ha="center", fontsize=8)
-    fig.text(0.022, 0.545, "Probability of detection (POD)", rotation=90, va="center", fontsize=8)
+    # Shared axis labels — x-label sits clearly BELOW the tick labels.
+    fig.text(0.535, 0.225, "Success ratio  (1 − FAR)", ha="center", fontsize=8)
+    fig.text(0.020, 0.615, "Probability of detection (POD)", rotation=90, va="center", fontsize=8)
 
-    # ── Two horizontal colorbars below the panels ─────────────────────────────
-    cax_ari = fig.add_axes([0.17, 0.150, 0.68, 0.022])
-    cax_csi = fig.add_axes([0.17, 0.070, 0.68, 0.022])
+    # ── Bottom band: colorbars (left) beside the symbol legend (right) ────────
+    cax_ari = fig.add_axes([0.17, 0.135, 0.38, 0.025])
+    cax_csi = fig.add_axes([0.17, 0.060, 0.38, 0.025])
     sm = cm.ScalarMappable(norm=ARI_NORM, cmap=CMAP)
     sm.set_array([])
     cb_ari = fig.colorbar(sm, cax=cax_ari, orientation="horizontal", ticks=[1, 10, 100, 1000])
-    cb_ari.ax.tick_params(labelsize=7)
     cb_ari.ax.set_xticklabels(["1", "10", "100", "1000"])
-    fig.text(0.155, 0.161, "ARI (yr)", ha="right", va="center", fontsize=7)
+    cb_ari.ax.tick_params(labelsize=7)
+    fig.text(0.16, 0.1475, "ARI (yr)", ha="right", va="center", fontsize=7)
     cb_csi = fig.colorbar(cf, cax=cax_csi, orientation="horizontal")
     cb_csi.ax.tick_params(labelsize=7)
-    fig.text(0.155, 0.081, "CSI", ha="right", va="center", fontsize=7)
+    fig.text(0.16, 0.0725, "CSI", ha="right", va="center", fontsize=7)
 
-    # ── Shape legend (grey; shape = source, colour = ARI) ─────────────────────
     handles = [Line2D([0], [0], marker=SOURCES[s]["marker"], color="0.3", ls="",
                       ms=7, mec="k", mew=0.4, label=SOURCES[s]["label"]) for s in order]
-    fig.legend(handles=handles, loc="upper center", ncol=len(order), fontsize=7,
-               frameon=False, bbox_to_anchor=(0.53, 0.965),
-               handletextpad=0.3, columnspacing=1.1)
-    fig.text(0.975, 0.028, "dashed = frequency bias", ha="right", fontsize=7,
+    fig.legend(handles=handles, loc="center left", bbox_to_anchor=(0.60, 0.105),
+               ncol=1, fontsize=7, frameon=False, handletextpad=0.3, labelspacing=0.7)
+    fig.text(0.985, 0.018, "dashed = frequency bias", ha="right", fontsize=7,
              color="0.4", style="italic")
 
-    # Exact 6.5x6.5 (no bbox_inches='tight').
-    for ext in ("png", "pdf"):
+    for ext in ("png", "pdf"):                               # exact 6.5x6.5 (no bbox_tight)
         buf = io.BytesIO()
         kw = {"format": ext}
         if ext == "png":
@@ -165,9 +178,9 @@ def make_combined(loaded, order, out_stem, bucket, prefix):
 def main() -> None:
     cfg = load_config()
     bucket, prefix = cfg["aws"]["output_bucket"], cfg["aws"]["output_prefix"]
-    loaded = load_sources(bucket, prefix, FIG1_ORDER)
-    make_combined(loaded, FIG1_ORDER, OUT1, bucket, prefix)   # all three sources
-    make_combined(loaded, FIG2_ORDER, OUT2, bucket, prefix)   # no nearest-pixel
+    loaded = load_sources(bucket, prefix, ["watershed", "station_nearest", "nearest"])
+    for order, out_stem in FIGS:
+        make_combined(loaded, order, out_stem, bucket, prefix)
 
 
 if __name__ == "__main__":
