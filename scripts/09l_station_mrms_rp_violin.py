@@ -116,7 +116,9 @@ def main() -> None:
                                              columns=["site_no"])["site_no"].astype(str)))
     log.info("Universe: %d stations", len(stations))
 
-    atlas14 = m.load_atlas14(bucket, prefix)
+    atlas14 = m.load_atlas14(bucket, prefix)                          # streamgage climatology (MRMS)
+    atlas14_st = m._read_parquet_s3(bucket, f"{prefix}atlas14/precipitation_frequency_stations.parquet")
+    atlas14_st["station_id"] = atlas14_st["station_id"].astype(str)   # station climatology (gauge trigger)
     tc_by_site = m08c.load_tc(bucket, prefix)
     mrms = m.load_mrms_nearest(bucket, prefix, product_key)
     mrms_start = mrms.groupby("site_no")["datetime_utc"].min()
@@ -135,10 +137,10 @@ def main() -> None:
         a14_site = atlas14[atlas14["site_no"] == s]
         if a14_site.empty:
             continue
-        depths = {p: m08c.depth_at_duration(a14_site, p, d_tc) for p in ARIS}
-        depths = {p: (d if np.isfinite(d) and d > 0 else None) for p, d in depths.items()}
+        depths_mrms = {p: m08c.depth_at_duration(a14_site, p, d_tc) for p in ARIS}
+        depths_mrms = {p: (d if np.isfinite(d) and d > 0 else None) for p, d in depths_mrms.items()}
 
-        # MRMS nearest pixel (flow ∩ MRMS window)
+        # MRMS nearest pixel (flow ∩ MRMS window) — streamgage climatology
         if s in mrms_start.index:
             ws = max(flow.index.min(), mrms_start[s]); we = min(flow.index.max(), mrms_end[s])
             if not (pd.isna(ws) or pd.isna(we) or ws >= we):
@@ -147,24 +149,28 @@ def main() -> None:
                           .sort_index().reindex(grid).fillna(0.0))
                 roll = precip.rolling(d_tc, min_periods=d_tc).sum()
                 for p in ARIS:
-                    if depths[p] is None:
+                    if depths_mrms[p] is None:
                         continue
-                    wet = (roll >= depths[p]).fillna(False)
+                    wet = (roll >= depths_mrms[p]).fillna(False)
                     rp["mrms"][p].extend(events_to_rps(wet, flow, b04_row))
 
-        # Nearest qualifying station gauge (08d pairing)
+        # Nearest qualifying station gauge (08d pairing) — the station's OWN climatology
         if s in coords.index:
             cc = coords.loc[s]
             assigned = m08d.assign_station(float(cc["dec_lat_va"]), float(cc["dec_long_va"]),
                                            flow.index.min(), flow.index.max(), qual, hourly_by_sid)
             if assigned is not None:
-                precip_grid = assigned[4]
-                roll = precip_grid.rolling(d_tc, min_periods=d_tc).sum()
-                for p in ARIS:
-                    if depths[p] is None:
-                        continue
-                    wet = (roll >= depths[p]).fillna(False)
-                    rp["station"][p].extend(events_to_rps(wet, flow, b04_row))
+                sid = assigned[0]
+                a14_sta = atlas14_st[atlas14_st["station_id"] == sid]
+                if not a14_sta.empty:
+                    depths_sta = {p: m08c.depth_at_duration(a14_sta, p, d_tc) for p in ARIS}
+                    depths_sta = {p: (d if np.isfinite(d) and d > 0 else None) for p, d in depths_sta.items()}
+                    roll = assigned[4].rolling(d_tc, min_periods=d_tc).sum()
+                    for p in ARIS:
+                        if depths_sta[p] is None:
+                            continue
+                        wet = (roll >= depths_sta[p]).fillna(False)
+                        rp["station"][p].extend(events_to_rps(wet, flow, b04_row))
         if i % 20 == 0:
             log.info("  %d/%d stations", i, len(stations))
 

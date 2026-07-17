@@ -56,8 +56,11 @@ def main() -> None:
     cfg = load_config()
     bucket, prefix = cfg["aws"]["output_bucket"], cfg["aws"]["output_prefix"]
 
-    log.info("Loading inputs (Atlas 14, flow stats, streamflow, Tc)...")
-    atlas14    = m.load_atlas14(bucket, prefix)
+    log.info("Loading inputs (station Atlas 14, flow stats, streamflow, Tc)...")
+    # Atlas 14 keyed by PRECIP STATION (07c): the station's rain is judged against
+    # its OWN climatology, not the streamgage's (climatology-mismatch fix).
+    atlas14_st = m._read_parquet_s3(bucket, f"{prefix}atlas14/precipitation_frequency_stations.parquet")
+    atlas14_st["station_id"] = atlas14_st["station_id"].astype(str)
     flow_stats = m.load_flow_stats(bucket, prefix)
     streamflow = m.load_streamflow(bucket, prefix)
     tc_by_site = c.load_tc(bucket, prefix)
@@ -66,15 +69,13 @@ def main() -> None:
     except Exception:
         clusters = {}
 
-    # Pin to 08c's retained 106 gauges (flow∩MRMS window already applied there);
-    # Atlas 14 covers ALL stations, so without this 08h would run the pre-window 158.
+    # Pin to 08c's retained 106 gauges (flow∩MRMS window already applied there).
     retained = set(m._read_parquet_s3(bucket, f"{prefix}{UNIVERSE_KEY}",
                                       ["site_no"])["site_no"].astype(str))
     q_cols = [f"Q{rp}" for rp in c.FLOW_RPS if f"Q{rp}" in flow_stats.columns]
     has_q  = set(flow_stats.loc[flow_stats[q_cols].notna().any(axis=1), "site_no"])
-    stations_all = sorted(retained & has_q & set(tc_by_site)
-                          & set(atlas14["site_no"]) & set(streamflow["site_no"]))
-    log.info("Universe (08c-retained 106 ∩ valid Q ∩ Tc ∩ Atlas14 ∩ streamflow): %d", len(stations_all))
+    stations_all = sorted(retained & has_q & set(tc_by_site) & set(streamflow["site_no"]))
+    log.info("Universe (08c-retained 106 ∩ valid Q ∩ Tc ∩ streamflow): %d", len(stations_all))
 
     flow_start = streamflow.groupby("site_no")["datetime_utc"].min()
     flow_end   = streamflow.groupby("site_no")["datetime_utc"].max()
@@ -126,9 +127,10 @@ def main() -> None:
 
         precip_site = hourly_by_sid[sid]                  # raw hourly-max (unfilled)
         flow_site   = streamflow[streamflow["site_no"] == site_no].set_index("datetime_utc")["value_cfs"].sort_index()
-        a14_site    = atlas14[atlas14["site_no"] == site_no]
+        a14_site    = atlas14_st[atlas14_st["station_id"] == sid]   # station's own climatology
         fs_rows     = flow_stats[flow_stats["site_no"] == site_no]
         if flow_site.empty or a14_site.empty or fs_rows.empty:
+            log.warning("[%s][%d/%d] %s: no station Atlas 14 for %s, skipping", SOURCE, i, n, site_no, sid)
             continue
         recs = c.analyse_station_tc(site_no, clusters.get(site_no, -1), precip_site, flow_site,
                                     a14_site, fs_rows.iloc[0], SOURCE, ws, we,

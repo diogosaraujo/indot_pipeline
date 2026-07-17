@@ -19,8 +19,8 @@ Reuses validate_precip_frequency.py verbatim:
                            a P100 event also counts as P50, P25, ... P2)
 Station hourly precip comes from 08d's load_and_qualify (ISD/LCD inches + GHCNh mm→in,
 kept where >= 50 % coverage of the 2002-present era and plausible max).  Atlas-14 is
-published at the USGS gauge locations, so it is spatially interpolated (linear +
-nearest fill) to each precip-station location.
+taken at each precip-station's OWN location (07c extracts it directly from the PFDS at
+the station coordinates), so each gauge's rain is judged against its own climatology.
 
 "Active" = the station's hourly record extends to within ACTIVE_MONTHS (12) of the
 dataset's most-recent hour — i.e. still reporting — on top of the 08d qualification.
@@ -34,7 +34,7 @@ distribution SHAPE (how fast frequency falls with return period) is directly com
 
 Reads:
     precip/noaa/isd_hourly.parquet, ghcnh_hourly.parquet   (via 08d load_and_qualify)
-    atlas14/precipitation_frequency.parquet + stations/indiana_streamflow_sites.parquet
+    atlas14/precipitation_frequency_stations.parquet       (run 07c first)
     analysis/storm_events/storm_events.parquet             (run validate_storm_events.py first)
 
 Writes (analysis/precip_stations/):
@@ -60,7 +60,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.interpolate import griddata
 
 from utils import load_config, s3_client, write_bytes_to_s3
 
@@ -83,10 +82,9 @@ PRECIP_DURATIONS_HR = vpf.PRECIP_DURATIONS_HR       # [1,3,6,12,24]
 HOURS_PER_YEAR      = 8766.0
 ACTIVE_MONTHS       = 12                            # "active" = reporting within this many months
 
-INV_KEY     = "stations/indiana_streamflow_sites.parquet"
-A14_KEY     = "atlas14/precipitation_frequency.parquet"
-STORMS_KEY  = "analysis/storm_events/storm_events.parquet"
-OUT_PREFIX  = "analysis/precip_stations/"
+STATION_A14_KEY = "atlas14/precipitation_frequency_stations.parquet"   # 07c: Atlas 14 at station coords
+STORMS_KEY      = "analysis/storm_events/storm_events.parquet"
+OUT_PREFIX      = "analysis/precip_stations/"
 
 
 def _read_parquet(bucket: str, key: str, columns=None) -> pd.DataFrame:
@@ -97,30 +95,18 @@ def _read_parquet(bucket: str, key: str, columns=None) -> pd.DataFrame:
 # ── Atlas-14 interpolated to precip-station locations ─────────────────────────
 
 def atlas14_at_stations(stations: pd.DataFrame, bucket: str, prefix: str) -> dict[str, pd.DataFrame]:
-    """{station_id -> DataFrame[return_period_yr, duration_hr, depth_in]} by spatially
-    interpolating the gauge-location Atlas-14 depths to each station (linear + nearest fill)."""
-    a14 = _read_parquet(bucket, f"{prefix}{A14_KEY}")
-    a14["site_no"] = a14["site_no"].astype(str)
-    inv = _read_parquet(bucket, f"{prefix}{INV_KEY}", columns=["site_no", "dec_lat_va", "dec_long_va"])
-    inv["site_no"] = inv["site_no"].astype(str)
-    a14 = a14.merge(inv, on="site_no", how="left").dropna(subset=["dec_lat_va", "dec_long_va"])
-
-    ids = stations["station_id"].tolist()
-    tgt = stations[["latitude", "longitude"]].to_numpy(float)
-    per_station_rows: dict[str, list] = {sid: [] for sid in ids}
-    for rp in RETURN_PERIODS:
-        for dur in PRECIP_DURATIONS_HR:
-            sub = a14[(a14["return_period_yr"] == rp) & (a14["duration_hr"] == dur)].dropna(subset=["depth_in"])
-            if len(sub) < 3:
-                continue
-            src = sub[["dec_lat_va", "dec_long_va"]].to_numpy(float)
-            val = sub["depth_in"].to_numpy(float)
-            lin  = griddata(src, val, tgt, method="linear")
-            near = griddata(src, val, tgt, method="nearest")
-            depth = np.where(np.isnan(lin), near, lin)
-            for sid, d in zip(ids, depth):
-                per_station_rows[sid].append({"return_period_yr": rp, "duration_hr": dur, "depth_in": float(d)})
-    return {sid: pd.DataFrame(rows) for sid, rows in per_station_rows.items() if rows}
+    """{station_id -> DataFrame[return_period_yr, duration_hr, depth_in]} from Atlas 14
+    extracted DIRECTLY at each precip-station location (07c) — replaces the earlier
+    spatial interpolation of the gauge-location Atlas 14 (each gauge's rain is now judged
+    against its own climatology)."""
+    a14 = _read_parquet(bucket, f"{prefix}{STATION_A14_KEY}")
+    a14["station_id"] = a14["station_id"].astype(str)
+    a14 = a14[a14["duration_hr"].isin(PRECIP_DURATIONS_HR)
+              & a14["return_period_yr"].isin(RETURN_PERIODS)]
+    ids = set(stations["station_id"].astype(str))
+    a14 = a14[a14["station_id"].isin(ids)]
+    return {sid: g[["return_period_yr", "duration_hr", "depth_in"]].reset_index(drop=True)
+            for sid, g in a14.groupby("station_id")}
 
 
 # ── Active-station selection ──────────────────────────────────────────────────
@@ -191,50 +177,58 @@ def mrms_storm_counts(bucket: str, prefix: str, start: pd.Timestamp,
 
 # ── Comparison figure ─────────────────────────────────────────────────────────
 
+def _save_fig(fig, bucket: str, prefix: str, stem: str) -> None:
+    for ext in ("png", "pdf"):                               # exact 6.5x4 (no bbox_tight)
+        buf = io.BytesIO()
+        kw = {"format": ext}
+        if ext == "png":
+            kw["dpi"] = 300
+        fig.savefig(buf, **kw)
+        write_bytes_to_s3(buf.getvalue(), bucket, f"{prefix}{OUT_PREFIX}{stem}.{ext}")
+        log.info("Wrote s3://%s/%s%s%s.%s", bucket, prefix, OUT_PREFIX, stem, ext)
+    plt.close(fig)
+
+
 def make_figure(summary: pd.DataFrame, has_mrms: bool, n_stations: int,
                 bucket: str, prefix: str) -> None:
     rp_labels = [f"P{rp}" for rp in summary["return_period_yr"]]
     x = np.arange(len(rp_labels))
-    fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.6))
 
-    # Panel A: per-year rates (log), grouped bars
-    ax = axes[0]
+    # ── Figure 1: per-year event frequency (grouped bars) ─────────────────────
+    fig, ax = plt.subplots(figsize=(6.5, 4.0))
     w = 0.38
     st = summary["station_events_per_yr"].to_numpy()
-    ax.bar(x - (w/2 if has_mrms else 0), st, w, color="#2c7fb8", label="Station events / yr")
+    ax.bar(x - (w / 2 if has_mrms else 0), st, w, color="#2c7fb8", label="Station events / yr")
     if has_mrms:
         mr = summary["mrms_storms_per_yr"].to_numpy()
-        ax.bar(x + w/2, mr, w, color="#d95f0e", label="MRMS storms / yr")
+        ax.bar(x + w / 2, mr, w, color="#d95f0e", label="MRMS storms / yr")
     ax.set_yscale("log"); ax.set_xticks(x); ax.set_xticklabels(rp_labels)
-    ax.set_ylabel("Events per year (log)"); ax.set_xlabel("Atlas-14 return period")
-    ax.set_title(f"Per-year event frequency\n(stations: per-gauge summed over {n_stations} active gauges; "
-                 "MRMS: domain-wide storms)", fontsize=10.5)
+    ax.set_ylabel("Events per year (log)", fontsize=10)
+    ax.set_xlabel("Atlas-14 return period", fontsize=10)
+    ax.tick_params(labelsize=9)
     ax.legend(fontsize=9); ax.grid(axis="y", ls=":", alpha=0.4)
+    fig.tight_layout()
+    _save_fig(fig, bucket, prefix, "station_vs_mrms_bars")
 
-    # Panel B: distribution SHAPE, each normalised to its own P2 count
-    ax = axes[1]
+    # ── Figure 2: ARI distribution shape (each normalised to its own P2) ──────
+    fig, ax = plt.subplots(figsize=(6.5, 4.0))
+
     def norm(col):
         v = summary[col].to_numpy(float); base = v[0] if v[0] > 0 else np.nan
         return v / base
+
     ax.plot(x, norm("station_events"), "o-", color="#2c7fb8", lw=2, label="Stations")
     if has_mrms:
         ax.plot(x, norm("mrms_storms"), "s-", color="#d95f0e", lw=2, label="MRMS storms")
     ax.plot(x, [2.0 / rp for rp in summary["return_period_yr"]], "k--", lw=1,
             label="Atlas-14 (1/RP, ×P2)")
     ax.set_yscale("log"); ax.set_xticks(x); ax.set_xticklabels(rp_labels)
-    ax.set_ylabel("Frequency relative to P2"); ax.set_xlabel("Atlas-14 return period")
-    ax.set_title("ARI distribution shape (normalised to P2)", fontsize=10.5)
+    ax.set_ylabel("Frequency relative to P2", fontsize=10)
+    ax.set_xlabel("Atlas-14 return period", fontsize=10)
+    ax.tick_params(labelsize=9)
     ax.legend(fontsize=9); ax.grid(True, which="both", ls=":", alpha=0.4)
-
-    fig.suptitle("Indiana precipitation-event frequency — rain gauges vs MRMS storm objects",
-                 fontsize=13, fontweight="bold")
     fig.tight_layout()
-    for ext in ("png", "svg"):
-        buf = io.BytesIO()
-        fig.savefig(buf, format=ext, dpi=150, bbox_inches="tight")
-        write_bytes_to_s3(buf.getvalue(), bucket, f"{prefix}{OUT_PREFIX}station_vs_mrms_comparison.{ext}")
-        log.info("Wrote s3://%s/%s%sstation_vs_mrms_comparison.%s", bucket, prefix, OUT_PREFIX, ext)
-    plt.close(fig)
+    _save_fig(fig, bucket, prefix, "station_vs_mrms_shape")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -256,7 +250,7 @@ def main() -> None:
     log.info("Active precip stations (reporting within %d mo of %s): %d / %d qualified",
              ACTIVE_MONTHS, ref_end.date(), len(active), len(qual))
 
-    log.info("Interpolating Atlas-14 to station locations...")
+    log.info("Loading station-location Atlas 14 (07c)...")
     a14_map = atlas14_at_stations(active, bucket, prefix)
 
     log.info("Counting station precip events (%s → %s)...", start.date(), end.date())
