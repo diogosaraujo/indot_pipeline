@@ -67,7 +67,7 @@ SOURCES = {
 
 
 def marker_size(m):
-    return {"*": 90, "^": 34, "o": 26}.get(m, 30)
+    return {"*": 130, "^": 52, "o": 42}.get(m, 46)
 
 
 # Per-figure config; optional `markers`/`labels`/`ari_label` override the defaults.
@@ -107,15 +107,17 @@ def draw_background(ax):
 
 def label_bias(ax):
     """Label each frequency-bias line with its value at the line end, just INSIDE
-    the panel (so it works on every panel) with a light background for legibility."""
-    bbox = dict(boxstyle="round,pad=0.12", fc="white", alpha=0.6, ec="none")
+    the panel (works on every panel). Labels over the dark CSI shading (b >= 1.5)
+    use a white bold font; the lighter ones keep the grey font."""
     for b in BIAS:
+        white = b >= 1.5
+        color, weight = ("white", "bold") if white else ("0.35", "normal")
         if b * SR_MAX <= 1.0:                                # exits the right edge
-            ax.text(SR_MAX * 0.98, b * SR_MAX, f"{b:g}", fontsize=7, color="0.35",
-                    ha="right", va="center", bbox=bbox, zorder=5)
-        else:                                                # exits the top → sit below the title
-            ax.text(1.0 / b, 0.96, f"{b:g}", fontsize=7, color="0.35",
-                    ha="center", va="top", bbox=bbox, zorder=5)
+            ax.text(SR_MAX * 0.98, b * SR_MAX, f"{b:g}", fontsize=7, color=color,
+                    fontweight=weight, ha="right", va="center", zorder=5)
+        else:                                                # exits the top → placed lower along its
+            ax.text(0.75 / b, 0.75, f"{b:g}", fontsize=7, color=color,        # line to clear the
+                    fontweight=weight, ha="right", va="center", zorder=5)     # CSI 0.20 label
 
 
 def pod_sr(sub):
@@ -160,7 +162,13 @@ def make_combined(loaded, fig_cfg, bucket, prefix):
     for ax, flow_rp in zip(axes, FLOW_RPS):
         cf, cs = draw_background(ax)
         for t in ax.clabel(cs, fmt="%.2f", fontsize=7, inline=True, inline_spacing=2):
-            t.set_bbox(dict(boxstyle="round,pad=0.05", fc="white", alpha=0.6, ec="none"))
+            try:
+                lvl = float(t.get_text())
+            except ValueError:
+                lvl = 0.0
+            if lvl >= 0.15:                              # over the dark blue → white bold
+                t.set_color("white")
+                t.set_fontweight("bold")
         for s in order:
             df = loaded.get(s)
             if df is None:
