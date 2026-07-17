@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pyarrow.parquet as pq
 from matplotlib import cm
-from matplotlib.colors import LogNorm
+from matplotlib.colors import BoundaryNorm, ListedColormap
 from matplotlib.lines import Line2D
 
 from utils import load_config, s3_client, write_bytes_to_s3
@@ -42,10 +42,18 @@ from utils import load_config, s3_client, write_bytes_to_s3
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("09h_tc")
 
-FLOW_RPS = [10, 50, 100]
-EPS      = 1e-9
-CMAP     = "plasma"
-ARI_NORM = LogNorm(vmin=1, vmax=1000)
+FLOW_RPS   = [10, 50, 100]
+EPS        = 1e-9
+SR_MAX     = 0.3       # success-ratio axis zoom (points cluster at low SR)
+CSI_MAX    = 0.3       # max CSI reachable within the shown box (SR=0.3, POD=1)
+BIAS       = [0.3, 0.5, 1, 1.5, 2, 3, 5]
+CSI_LEVELS = np.arange(0.05, 0.301, 0.05)      # CSI contour lines within the shown range
+
+# 10 discrete, distinct colours for the precipitation ARI thresholds.
+ARIS       = [1, 2, 5, 10, 25, 50, 100, 200, 500, 1000]
+ARI_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+              "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#000000"]
+ARI_IDX    = {a: i for i, a in enumerate(ARIS)}
 
 # source key → parquet, marker, marker size, legend label
 SOURCES = {
@@ -56,7 +64,6 @@ SOURCES = {
     "nearest":         {"key": "analysis/event_confusion_matrix_tc.parquet",
                         "marker": "*", "size": 90, "label": "Nearest-pixel MRMS"},
 }
-SR_MAX = 0.4       # zoom the success-ratio axis to separate the clustered points
 
 # (source order, output stem) for each figure
 FIGS = [
@@ -73,15 +80,28 @@ def _read(bucket, key, columns=None):
 
 
 def draw_background(ax):
-    g = np.linspace(0.001, 1, 300)
+    g = np.linspace(0.001, 1, 400)
     SR, POD = np.meshgrid(g, g)
     CSI = 1.0 / (1.0 / SR + 1.0 / POD - 1.0)
-    cf = ax.contourf(SR, POD, CSI, levels=np.arange(0, 1.01, 0.1), cmap="Blues", alpha=0.75)
-    ax.contour(SR, POD, CSI, levels=np.arange(0.1, 1.0, 0.1), colors="0.45", linewidths=0.4)
-    for b in [0.3, 0.5, 1, 1.5, 2, 3, 5]:                    # frequency-bias lines
-        xx = np.linspace(0, 1, 10)
+    # CSI shading + contours only up to CSI_MAX (the most reachable in the box).
+    cf = ax.contourf(SR, POD, CSI, levels=np.arange(0, CSI_MAX + 1e-9, 0.05),
+                     cmap="Blues", alpha=0.75)
+    cs = ax.contour(SR, POD, CSI, levels=CSI_LEVELS, colors="0.45", linewidths=0.4)
+    for b in BIAS:                                           # frequency-bias lines
+        xx = np.linspace(0, 1, 60)
         ax.plot(xx, np.minimum(b * xx, 1), ls="--", color="0.5", lw=0.5)
-    return cf
+    return cf, cs
+
+
+def label_bias(ax):
+    """Label each frequency-bias line with its value at the line end (in the margin)."""
+    for b in BIAS:
+        if b * SR_MAX <= 1.0:                                # exits the right edge
+            ax.text(SR_MAX * 1.02, b * SR_MAX, f"{b:g}", fontsize=7, color="0.4",
+                    ha="left", va="center", clip_on=False)
+        else:                                                # exits the top edge
+            ax.text(1.0 / b, 1.015, f"{b:g}", fontsize=7, color="0.4",
+                    ha="center", va="bottom", clip_on=False)
 
 
 def pod_sr(sub):
@@ -110,14 +130,16 @@ def load_sources(bucket, prefix, order):
 
 def make_combined(loaded, order, out_stem, bucket, prefix):
     fig = plt.figure(figsize=(6.5, 6.5))
-    # Panels take the whole upper area; bottom band (below 0.28) holds the
-    # colorbars (left) and symbol legend (right), side by side.
-    gs = fig.add_gridspec(1, 3, left=0.085, right=0.985, top=0.95, bottom=0.28, wspace=0.12)
+    # Panels fill the upper area (right margin left for the rightmost panel's
+    # frequency-bias labels); the bottom band holds the ARI colorbar (full width)
+    # over a row with the CSI colorbar (left) beside the symbol legend (right).
+    gs = fig.add_gridspec(1, 3, left=0.085, right=0.90, top=0.955, bottom=0.30, wspace=0.13)
     axes = [fig.add_subplot(gs[0, i]) for i in range(3)]
 
     cf = None
     for ax, flow_rp in zip(axes, FLOW_RPS):
-        cf = draw_background(ax)
+        cf, cs = draw_background(ax)
+        ax.clabel(cs, fmt="%.2f", fontsize=7, inline=True, inline_spacing=2)
         for s in order:
             df = loaded.get(s)
             if df is None:
@@ -126,42 +148,48 @@ def make_combined(loaded, order, out_stem, bucket, prefix):
             if sub.empty:
                 continue
             rps, sr, pod = pod_sr(sub)
-            ax.plot(sr, pod, color="0.45", lw=0.7, zorder=4)
-            ax.scatter(sr, pod, c=rps, cmap=CMAP, norm=ARI_NORM, marker=SOURCES[s]["marker"],
+            colors = [ARI_COLORS[ARI_IDX[int(round(r))]] for r in rps]
+            ax.plot(sr, pod, color="0.5", lw=0.6, zorder=4)
+            ax.scatter(sr, pod, c=colors, marker=SOURCES[s]["marker"],
                        s=SOURCES[s]["size"], edgecolor="k", linewidth=0.4, zorder=6)
         ax.set_xlim(0, SR_MAX)
         ax.set_ylim(0, 1)
-        ax.set_xticks([0, 0.1, 0.2, 0.3, 0.4])
-        # Drop the rightmost "0.4" except on the last panel so it doesn't collide
+        ax.set_xticks([0, 0.1, 0.2, 0.3])
+        # Drop the rightmost "0.3" except on the last panel so it doesn't collide
         # with the next panel's "0" when packed tight.
-        ax.set_xticklabels(["0", "0.1", "0.2", "0.3", "0.4" if ax is axes[-1] else ""])
+        ax.set_xticklabels(["0", "0.1", "0.2", "0.3" if ax is axes[-1] else ""])
         ax.set_title(f"Q{flow_rp}", fontsize=9)
         ax.tick_params(labelsize=7)
         if ax is not axes[0]:
             ax.set_yticklabels([])
+    label_bias(axes[-1])       # frequency-bias values in the rightmost panel's margin
 
     # Shared axis labels — x-label sits clearly BELOW the tick labels.
-    fig.text(0.535, 0.225, "Success ratio  (1 − FAR)", ha="center", fontsize=8)
-    fig.text(0.020, 0.615, "Probability of detection (POD)", rotation=90, va="center", fontsize=8)
+    fig.text(0.49, 0.255, "Success ratio  (1 − FAR)", ha="center", fontsize=8)
+    fig.text(0.020, 0.63, "Probability of detection (POD)", rotation=90, va="center", fontsize=8)
 
-    # ── Bottom band: colorbars (left) beside the symbol legend (right) ────────
-    cax_ari = fig.add_axes([0.17, 0.135, 0.38, 0.025])
-    cax_csi = fig.add_axes([0.17, 0.060, 0.38, 0.025])
-    sm = cm.ScalarMappable(norm=ARI_NORM, cmap=CMAP)
+    # ── ARI discrete colorbar (full width) ────────────────────────────────────
+    cax_ari = fig.add_axes([0.17, 0.155, 0.70, 0.028])
+    sm = cm.ScalarMappable(cmap=ListedColormap(ARI_COLORS),
+                           norm=BoundaryNorm(np.arange(len(ARIS) + 1), len(ARIS)))
     sm.set_array([])
-    cb_ari = fig.colorbar(sm, cax=cax_ari, orientation="horizontal", ticks=[1, 10, 100, 1000])
-    cb_ari.ax.set_xticklabels(["1", "10", "100", "1000"])
-    cb_ari.ax.tick_params(labelsize=7)
-    fig.text(0.16, 0.1475, "ARI (yr)", ha="right", va="center", fontsize=7)
+    cb_ari = fig.colorbar(sm, cax=cax_ari, orientation="horizontal",
+                          ticks=np.arange(len(ARIS)) + 0.5)
+    cb_ari.ax.set_xticklabels([str(a) for a in ARIS])
+    cb_ari.ax.tick_params(labelsize=7, length=0)
+    fig.text(0.16, 0.169, "ARI (yr)", ha="right", va="center", fontsize=7)
+
+    # ── CSI colorbar (left) beside the symbol legend (right) ──────────────────
+    cax_csi = fig.add_axes([0.17, 0.065, 0.34, 0.028])
     cb_csi = fig.colorbar(cf, cax=cax_csi, orientation="horizontal")
     cb_csi.ax.tick_params(labelsize=7)
-    fig.text(0.16, 0.0725, "CSI", ha="right", va="center", fontsize=7)
+    fig.text(0.16, 0.079, "CSI", ha="right", va="center", fontsize=7)
 
     handles = [Line2D([0], [0], marker=SOURCES[s]["marker"], color="0.3", ls="",
                       ms=7, mec="k", mew=0.4, label=SOURCES[s]["label"]) for s in order]
-    fig.legend(handles=handles, loc="center left", bbox_to_anchor=(0.60, 0.105),
-               ncol=1, fontsize=7, frameon=False, handletextpad=0.3, labelspacing=0.7)
-    fig.text(0.985, 0.018, "dashed = frequency bias", ha="right", fontsize=7,
+    fig.legend(handles=handles, loc="center left", bbox_to_anchor=(0.58, 0.08),
+               ncol=1, fontsize=7, frameon=False, handletextpad=0.3, labelspacing=0.6)
+    fig.text(0.985, 0.015, "dashed = frequency bias", ha="right", fontsize=7,
              color="0.4", style="italic")
 
     for ext in ("png", "pdf"):                               # exact 6.5x6.5 (no bbox_tight)
