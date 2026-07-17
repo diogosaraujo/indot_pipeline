@@ -39,8 +39,9 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s")
 log = logging.getLogger("08g_areal_tc")
 
-OUTPUT_KEY = "analysis/event_confusion_matrix_tc_areal.parquet"
-SOURCE     = "watershed"
+OUTPUT_KEY   = "analysis/event_confusion_matrix_tc_areal.parquet"
+SOURCE       = "watershed"
+UNIVERSE_KEY = "analysis/event_confusion_matrix_tc.parquet"   # 08c's retained 106 gauges
 
 
 def load_watershed_precip(bucket, prefix, product) -> pd.DataFrame:
@@ -72,11 +73,13 @@ def main() -> None:
     except Exception:
         clusters = {}
 
+    retained = set(m._read_parquet_s3(bucket, f"{prefix}{UNIVERSE_KEY}",
+                                      ["site_no"])["site_no"].astype(str))
     q_cols = [f"Q{rp}" for rp in c.FLOW_RPS if f"Q{rp}" in flow_stats.columns]
     has_q  = set(flow_stats.loc[flow_stats[q_cols].notna().any(axis=1), "site_no"])
-    stations_all = sorted(has_q & set(tc_by_site)
+    stations_all = sorted(retained & has_q & set(tc_by_site)
                           & set(areal_ddf["site_no"]) & set(streamflow["site_no"]))
-    log.info("Universe (valid Q ∩ Tc ∩ areal DDF ∩ streamflow): %d", len(stations_all))
+    log.info("Universe (08c-retained 106 ∩ valid Q ∩ Tc ∩ areal DDF ∩ streamflow): %d", len(stations_all))
 
     flow_start = streamflow.groupby("site_no")["datetime_utc"].min()
     flow_end   = streamflow.groupby("site_no")["datetime_utc"].max()

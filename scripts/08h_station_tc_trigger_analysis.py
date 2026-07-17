@@ -46,9 +46,10 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s")
 log = logging.getLogger("08h_station_tc")
 
-OUTPUT_KEY = "analysis/event_confusion_matrix_tc_station.parquet"
-SOURCE     = "station_nearest"
-INV_KEY    = "stations/indiana_streamflow_sites.parquet"
+OUTPUT_KEY   = "analysis/event_confusion_matrix_tc_station.parquet"
+SOURCE       = "station_nearest"
+INV_KEY      = "stations/indiana_streamflow_sites.parquet"
+UNIVERSE_KEY = "analysis/event_confusion_matrix_tc.parquet"   # 08c's retained 106 gauges
 
 
 def main() -> None:
@@ -65,11 +66,15 @@ def main() -> None:
     except Exception:
         clusters = {}
 
+    # Pin to 08c's retained 106 gauges (flow∩MRMS window already applied there);
+    # Atlas 14 covers ALL stations, so without this 08h would run the pre-window 158.
+    retained = set(m._read_parquet_s3(bucket, f"{prefix}{UNIVERSE_KEY}",
+                                      ["site_no"])["site_no"].astype(str))
     q_cols = [f"Q{rp}" for rp in c.FLOW_RPS if f"Q{rp}" in flow_stats.columns]
     has_q  = set(flow_stats.loc[flow_stats[q_cols].notna().any(axis=1), "site_no"])
-    stations_all = sorted(has_q & set(tc_by_site)
+    stations_all = sorted(retained & has_q & set(tc_by_site)
                           & set(atlas14["site_no"]) & set(streamflow["site_no"]))
-    log.info("Universe (valid Q ∩ Tc ∩ Atlas14 ∩ streamflow): %d", len(stations_all))
+    log.info("Universe (08c-retained 106 ∩ valid Q ∩ Tc ∩ Atlas14 ∩ streamflow): %d", len(stations_all))
 
     flow_start = streamflow.groupby("site_no")["datetime_utc"].min()
     flow_end   = streamflow.groupby("site_no")["datetime_utc"].max()
