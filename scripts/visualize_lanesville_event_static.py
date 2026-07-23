@@ -77,7 +77,9 @@ PEAK_HOUR    = 15                    # UTC hour shown on the map panel (event pe
 # Zoomed-out view so the precip gauge, bridges and the highlighted bridge all fit.
 LON_MIN, LON_MAX = -86.10, -85.72
 LAT_MIN, LAT_MAX = 38.12, 38.34
-HOURS        = list(range(6, 23))   # 06–22 UTC (EDT = UTC-4) for the time-series panels
+HOURS        = list(range(6, 23))   # 06–22 UTC window for the time-series panels
+UTC_OFFSET_HR = -4                  # Harrison Co., IN is Eastern; June → EDT (UTC-4)
+TZ_LABEL      = "EDT"               # axes/titles are labelled in local time
 
 MRMS_BUCKET     = "noaa-mrms-pds"
 MRMS_1H_FOLDER  = "MultiSensor_QPE_01H_Pass2_00.00"
@@ -117,7 +119,8 @@ BRIDGE_SCOUR_COL  = "scour_critical"
 BRIDGE_COLOR      = "#2ca02c"                           # green — regular bridges
 SCOUR_COLOR       = "#e377c2"                           # pink  — scour-critical bridges
 HIGHLIGHT_COLOR   = "#e31a1c"                           # red star — the featured bridge
-HIGHLIGHT_ASSET   = "062-31-07183"
+HIGHLIGHT_ASSET   = "062-31-07183"                     # matched in the bridge table
+HIGHLIGHT_LABEL   = "Bridge 022310"                    # short label (legend + bottom-panel title)
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -357,7 +360,7 @@ def load_mrms(fs: s3fs.S3FileSystem, bridge_lat: float, bridge_lon: float):
 
 # ── Time-series panel helper ────────────────────────────────────────────────────
 
-def _draw_series(ax, xh, values, title, a14_depths, bar_color):
+def _draw_series(ax, xh, values, title, a14_depths, bar_color, title_fs=None):
     """Hourly bar series + the two bracketing Atlas-14 1-h thresholds."""
     vals = np.nan_to_num(np.asarray(values, float))
     ax.bar(xh, vals, width=0.85, color=bar_color, alpha=0.75, zorder=2)
@@ -379,7 +382,7 @@ def _draw_series(ax, xh, values, title, a14_depths, bar_color):
         ax.plot([xh[kpk]], [peak], "v", color=THRESH_COLOR, ms=5, zorder=6)
 
     ax.set_ylabel("Precip (in)")
-    ax.set_title(title, pad=3)
+    ax.set_title(title, pad=3, fontsize=title_fs)
     ax.grid(axis="y", ls=":", alpha=0.4)
     ax.margins(x=0.01)
 
@@ -403,17 +406,26 @@ def make_figure(peak_frame, precip_hourly, bridge_hourly,
     norm_1h = mcolors.Normalize(vmin=0.01, vmax=QPE_1H_VMAX)
 
     fig = plt.figure(figsize=(6.5, 4.0), constrained_layout=True)
-    gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.85], height_ratios=[1.0, 1.0])
-    ax_map = fig.add_subplot(gs[:, 0])
-    ax_top = fig.add_subplot(gs[0, 1])
-    ax_bot = fig.add_subplot(gs[1, 1], sharex=ax_top)
+    outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.9], wspace=0.05)
+    # Left column: map (large) + legend strip + horizontal colorbar strip, stacked so
+    # the legend sits right above the colorbar beneath the map.
+    gl = outer[0].subgridspec(3, 1, height_ratios=[1.0, 0.22, 0.11], hspace=0.06)
+    ax_map = fig.add_subplot(gl[0])
+    ax_leg = fig.add_subplot(gl[1]); ax_leg.axis("off")
+    cax    = fig.add_subplot(gl[2])
+    # Right column: two stacked time-series spanning the full figure height (as tall as
+    # the whole left column / map block).
+    gr = outer[1].subgridspec(2, 1, hspace=0.34)
+    ax_top = fig.add_subplot(gr[0])
+    ax_bot = fig.add_subplot(gr[1], sharex=ax_top)
 
     # ── Panel 1: MRMS peak-hour map ─────────────────────────────────────────────
     ax_map.set_xlim(LON_MIN, LON_MAX)
     ax_map.set_ylim(LAT_MIN, LAT_MAX)
     ax_map.set_aspect("auto")
     ax_map.set_xticks([]); ax_map.set_yticks([])           # declutter the small map
-    ax_map.set_title(f"MRMS 1-h QPE · {PEAK_HOUR:02d}Z {EVENT_DATE:%m-%d}")
+    local_peak = (PEAK_HOUR + UTC_OFFSET_HR) % 24
+    ax_map.set_title(f"MRMS 1-h QPE · {local_peak:02d} {TZ_LABEL} {EVENT_DATE:%m-%d}")
 
     if HAS_CTX:
         try:
@@ -430,12 +442,12 @@ def make_figure(peak_frame, precip_hourly, bridge_hourly,
     else:                                                   # keep the colorbar meaningful
         im = ax_map.imshow(np.zeros((2, 2)), origin="upper", extent=extent,
                            cmap=precip_cmap, norm=norm_1h, aspect="auto", zorder=2)
-    cb = fig.colorbar(im, ax=ax_map, orientation="horizontal",
-                      fraction=0.05, pad=0.02, aspect=28)
+    cb = fig.colorbar(im, cax=cax, orientation="horizontal")
     cb.set_label("1-h rain (in)", fontsize=7.5)
     cb.ax.tick_params(labelsize=7)
 
-    # Bridges, gauge, and the highlighted bridge (big red star ≈ gauge size).
+    # Bridges, gauge, and the highlighted bridge. The highlight is a HOLLOW red star
+    # (facecolor="none") so a nearby/overlapping gauge dot stays visible underneath.
     handles, labels = [], []
     if len(reg_xy):
         h = ax_map.scatter(reg_xy[:, 0], reg_xy[:, 1], marker="o", s=12,
@@ -449,25 +461,27 @@ def make_figure(peak_frame, precip_hourly, bridge_hourly,
                        facecolor=PRECIP_DOT_COLOR, edgecolors="black", lw=0.8, zorder=7)
     handles.append(h); labels.append("Precip gauge")
     if highlight is not None:
-        h = ax_map.scatter([highlight["lon"]], [highlight["lat"]], marker="*", s=200,
-                           facecolor=HIGHLIGHT_COLOR, edgecolors="black", lw=0.8, zorder=8)
-        handles.append(h); labels.append(highlight["asset"])
-    ax_map.legend(handles, labels, loc="lower left", fontsize=7, framealpha=0.85,
-                  labelspacing=0.25, handletextpad=0.35, borderpad=0.3, markerscale=0.9)
+        h = ax_map.scatter([highlight["lon"]], [highlight["lat"]], marker="*", s=320,
+                           facecolor="none", edgecolors=HIGHLIGHT_COLOR, lw=1.8, zorder=9)
+        handles.append(h); labels.append(HIGHLIGHT_LABEL)
+    # Legend beneath the map, right above the colorbar, split into 2 columns.
+    ax_leg.legend(handles, labels, loc="center", ncol=2, fontsize=7, framealpha=0.9,
+                  labelspacing=0.3, columnspacing=1.0, handletextpad=0.3, borderpad=0.4)
 
     # ── Panel 2 (top-right): USGS gauge hourly precip ───────────────────────────
     xh = np.arange(len(HOURS))
     _draw_series(ax_top, xh, precip_hourly,
-                 f"Gauge {PRECIP_SITE_NO} · 1-h precip", a14_gauge, HYETO_COLOR)
+                 "USGS 03294500 Gauge - Ohio River at Louisville", a14_gauge,
+                 HYETO_COLOR, title_fs=8.0)
 
     # ── Panel 3 (bottom-right): MRMS hourly at the bridge pixel ──────────────────
     _draw_series(ax_bot, xh, bridge_hourly,
-                 f"MRMS 1-h @ {HIGHLIGHT_ASSET}", a14_bridge, HYETO_COLOR)
+                 f"MRMS 1-h At {HIGHLIGHT_LABEL}", a14_bridge, HYETO_COLOR)
 
-    # Shared x-axis (only the bottom panel shows hour labels).
+    # Shared x-axis in LOCAL time (only the bottom panel shows hour labels).
     ax_bot.set_xticks(xh[::3])
-    ax_bot.set_xticklabels([f"{h:02d}" for h in HOURS[::3]])
-    ax_bot.set_xlabel("Hour (UTC)")
+    ax_bot.set_xticklabels([f"{(h + UTC_OFFSET_HR) % 24:02d}" for h in HOURS[::3]])
+    ax_bot.set_xlabel(f"Hour ({TZ_LABEL})")
     plt.setp(ax_top.get_xticklabels(), visible=False)
 
     # No bbox_inches="tight" — keep the canvas at exactly 6.5 x 4 in (constrained_layout
