@@ -1,0 +1,4 @@
+# Deploy secrets / local settings
+deploy/config.env
+__pycache__/
+*.pyc

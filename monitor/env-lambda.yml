@@ -1,0 +1,21 @@
+# Conda env baked into the Lambda container image (both poller + alerter).
+# eccodes/cfgrib come from conda-forge (the C library is painful via pip) —
+# same rationale as the repo's top-level environment.yml.
+name: base
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - eccodes
+  - cfgrib
+  - h5py
+  - xarray
+  - numpy
+  - pandas
+  - pyarrow
+  - s3fs
+  - matplotlib-base
+  - requests
+  - boto3
+  - pyyaml
+  - pip
