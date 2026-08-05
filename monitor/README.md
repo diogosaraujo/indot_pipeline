@@ -21,6 +21,8 @@ retrospective LP3 quantiles, `group_wet_events` 24-h declustering).
 
 - **Precip trigger** — trailing `round(Kirpich Tc)`-hour MRMS accumulation ≥ the
   Atlas-14 depth at that duration (per `scripts/08c_tc_trigger_analysis.py`).
+  Native Tc is used as-is; bridges whose Tc exceeds `STATE_HOURS` (48 h) can't
+  fill their accumulation window and are effectively flow-trigger only.
 - **Flow trigger** — NWM **open-loop** (`analysis_assim_no_da`) hourly streamflow
   ≥ the retro-LP3 `Q` from `scripts/04c` (the gauge-free operating point from
   `scripts/08f`). The PDF also shows **A&A** (`analysis_assim`, with DA) for context.

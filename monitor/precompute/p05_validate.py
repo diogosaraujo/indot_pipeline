@@ -76,10 +76,13 @@ def check_internal(cfg: pd.DataFrame) -> None:
         line = f"{c}: {n - nnull}/{n} present ({100*(n-nnull)/n:.1f}%), {neg} negative"
         (warn if neg else ok)(line)
 
-    # tc_dur range
-    td = cfg["tc_dur_hr"]
-    (ok if td.between(1, 72).all() else warn)(
-        f"tc_dur_hr range [{int(td.min())}, {int(td.max())}] h (expect 1-72)")
+    # tc_dur range — native Kirpich Tc can be very large on long main stems.
+    # Bridges with tc_dur > STATE_HOURS can't fill their precip window (flow only).
+    td = pd.to_numeric(cfg["tc_dur_hr"], errors="coerce")
+    over = int((td > config.STATE_HOURS).sum())
+    ok(f"tc_dur_hr native range [{int(td.min())}, {int(td.max())}] h; "
+       f"{over} bridges ({100*over/len(cfg):.1f}%) exceed STATE_HOURS={config.STATE_HOURS} "
+       f"-> precip window can't fill (flow-trigger only)")
 
 
 # ── 2. Q vs 04c gauge flow-stats ─────────────────────────────────────────────
