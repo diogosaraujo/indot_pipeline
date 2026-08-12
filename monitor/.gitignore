@@ -1,4 +1,5 @@
 # Deploy secrets / local settings
 deploy/config.env
+deploy/monitor-inline.json
 __pycache__/
 *.pyc

@@ -15,7 +15,13 @@ aws iam create-role --role-name "$ROLE_NAME" \
 aws iam attach-role-policy --role-name "$ROLE_NAME" \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
-cat > /tmp/monitor-inline.json <<JSON
+# Written next to this script rather than /tmp, and referenced by a RELATIVE
+# file:// path: a native Windows aws.exe under Git Bash resolves
+# file:///tmp/... to C:\tmp\... and fails, while a relative path works on both.
+POLICY_FILE=monitor-inline.json
+trap 'rm -f "$POLICY_FILE"' EXIT
+
+cat > "$POLICY_FILE" <<JSON
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -42,7 +48,7 @@ cat > /tmp/monitor-inline.json <<JSON
 JSON
 
 aws iam put-role-policy --role-name "$ROLE_NAME" \
-  --policy-name monitor-access --policy-document file:///tmp/monitor-inline.json
+  --policy-name monitor-access --policy-document "file://${POLICY_FILE}"
 
 echo "Role ready: arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 echo "(IAM changes take ~15 s to propagate before deploying the functions.)"
