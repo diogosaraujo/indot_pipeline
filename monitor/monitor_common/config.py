@@ -84,4 +84,6 @@ def keys() -> dict:
         "state_nwm": f"{p}monitor/state/nwm/",       # + {YYYYMMDDHH}.parquet
         "alert_state": f"{p}monitor/alert_state.parquet",
         "alerts": f"{p}monitor/alerts/",             # archived PDFs
+        "pending": f"{p}monitor/alerts/pending/",    # + {YYYYMMDDHH}.parquet (poller -> alerter)
+        "counties": f"{p}monitor/assets/in_counties.parquet",   # digest-map outlines (p07)
     }

@@ -2,8 +2,8 @@
 
 Runs once an hour (EventBridge Scheduler). Fetches the single CONUS MRMS grib
 and NWM channel_rt files ONCE, samples every bridge, appends to rolling state,
-evaluates both triggers for all bridges, and async-invokes the alerter Lambda
-once per firing bridge. This is deliberately NOT one Lambda per bridge.
+evaluates both triggers for all bridges, then invokes the alerter Lambda ONCE
+with the whole run's events -> a single digest PDF and a single email.
 
 Env: MONITOR_BUCKET, MONITOR_PREFIX, MONITOR_ALERTER_FUNCTION, and the tuning
 knobs in monitor_common/config.py.
@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from monitor_common import catalog, config, mrms, nwm, state
+from monitor_common.s3io import write_parquet
 from monitor_common.triggers import evaluate
 
 logging.basicConfig(level=logging.INFO,
@@ -90,34 +91,59 @@ def _ingest_nwm(comids: np.ndarray, ol_hour, aa_hour) -> pd.DataFrame | None:
     return latest_df
 
 
-def _fan_out(fires: list[dict], cfg: pd.DataFrame) -> int:
-    """Group fires by bridge; one async alerter invocation per firing bridge."""
+def _dispatch_digest(fires: list[dict], cfg: pd.DataFrame,
+                     nwm_latest: pd.DataFrame | None,
+                     mrms_hour, nwm_hour) -> int:
+    """Write the whole run's events to S3 and invoke the alerter ONCE.
+
+    One digest email per run, not one per bridge: 200+ concurrent alerters
+    swamp the SES send rate (1/s in the sandbox), and an inspector wants a
+    single ranked list, not 200 separate messages. The event table goes via S3
+    rather than the invoke payload so a large storm can't exceed the 256 KB
+    async-payload limit.
+    """
     if not fires:
         return 0
-    by_bridge: dict[str, list[dict]] = {}
-    for f in fires:
-        by_bridge.setdefault(f["bridge_id"], []).append(f)
+    ev = pd.DataFrame(fires)
+    meta = cfg.set_index("bridge_id")
+    ev["asset"] = ev["bridge_id"].map(meta[config.ASSET_COL]).fillna(ev["bridge_id"])
+    for c in ("lat", "lon", "comid", "tc_dur_hr"):
+        ev[c] = ev["bridge_id"].map(meta[c])
+    ev["scour"] = ev["bridge_id"].map(meta[config.SCOUR_COL]).fillna(False).astype(bool)
+
+    # A&A corroboration — the same reach under data assimilation. Flow alerts
+    # the DA run does not reproduce are flagged rather than dropped.
+    ev["q_aa_cfs"] = np.nan
+    if nwm_latest is not None and "q_aa_cms" in getattr(nwm_latest, "columns", []):
+        aa = pd.to_numeric(ev["comid"], errors="coerce").map(
+            nwm_latest["q_aa_cms"]) * config.CFS_PER_CMS
+        ev["q_aa_cfs"] = aa.to_numpy()
+    ev["aa_confirms"] = (ev["trigger_type"].eq("flow")
+                         & (ev["q_aa_cfs"] >= ev["threshold"])).fillna(False)
+    ev["map_class"] = np.where(
+        ev["trigger_type"].eq("precip"), "precip",
+        np.where(ev["aa_confirms"], "flow_conf", "flow_open"))
+
+    hour = nwm_hour or mrms_hour
+    key = f"{config.keys()['pending']}{state.stamp(hour)}.parquet"
+    out = ev.copy()
+    out["valid_hour"] = pd.to_datetime(out["valid_hour"], utc=True)
+    write_parquet(out, config.keys()["bucket"], key)
+
+    payload = {"events_key": key,
+               "mrms_hour": None if mrms_hour is None else mrms_hour.isoformat(),
+               "nwm_hour": None if nwm_hour is None else nwm_hour.isoformat()}
     import boto3
-    lam = boto3.client("lambda", region_name=config.REGION)
-    sent = 0
-    idx = cfg.set_index("bridge_id")
-    for bid, evs in by_bridge.items():
-        row = idx.loc[bid]
-        valid_hour = max(e["valid_hour"] for e in evs)
-        payload = {
-            "bridge_id": bid,
-            "valid_hour": valid_hour.isoformat(),
-            "triggers": [{"type": e["trigger_type"], "observed": e["observed"],
-                          "threshold": e["threshold"], "severity_rp": e["severity_rp"]}
-                         for e in evs],
-        }
-        try:
-            lam.invoke(FunctionName=config.ALERTER_FUNCTION, InvocationType="Event",
-                       Payload=json.dumps(payload).encode())
-            sent += 1
-        except Exception as e:  # noqa: BLE001
-            log.error("Alerter invoke failed for %s: %s", bid, e)
-    return sent
+    try:
+        boto3.client("lambda", region_name=config.REGION).invoke(
+            FunctionName=config.ALERTER_FUNCTION, InvocationType="Event",
+            Payload=json.dumps(payload).encode())
+        log.info("Digest dispatched: %d events, %d bridges -> %s",
+                 len(ev), ev["bridge_id"].nunique(), key)
+        return 1
+    except Exception as e:  # noqa: BLE001
+        log.error("Digest alerter invoke failed: %s", e)
+        return 0
 
 
 def handler(event=None, context=None):
@@ -150,8 +176,8 @@ def handler(event=None, context=None):
         if removed:
             log.info("Pruned %d stale %s slices", removed, kind)
 
-    sent = _fan_out(fires, cfg)
-    log.info("Evaluated %d bridges: %d new firing events -> %d alert(s) dispatched",
+    sent = _dispatch_digest(fires, cfg, nwm_latest, mrms_hour, nwm_hour)
+    log.info("Evaluated %d bridges: %d new firing events -> %d digest dispatched",
              len(cfg), len(fires), sent)
     return {"bridges": len(cfg), "fires": len(fires), "alerts": sent,
             "mrms_hour": None if mrms_hour is None else mrms_hour.isoformat(),

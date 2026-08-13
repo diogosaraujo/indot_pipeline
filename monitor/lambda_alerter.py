@@ -1,9 +1,16 @@
-"""Alerter Lambda — builds the PDF for one firing bridge and emails it via SES.
+"""Alerter Lambda — builds ONE digest PDF for the whole run and emails it.
 
-Invoked asynchronously (InvocationType='Event') by the poller, once per firing
-bridge. Payload:
-    {"bridge_id": "...", "valid_hour": "2026-07-29T14:00:00+00:00",
-     "triggers": [{"type": "precip"|"flow", "observed": .., "threshold": .., "severity_rp": ..}]}
+Invoked asynchronously (InvocationType='Event') by the poller, once per run:
+    {"events_key": "…/monitor/alerts/pending/2026081215.parquet",
+     "mrms_hour": "…", "nwm_hour": "…"}
+
+The digest is a single PDF (statewide map + paginated bridge table) and a
+single email whose body lists every affected bridge and what triggered it.
+One message per run — not one per bridge, which swamps the SES send rate and
+buries the reader.
+
+The legacy per-bridge payload ({"bridge_id": …, "triggers": […]}) is still
+accepted so a single bridge can be re-rendered in detail on demand.
 """
 from __future__ import annotations
 
@@ -109,7 +116,90 @@ def _send_email(subject: str, body: str, pdf: bytes, filename: str) -> bool:
     return True
 
 
+def _digest_body(ev: pd.DataFrame, mrms_hour, nwm_hour) -> str:
+    """Plain-text roster: every affected bridge and what set it off."""
+    n_b = ev["bridge_id"].nunique()
+    n_flow = int((ev["trigger_type"] == "flow").sum())
+    n_prec = int((ev["trigger_type"] == "precip").sum())
+    n_open = int((ev["map_class"] == "flow_open").sum())
+    n_scour = int(ev["scour"].astype(bool).sum())
+    hour = nwm_hour or mrms_hour
+
+    L = [f"INDOT BRIDGE FLOOD ALERT — {n_b} bridge(s) triggered",
+         f"Valid {hour:%Y-%m-%d %H:%M} UTC"
+         + (f"   (MRMS {mrms_hour:%H%M}Z, NWM {nwm_hour:%H%M}Z)"
+            if mrms_hour is not None and nwm_hour is not None else ""),
+         "",
+         f"  {n_flow} streamflow · {n_prec} precipitation · {n_scour} scour-critical",
+         "  Severity: " + ", ".join(
+             f"{int((ev['severity_rp'] == rp).sum())} x {rp}-yr"
+             for rp in config.SEVERITY_RPS),
+         ]
+    if n_open:
+        L += ["", f"  NOTE: {n_open} streamflow alert(s) are open-loop only — NWM's",
+              "        data-assimilation run does not reproduce them. Marked 'A&A: NO'",
+              "        below and orange on the map. Treat as unconfirmed."]
+    L += ["", "The attached PDF has a statewide map (colored by which product",
+          "confirms each alert) and the full table.", "",
+          "-" * 78,
+          f"{'BRIDGE':<28}{'TRIGGER':<10}{'SEV':>7}{'OBSERVED':>14}{'THRESHOLD':>14}{'  A&A':<6}",
+          "-" * 78]
+
+    ev = ev.sort_values(["severity_rp", "observed"], ascending=[False, False])
+    for _, r in ev.iterrows():
+        unit = "in" if r["trigger_type"] == "precip" else "cfs"
+        fmt = "{:,.2f}" if r["trigger_type"] == "precip" else "{:,.0f}"
+        aa = "  -" if r["trigger_type"] == "precip" else ("  yes" if r["aa_confirms"] else "  NO")
+        name = str(r["asset"])[:26] + ("*" if bool(r["scour"]) else "")
+        L.append(f"{name:<28}{r['trigger_type'].upper():<10}"
+                 f"{int(r['severity_rp']):>4}-yr"
+                 f"{fmt.format(r['observed']) + ' ' + unit:>14}"
+                 f"{fmt.format(r['threshold']) + ' ' + unit:>14}{aa:<6}")
+    L += ["-" * 78, "* = scour-critical (fires at the 10-yr; all others at the 50-yr)", "",
+          "Precip trigger: trailing round(Kirpich Tc)-h MRMS >= Atlas-14 depth.",
+          "Flow trigger:   NWM open-loop streamflow >= retrospective LP3 Q (04c).",
+          "Alerts are de-duplicated on a 24-h event separation.", ""]
+    return "\n".join(L)
+
+
+def _digest_handler(event):
+    from monitor_common.s3io import read_parquet, write_bytes
+    k = config.keys()
+    ev = read_parquet(k["bucket"], event["events_key"])
+    if ev.empty:
+        log.warning("Digest requested but the event table is empty — nothing sent.")
+        return {"bridges": 0, "emailed": False}
+
+    mrms_hour = pd.Timestamp(event["mrms_hour"]).tz_convert("UTC") if event.get("mrms_hour") else None
+    nwm_hour = pd.Timestamp(event["nwm_hour"]).tz_convert("UTC") if event.get("nwm_hour") else None
+    hour = nwm_hour or mrms_hour
+
+    cfg = catalog.load()
+    try:
+        counties = read_parquet(k["bucket"], k["counties"])
+    except Exception as e:  # noqa: BLE001  (map still renders without outlines)
+        log.warning("County outlines unavailable (%s) — map drawn without them. "
+                    "Run precompute/p07_map_assets.py to create them.", e)
+        counties = None
+
+    pdf = figure.build_digest_pdf(ev, cfg, counties, mrms_hour, nwm_hour)
+    fname = f"digest_{hour:%Y%m%d%H}.pdf"
+    write_bytes(pdf, k["bucket"], f"{k['alerts']}{fname}", content_type="application/pdf")
+
+    n_b = ev["bridge_id"].nunique()
+    top = int(ev["severity_rp"].max())
+    n_scour = int(ev["scour"].astype(bool).sum())
+    subject = (f"[BRIDGE FLOOD ALERT] {n_b} bridge(s) — up to {top}-yr"
+               + (f", {n_scour} scour-critical" if n_scour else "")
+               + f" ({hour:%Y-%m-%d %H:%MZ})")
+    emailed = _send_email(subject, _digest_body(ev, mrms_hour, nwm_hour), pdf, fname)
+    log.info("Digest built for %d bridges -> %s (emailed=%s)", n_b, fname, emailed)
+    return {"bridges": n_b, "pdf": fname, "emailed": emailed}
+
+
 def handler(event, context=None):
+    if "events_key" in event:
+        return _digest_handler(event)
     cfg = catalog.load()
     bridge = catalog.bridge_row(cfg, event["bridge_id"])
     valid_hour = pd.Timestamp(event["valid_hour"]).tz_convert("UTC")
