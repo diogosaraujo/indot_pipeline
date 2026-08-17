@@ -167,9 +167,12 @@ def main() -> None:
             log.warning("%s: only %d/24 MRMS hours — accumulation is a partial day",
                         day, nhr)
         peak = day_peak_flow(day)
-        ratio = None
-        if not peak.empty and "q_ol_cms" in peak.columns:
-            ratio = (peak["q_ol_cms"] * CFS) / q100.reindex(peak.index)
+        ratio_ol = ratio_aa = None
+        if not peak.empty:
+            if "q_ol_cms" in peak.columns:
+                ratio_ol = (peak["q_ol_cms"] * CFS) / q100.reindex(peak.index)
+            if "q_aa_cms" in peak.columns:
+                ratio_aa = (peak["q_aa_cms"] * CFS) / q100.reindex(peak.index)
 
         extents = [STATE]
         if not args.only_state:
@@ -178,8 +181,8 @@ def main() -> None:
                 extents.append(dict(lat=tuple(r["lat"]), lon=tuple(r["lon"]),
                                     name=f"region {rid}"))
         for extent in extents:
-            render(day, extent, acc, lats, lons, nhr, ratio, de, cfg, counties,
-                   flow, args.dpi, out, not args.no_upload)
+            render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de,
+                   cfg, counties, flow, args.dpi, out, not args.no_upload)
 
 
 if __name__ == "__main__":
