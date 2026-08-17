@@ -220,6 +220,124 @@ def nwm_key(ts: pd.Timestamp) -> str:
     return ep_key(f"nwm/{ts:%Y%m%d%H}.parquet")
 
 
+def load_mrms_hour(ts: pd.Timestamp):
+    """(arr, lats_desc, lons_asc) in inches for one hour, or None if absent."""
+    import io as _io
+    from monitor_common.s3io import read_bytes
+    try:
+        z = np.load(_io.BytesIO(read_bytes(bucket(), mrms_key(ts))))
+    except Exception:  # noqa: BLE001
+        return None
+    return z["arr"], z["lats"], z["lons"]
+
+
+def load_nwm_hour(ts: pd.Timestamp) -> pd.DataFrame | None:
+    try:
+        return read_parquet(bucket(), nwm_key(ts)).set_index("comid")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def day_accum(day: str) -> tuple:
+    """24-h MRMS accumulation (inches) for a local day, plus the hour count."""
+    acc = lats = lons = None
+    n = 0
+    for ts in hour_range(day):
+        got = load_mrms_hour(ts)
+        if got is None:
+            continue
+        arr, lats, lons = got
+        acc = arr.astype(np.float64) if acc is None else acc + arr
+        n += 1
+    return acc, lats, lons, n
+
+
+def day_peak_flow(day: str) -> pd.DataFrame:
+    """Per-COMID peak open-loop and A&A flow (cms) over a local day."""
+    best = None
+    for ts in hour_range(day):
+        d = load_nwm_hour(ts)
+        if d is None:
+            continue
+        cur = d[[c for c in ("q_ol_cms", "q_aa_cms") if c in d.columns]]
+        best = cur if best is None else np.fmax(best, cur.reindex(best.index))
+    return best if best is not None else pd.DataFrame()
+
+
+# ── Plot helpers ─────────────────────────────────────────────────────────────
+
+def draw_flowlines(ax, flow, values: pd.Series | None = None, vmax: float = 1.5,
+                   lw_base: float = 0.45, cmap: str = "Blues",
+                   lat=None, lon=None) -> None:
+    """River network, optionally colored by a per-COMID value (e.g. q/Q100).
+
+    Reaches with no value are drawn thin and gray so the network still reads as
+    a network — the quiet rivers are the context that makes the loud ones mean
+    something.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+
+    if flow is None or flow.empty:
+        return
+    f = flow
+    if lat is not None and lon is not None:      # clip to the frame before building segments
+        f = f[(f["lat"] >= lat[0] - .05) & (f["lat"] <= lat[1] + .05)
+              & (f["lon"] >= lon[0] - .05) & (f["lon"] <= lon[1] + .05)]
+        if f.empty:
+            return
+    cm = plt.get_cmap(cmap)
+    quiet, hot, hot_c, hot_w = [], [], [], []
+    for (comid, _pid), g in f.groupby(["comid", "part_id"], sort=False):
+        seg = g[["lon", "lat"]].to_numpy()
+        if len(seg) < 2:
+            continue
+        v = None if values is None else values.get(comid)
+        if v is None or not np.isfinite(v):
+            quiet.append(seg)
+        else:
+            frac = float(np.clip(v / vmax, 0, 1))
+            hot.append(seg); hot_c.append(cm(0.25 + 0.75 * frac))
+            hot_w.append(lw_base * (1.0 + 3.5 * frac))
+    if quiet:
+        ax.add_collection(LineCollection(quiet, colors="#c7d3dd", linewidths=lw_base, zorder=2))
+    if hot:
+        ax.add_collection(LineCollection(hot, colors=hot_c, linewidths=hot_w, zorder=3))
+
+
+def place_labels(ax, pts: pd.DataFrame, text_col: str, fontsize=7.0,
+                 min_gap_frac=0.030) -> None:
+    """Direct labels with greedy vertical de-confliction and leader lines.
+
+    Labels start to the right of their marker, are pushed apart vertically until
+    none overlap, and get a leader line once moved far enough that the pairing
+    would otherwise be ambiguous.
+    """
+    if pts.empty:
+        return
+    y0, y1 = ax.get_ylim(); x0, x1 = ax.get_xlim()
+    span = y1 - y0
+    gap = span * min_gap_frac
+    d = pts.sort_values("lat", ascending=False).copy()
+    left = d["lon"] > (x0 + x1) / 2          # flip side near the right edge
+    d["ty"] = d["lat"]
+    ys = d["ty"].to_numpy()
+    for i in range(1, len(ys)):              # push down to clear the one above
+        if ys[i - 1] - ys[i] < gap:
+            ys[i] = ys[i - 1] - gap
+    d["ty"] = ys
+    dx = (x1 - x0) * 0.012
+    for (_, r), lft in zip(d.iterrows(), left):
+        sx = r["lon"] - dx if lft else r["lon"] + dx
+        ha = "right" if lft else "left"
+        if abs(r["ty"] - r["lat"]) > gap * 0.55:
+            ax.plot([r["lon"], sx], [r["lat"], r["ty"]], lw=0.4, color=MUTED,
+                    zorder=5, solid_capstyle="round")
+        ax.text(sx, r["ty"], str(r[text_col]), fontsize=fontsize, ha=ha,
+                va="center", color=INK, zorder=6,
+                bbox=dict(boxstyle="round,pad=0.14", fc="white", ec="none", alpha=0.72))
+
+
 def draw_counties(ax, counties, lw=0.5, fc="#f4f3ef") -> None:
     if counties is None or counties.empty:
         return
