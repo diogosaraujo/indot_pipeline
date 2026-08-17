@@ -28,7 +28,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MUTED, SURFACE,  # noqa: E402

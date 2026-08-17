@@ -26,17 +26,15 @@ import pathlib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
-from matplotlib.lines import Line2D  # noqa: E402
 
 from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MAX_LABELS,  # noqa: E402
                     MUTED, SEV_SIZE, SURFACE, TIER_C, active_regions, bucket,
                     day_peak_flow, draw_counties, draw_flowlines, ep_key,
-                    hour_range, load_config, load_counties, load_events,
-                    load_flowlines, load_regions, place_labels, river_ramp_legend,
-                    set_geo, sev_sizes, tile_region)
+                    load_config, load_counties, load_events, load_flowlines,
+                    load_regions, place_labels, river_ramp_legend, set_geo,
+                    sev_sizes, tile_region)
 from monitor_common.s3io import write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,

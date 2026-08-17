@@ -28,13 +28,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from matplotlib.lines import Line2D  # noqa: E402
-
-from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MUTED, SEV_SIZE,  # noqa: E402
-                    SURFACE, active_regions, bucket, day_accum, day_peak_flow,
-                    draw_counties, draw_flowlines, ep_key, load_config,
-                    load_counties, load_events, load_flowlines, load_regions,
-                    river_ramp_legend, set_geo, sev_sizes)
+from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MUTED,  # noqa: E402
+                    PANEL_FIG, SEV_SIZE, SURFACE, active_regions, bucket,
+                    day_accum, day_peak_flow, draw_counties, draw_flowlines,
+                    ep_key, load_config, load_counties, load_events,
+                    load_flowlines, load_regions, panel_legend_rects,
+                    panel_rects, river_ramp_legend, set_geo, sev_sizes)
 from monitor_common.s3io import write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -126,7 +125,9 @@ def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
     x += 0.078
     for rp in (10, 50, 100):
         n = int((de["severity_rp"] == rp).sum())
-        fig.text(x, 0.938, "•", fontsize=8 + rp / 14.0, color=INK2, va="top")
+        # glyph scaled by marker DIAMETER (sqrt of area) so the key is honest
+        fig.text(x, 0.938, "•", fontsize=6 + np.sqrt(SEV_SIZE[rp]) * 0.95,
+                 color=INK2, va="top")
         fig.text(x + 0.016, 0.938, f"{rp}-yr ({n})", fontsize=10, color=INK2, va="top")
         x += 0.098
 
