@@ -87,7 +87,7 @@ def _state_page(pdf, day, d, cfg, counties, flow, regions, act, peak) -> None:
         ratio = (peak["q_ol_cms"] * 35.3146667) / q100.reindex(peak.index)
     draw_flowlines(ax, flow, ratio)
     ax.scatter(cfg["lon"], cfg["lat"], s=0.8, c=MUTED, alpha=0.20, linewidths=0, zorder=4)
-    _scatter(ax, d, size=30, lw=0.5)
+    _scatter(ax, d, scale=0.60, lw=0.5)     # smaller at state extent — up to 217 points
 
     for rid in act:
         r = regions[rid]
