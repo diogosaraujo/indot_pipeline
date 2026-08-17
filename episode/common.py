@@ -305,6 +305,26 @@ def draw_flowlines(ax, flow, values: pd.Series | None = None, vmax: float = 1.5,
         ax.add_collection(LineCollection(hot, colors=hot_c, linewidths=hot_w, zorder=3))
 
 
+# Shared 3-panel geometry (MRMS | NWM open-loop | NWM A&A). e04 and e05 both
+# use it so an animation frame and the static map for the same day are the same
+# size and land on the same ground — you can flip between them without the eye
+# having to re-register the map.
+PANEL_FIG = (24.0, 9.6)
+PANEL_W, PANEL_X0, PANEL_GAP = 0.293, 0.028, 0.014
+
+
+def panel_rects(y: float = 0.125, h: float = 0.715) -> list[list[float]]:
+    return [[PANEL_X0 + i * (PANEL_W + PANEL_GAP), y, PANEL_W, h] for i in range(3)]
+
+
+def panel_legend_rects(y: float = 0.062, h: float = 0.016):
+    """(rainfall colourbar rect, shared streamflow ramp rect)."""
+    cb = [PANEL_X0 + 0.035, y, PANEL_W - 0.07, h]
+    ramp = [PANEL_X0 + (PANEL_W + PANEL_GAP) + 0.055, y,
+            (PANEL_W * 2 + PANEL_GAP) - 0.11, h]
+    return cb, ramp
+
+
 # Severity is encoded as marker SIZE, not colour: colour already carries which
 # product confirms the alert, and one channel cannot do two jobs. Sizes are in
 # matplotlib points^2.

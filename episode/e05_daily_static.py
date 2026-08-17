@@ -45,15 +45,30 @@ CFS = 35.3146667
 STATE = dict(lat=(37.72, 41.83), lon=(-88.12, -84.72), name="statewide")
 
 
-def render(day, extent, acc, lats, lons, nhr, ratio, de, cfg, counties, flow,
-           dpi, outdir, upload):
-    la, lo = extent["lat"], extent["lon"]
-    fig = plt.figure(figsize=(12.5, 9.0), facecolor=SURFACE, dpi=dpi)
-    ax = fig.add_axes([0.035, 0.055, 0.70, 0.80])
-    cax = fig.add_axes([0.775, 0.42, 0.020, 0.40])
-    axk = fig.add_axes([0.755, 0.055, 0.235, 0.32]); axk.axis("off")
-    axk.set_xlim(0, 1); axk.set_ylim(0, 1); axk.set_autoscale_on(False)
+def _bridges(ax, de) -> None:
+    for cls, c, m in (("flow_conf", C_CONF, "o"), ("flow_open", C_OPEN, "o"),
+                      ("precip", C_PRECIP, "^")):
+        s = de[de["map_class"] == cls]
+        if len(s):
+            ax.scatter(s["lon"], s["lat"],
+                       s=sev_sizes(s["severity_rp"], 1.0 if m == "o" else 1.25),
+                       c=c, marker=m, edgecolors="white", linewidths=0.7, zorder=8)
 
+
+def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
+           counties, flow, dpi, outdir, upload):
+    """Three equal panels: rainfall, then the two NWM products side by side.
+
+    Overlaying rainfall and streamflow on one map made each harder to read, and
+    it also hid the open-loop/A&A disagreement, which is the whole reason both
+    products are carried. Separate panels let the eye compare them directly.
+    """
+    la, lo = extent["lat"], extent["lon"]
+    fig = plt.figure(figsize=PANEL_FIG, facecolor=SURFACE, dpi=dpi)
+    axes = [fig.add_axes(r) for r in panel_rects()]
+
+    # panel 1 — 24-h MRMS accumulation
+    ax = axes[0]
     draw_counties(ax, counties, lw=0.5, fc="#f7f6f2")
     pm = None
     if acc is not None:
@@ -63,53 +78,57 @@ def render(day, extent, acc, lats, lons, nhr, ratio, de, cfg, counties, flow,
             sub = np.ma.masked_less(acc[np.ix_(rs, cs)], 0.05)
             vmax = max(0.5, float(np.nanpercentile(acc[np.ix_(rs, cs)], 99.8)))
             pm = ax.pcolormesh(lons[cs], lats[rs], sub, cmap="YlGnBu", vmin=0,
-                               vmax=vmax, shading="nearest", zorder=2, alpha=0.92)
-    draw_flowlines(ax, flow, ratio, vmax=1.5, lw_base=0.55, lat=la, lon=lo)
+                               vmax=vmax, shading="nearest", zorder=2)
+    draw_flowlines(ax, flow, None, lw_base=0.35, lat=la, lon=lo)   # channels for context only
+    _bridges(ax, de); set_geo(ax, la, lo)
+    ax.set_title("24-h MRMS accumulation", fontsize=13, color=INK, loc="left", pad=8)
 
-    for cls, c, m, lbl in (("flow_conf", C_CONF, "o", "Flow — A&A corroborates"),
-                           ("flow_open", C_OPEN, "o", "Flow — open-loop only"),
-                           ("precip", C_PRECIP, "^", "Precipitation")):
-        s = de[de["map_class"] == cls]
-        if len(s):
-            ax.scatter(s["lon"], s["lat"],
-                       s=sev_sizes(s["severity_rp"], 1.0 if m == "o" else 1.25),
-                       c=c, marker=m, edgecolors="white", linewidths=0.7,
-                       zorder=8, label=lbl)
-    set_geo(ax, la, lo)
+    # panels 2 & 3 — peak NWM, identical scale so they can be compared
+    for ax, ratio, lbl in ((axes[1], ratio_ol, "Peak NWM open-loop (trigger)"),
+                           (axes[2], ratio_aa, "Peak NWM A&A (with DA)")):
+        draw_counties(ax, counties, lw=0.5, fc="#f7f6f2")
+        if ratio is None:
+            ax.text(0.5, 0.5, "product unavailable", transform=ax.transAxes,
+                    ha="center", color=MUTED, fontsize=12)
+        else:
+            draw_flowlines(ax, flow, ratio, vmax=1.5, lw_base=0.55, lat=la, lon=lo)
+        _bridges(ax, de); set_geo(ax, la, lo)
+        ax.set_title(lbl, fontsize=13, color=INK, loc="left", pad=8)
 
+    # legends: rainfall under panel 1, one shared streamflow ramp under 2 & 3
+    cb_rect, ramp_rect = panel_legend_rects()
     if pm is not None:
-        cb = fig.colorbar(pm, cax=cax)
-        cb.set_label("24-h MRMS accumulation (in)", fontsize=9.5, color=INK2)
+        cb = fig.colorbar(pm, cax=fig.add_axes(cb_rect), orientation="horizontal")
+        cb.set_label("24-h accumulation (in)", fontsize=9, color=INK2)
         cb.ax.tick_params(labelsize=8, colors=INK2)
-    else:
-        cax.axis("off")
+    river_ramp_legend(fig, ramp_rect,
+                      label="peak flow ÷ reach 100-yr Q  (both NWM panels share this scale)")
 
-    fig.text(0.035, 0.968, f"{pd.Timestamp(day):%A %d %B %Y}  —  24-h rainfall "
-                           f"and peak streamflow", fontsize=18, fontweight="bold",
+    fig.text(0.028, 0.975, f"{pd.Timestamp(day):%A %d %B %Y}  —  24-h rainfall and "
+                           f"peak streamflow", fontsize=20, fontweight="bold",
              color=INK, va="top")
-    fig.text(0.035, 0.928, f"{extent['name']}   ·   {len(de)} bridge(s) triggered   ·   "
-                           f"{nhr}/24 MRMS hours available",
-             fontsize=11, color=INK2, va="top")
+    fig.text(0.028, 0.938, f"{extent['name']}   ·   {len(de)} bridge(s) triggered   ·   "
+                           f"{nhr}/24 MRMS hours available   ·   "
+                           f"gray reaches carry no LP3 fit",
+             fontsize=11.5, color=INK2, va="top")
 
-    y = 0.97
-    for cls, c, m, lbl in (("flow_conf", C_CONF, "o", "Flow — A&A corroborates"),
-                           ("flow_open", C_OPEN, "o", "Flow — open-loop only"),
-                           ("precip", C_PRECIP, "^", "Precipitation")):
+    # marker key, laid out along the header so it steals no map area
+    x = 0.545
+    for cls, c, m, lbl in (("flow_conf", C_CONF, "o", "A&A corroborates"),
+                           ("flow_open", C_OPEN, "o", "open-loop only"),
+                           ("precip", C_PRECIP, "^", "precipitation")):
         n = int((de["map_class"] == cls).sum())
-        axk.plot([0.03], [y - 0.012], marker=m, ms=8, color=c, mec="white", mew=.9)
-        axk.text(0.11, y, f"{lbl} ({n})", fontsize=8.5, color=INK2, va="top")
-        y -= 0.085
-    y -= 0.02
-    axk.text(0, y, "Severity = marker size", fontsize=9.5, fontweight="bold",
-             color=INK, va="top")
-    y -= 0.085
-    for rp in (100, 50, 10):
-        n = int((de["severity_rp"] == rp).sum()) if "severity_rp" in de.columns else 0
-        axk.scatter([0.035], [y - 0.010], s=SEV_SIZE[rp] * 0.5, c=INK2,
-                    edgecolors="white", linewidths=0.6)
-        axk.text(0.11, y, f"{rp}-yr ({n})", fontsize=8.5, color=INK2, va="top")
-        y -= 0.078
-    river_ramp_legend(fig, [0.775, 0.30, 0.185, 0.014])
+        fig.text(x, 0.975, "●" if m == "o" else "▲", fontsize=13, color=c, va="top")
+        fig.text(x + 0.013, 0.973, f"{lbl} ({n})", fontsize=10.5, color=INK2, va="top")
+        x += 0.115
+    x = 0.545
+    fig.text(x, 0.938, "severity = size:", fontsize=10.5, color=INK, va="top")
+    x += 0.078
+    for rp in (10, 50, 100):
+        n = int((de["severity_rp"] == rp).sum())
+        fig.text(x, 0.938, "•", fontsize=8 + rp / 14.0, color=INK2, va="top")
+        fig.text(x + 0.016, 0.938, f"{rp}-yr ({n})", fontsize=10, color=INK2, va="top")
+        x += 0.098
 
     tag = extent["name"].replace(" ", "_")
     fp = pathlib.Path(outdir) / f"accum_{day}_{tag}.png"
