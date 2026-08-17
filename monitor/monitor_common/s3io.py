@@ -42,6 +42,10 @@ def write_bytes(data: bytes, bucket: str, key: str,
     s3().put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
 
 
+def read_bytes(bucket: str, key: str) -> bytes:
+    return s3().get_object(Bucket=bucket, Key=key)["Body"].read()
+
+
 def object_exists(bucket: str, key: str) -> bool:
     resp = s3().list_objects_v2(Bucket=bucket, Prefix=key, MaxKeys=1)
     return any(o["Key"] == key for o in resp.get("Contents", []))

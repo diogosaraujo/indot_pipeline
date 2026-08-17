@@ -34,7 +34,7 @@ import pandas as pd
 from common import (DAYS, IN_BBOX, bucket, ep_key, hour_range, load_config,
                     mrms_key, nwm_key)
 from monitor_common import config, mrms, nwm
-from monitor_common.s3io import list_keys, read_bytes, write_bytes, write_parquet
+from monitor_common.s3io import list_keys, write_bytes, write_parquet
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s")
