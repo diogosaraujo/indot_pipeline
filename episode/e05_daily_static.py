@@ -29,11 +29,12 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MUTED,  # noqa: E402
-                    PANEL_FIG, SEV_SIZE, SURFACE, active_regions, bucket,
-                    day_accum, day_peak_flow, draw_counties, draw_flowlines,
-                    ep_key, load_config, load_counties, load_events,
-                    load_flowlines, load_regions, panel_legend_rects,
-                    panel_rects, river_ramp_legend, set_geo, sev_sizes)
+                    PANEL_FIG, PRECIP_ALPHA, SEV_SIZE, SURFACE, active_regions,
+                    bucket, day_accum, day_peak_flow, draw_counties,
+                    draw_flowlines, ep_key, load_config, load_counties,
+                    load_events, load_flowlines, load_regions,
+                    panel_legend_rects, panel_rects, precip_cmap,
+                    river_ramp_legend, set_geo, sev_sizes)
 from monitor_common.s3io import write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -44,18 +45,18 @@ CFS = 35.3146667
 STATE = dict(lat=(37.72, 41.83), lon=(-88.12, -84.72), name="statewide")
 
 
-def _bridges(ax, de) -> None:
+def _bridges(ax, de, mscale=1.9) -> None:
     for cls, c, m in (("flow_conf", C_CONF, "o"), ("flow_open", C_OPEN, "o"),
                       ("precip", C_PRECIP, "^")):
         s = de[de["map_class"] == cls]
         if len(s):
             ax.scatter(s["lon"], s["lat"],
-                       s=sev_sizes(s["severity_rp"], 1.25 if m == "o" else 1.55),
-                       c=c, marker=m, edgecolors="white", linewidths=0.8, zorder=8)
+                       s=sev_sizes(s["severity_rp"], mscale * (1.0 if m == "o" else 1.25)),
+                       c=c, marker=m, edgecolors="white", linewidths=0.9, zorder=8)
 
 
 def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
-           counties, flow, dpi, outdir, upload):
+           counties, flow, dpi, outdir, upload, mscale=1.9):
     """Three equal panels: rainfall, then the two NWM products side by side.
 
     Overlaying rainfall and streamflow on one map made each harder to read, and
@@ -76,10 +77,12 @@ def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
         if rs.size and cs.size:
             sub = np.ma.masked_less(acc[np.ix_(rs, cs)], 0.05)
             vmax = max(0.5, float(np.nanpercentile(acc[np.ix_(rs, cs)], 99.8)))
-            pm = ax.pcolormesh(lons[cs], lats[rs], sub, cmap="YlGnBu", vmin=0,
-                               vmax=vmax, shading="nearest", zorder=2)
-    draw_flowlines(ax, flow, None, lw_base=0.35, lat=la, lon=lo)   # channels for context only
-    _bridges(ax, de); set_geo(ax, la, lo)
+            pm = ax.pcolormesh(lons[cs], lats[rs], sub, cmap=precip_cmap(),
+                               vmin=0.05, vmax=vmax, shading="nearest",
+                               zorder=2, alpha=PRECIP_ALPHA)
+    # no river network here — this panel is the rainfall field, and the NWM
+    # channels belong to the two panels that actually encode flow
+    _bridges(ax, de, mscale); set_geo(ax, la, lo)
     ax.set_title("24-h MRMS accumulation", fontsize=13, color=INK, loc="left", pad=8)
 
     # panels 2 & 3 — peak NWM, identical scale so they can be compared
@@ -91,7 +94,7 @@ def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
                     ha="center", color=MUTED, fontsize=12)
         else:
             draw_flowlines(ax, flow, ratio, vmax=1.5, lw_base=0.55, lat=la, lon=lo)
-        _bridges(ax, de); set_geo(ax, la, lo)
+        _bridges(ax, de, mscale); set_geo(ax, la, lo)
         ax.set_title(lbl, fontsize=13, color=INK, loc="left", pad=8)
 
     # legends: rainfall under panel 1, one shared streamflow ramp under 2 & 3
@@ -146,6 +149,8 @@ def main() -> None:
     ap.add_argument("--days", nargs="*", default=DAYS)
     ap.add_argument("--outdir", default="episode_out/static")
     ap.add_argument("--dpi", type=int, default=170)
+    ap.add_argument("--marker-scale", type=float, default=1.9,
+                    help="bridge symbol size multiplier (severity sets the tier)")
     ap.add_argument("--only-state", action="store_true")
     ap.add_argument("--no-upload", action="store_true")
     args = ap.parse_args()
@@ -183,7 +188,8 @@ def main() -> None:
                                     name=f"region {rid}"))
         for extent in extents:
             render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de,
-                   cfg, counties, flow, args.dpi, out, not args.no_upload)
+                   cfg, counties, flow, args.dpi, out, not args.no_upload,
+                   args.marker_scale)
 
 
 if __name__ == "__main__":

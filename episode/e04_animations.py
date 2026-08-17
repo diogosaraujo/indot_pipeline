@@ -31,11 +31,11 @@ import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MUTED, SURFACE,  # noqa: E402
-                    PANEL_FIG, TZ, active_regions, bucket, draw_counties,
-                    draw_flowlines, ep_key, hour_range, load_config, load_counties,
-                    load_events, load_flowlines, load_mrms_hour, load_nwm_hour,
-                    load_regions, panel_legend_rects, panel_rects,
-                    river_ramp_legend, set_geo, sev_sizes)
+                    PANEL_FIG, PRECIP_ALPHA, TZ, active_regions, bucket,
+                    draw_counties, draw_flowlines, ep_key, hour_range, load_config,
+                    load_counties, load_events, load_flowlines, load_mrms_hour,
+                    load_nwm_hour, load_regions, panel_legend_rects, panel_rects,
+                    precip_cmap, river_ramp_legend, set_geo, sev_sizes)
 from monitor_common.s3io import write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -47,7 +47,7 @@ STATE = dict(lat=(37.72, 41.83), lon=(-88.12, -84.72), name="statewide")
 
 
 def _frame(ts, extent, day_events, cfg, counties, flow, q100, vmax_p, vmax_q,
-           dpi, colors=192):
+           dpi, colors=192, mscale=1.9):
     """One 3-panel frame -> PIL Image."""
     la, lo = extent["lat"], extent["lon"]
     fig = plt.figure(figsize=PANEL_FIG, facecolor=SURFACE, dpi=dpi)
@@ -67,12 +67,13 @@ def _frame(ts, extent, day_events, cfg, counties, flow, q100, vmax_p, vmax_q,
         cs = np.where((lons >= lo[0]) & (lons <= lo[1]))[0]
         if rs.size and cs.size:
             sub = np.ma.masked_less(arr[np.ix_(rs, cs)], 0.01)
-            pm = ax.pcolormesh(lons[cs], lats[rs], sub, cmap="YlGnBu", vmin=0,
-                               vmax=vmax_p, shading="nearest", zorder=2)
+            pm = ax.pcolormesh(lons[cs], lats[rs], sub, cmap=precip_cmap(),
+                               vmin=0.01, vmax=vmax_p, shading="nearest",
+                               zorder=2, alpha=PRECIP_ALPHA)
     else:
         ax.text(0.5, 0.5, "no MRMS this hour", transform=ax.transAxes,
                 ha="center", color=MUTED, fontsize=13)
-    draw_flowlines(ax, flow, None, lw_base=0.35, lat=la, lon=lo)
+    # no river network here — this panel is the rainfall field
     ax.set_title("MRMS 1-h QPE", fontsize=13, color=INK, loc="left", pad=8)
 
     # panels 2 & 3 — NWM open-loop and A&A, identical scale
@@ -96,8 +97,9 @@ def _frame(ts, extent, day_events, cfg, counties, flow, q100, vmax_p, vmax_q,
             if len(s):
                 # same scale as the static map — the panels are the same size,
                 # so the markers must be too or the two products disagree
-                ax.scatter(s["lon"], s["lat"], s=sev_sizes(s["severity_rp"], 1.25),
-                           c=c, marker=m, edgecolors="white", linewidths=0.8, zorder=8)
+                ax.scatter(s["lon"], s["lat"],
+                           s=sev_sizes(s["severity_rp"], mscale * (1.0 if m == "o" else 1.25)),
+                           c=c, marker=m, edgecolors="white", linewidths=0.9, zorder=8)
         set_geo(ax, la, lo)
 
     cb_rect, ramp_rect = panel_legend_rects()
@@ -153,6 +155,8 @@ def main() -> None:
                          "Raise for print; GIF size scales roughly with dpi^2.")
     ap.add_argument("--colors", type=int, default=192,
                     help="GIF palette size; lower shrinks files on flat maps")
+    ap.add_argument("--marker-scale", type=float, default=1.9,
+                    help="bridge symbol size multiplier (severity sets the tier)")
     ap.add_argument("--only-state", action="store_true")
     ap.add_argument("--no-upload", action="store_true")
     args = ap.parse_args()
@@ -184,7 +188,8 @@ def main() -> None:
             frames = []
             for ts in hour_range(day):
                 frames.append(_frame(ts, extent, de, cfg, counties, flow, q100,
-                                     vp, vq, args.dpi, args.colors))
+                                     vp, vq, args.dpi, args.colors,
+                                     args.marker_scale))
             tag = extent["name"].replace(" ", "_")
             fp = out / f"{day}_{tag}.gif"
             frames[0].save(fp, save_all=True, append_images=frames[1:], loop=0,

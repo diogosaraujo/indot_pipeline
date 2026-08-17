@@ -266,6 +266,28 @@ def day_peak_flow(day: str) -> pd.DataFrame:
 
 # ── Plot helpers ─────────────────────────────────────────────────────────────
 
+# Precipitation colour scale, lifted from scripts/visualize_lanesville_event.py
+# (its "nws_precip" ramp): transparent at zero, then blues -> greens -> yellow
+# -> orange -> red -> purple. set_under("none") keeps dry cells fully clear so
+# the basemap shows through rather than being covered by a pale wash.
+PRECIP_COLORS = [
+    (1.0, 1.0, 1.0, 0.0),          # transparent for zero
+    "#b3d9ff", "#6ab4ff", "#1f78b4",
+    "#33a02c", "#b2df8a",
+    "#ffff33", "#ff7f00",
+    "#e31a1c", "#fb9a99",
+    "#6a0dad",
+]
+PRECIP_ALPHA = 0.70                # let counties and rivers read through the field
+
+
+def precip_cmap():
+    import matplotlib.colors as mcolors
+    cm = mcolors.LinearSegmentedColormap.from_list("nws_precip", PRECIP_COLORS, N=256)
+    cm.set_under("none")
+    return cm
+
+
 # River colour scale, matching scripts/visualize_lanesville_event.py: plasma_r
 # runs yellow (low) -> magenta -> dark purple (high), so the flooding reaches go
 # dark and prominent on a light basemap instead of fading out the way the light
