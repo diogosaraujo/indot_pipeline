@@ -41,7 +41,12 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s")
 log = logging.getLogger("episode.e03")
 
-CLASS_C = {"flow_conf": C_CONF, "flow_open": C_OPEN, "precip": C_PRECIP, "unknown": C_CONF}
+# 'unknown' means corroboration could not be assessed. It gets its own neutral
+# colour rather than folding into flow_conf: a gap must not read as a
+# confirmation, which is how the pre-digest Aug 12 run silently rendered all
+# 213 of its flow alerts as A&A-corroborated.
+CLASS_C = {"flow_conf": C_CONF, "flow_open": C_OPEN, "precip": C_PRECIP,
+           "unknown": "#7d7a72"}
 
 
 def _day_events(ev: pd.DataFrame, day: str) -> pd.DataFrame:
@@ -123,8 +128,12 @@ def _state_page(pdf, day, d, cfg, counties, flow, regions, act, peak) -> None:
     y -= 0.05
     for cls, col, mark, lbl in (("flow_conf", C_CONF, "o", "Flow — A&A corroborates"),
                                 ("flow_open", C_OPEN, "o", "Flow — open-loop only"),
-                                ("precip", C_PRECIP, "^", "Precipitation")):
+                                ("precip", C_PRECIP, "^", "Precipitation"),
+                                ("unknown", CLASS_C["unknown"], "o",
+                                 "Flow — corroboration unassessed")):
         cnt = int((d["map_class"] == cls).sum())
+        if cls == "unknown" and not cnt:
+            continue                       # only shown when the gap actually exists
         axk.plot([0.025], [y - 0.012], marker=mark, ms=8, color=col, mec="white", mew=.9)
         axk.text(0.075, y, f"{lbl}  ({cnt})", fontsize=9.5, color=INK2, va="top")
         y -= 0.045

@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from common import (DAYS, REGIONS_JSON, TZ, bucket, derive_regions, ep_key,
-                    load_config)
+                    load_config, load_nwm_hour)
 from monitor_common import config
 from monitor_common.s3io import list_keys, read_parquet, write_parquet
 
@@ -65,6 +65,44 @@ def collect_events() -> pd.DataFrame:
     return ev
 
 
+def backfill_map_class(ev: pd.DataFrame, cfg: pd.DataFrame) -> pd.DataFrame:
+    """Recover A&A corroboration for runs that predate the digest code.
+
+    The Aug 12 run was archived before _dispatch_digest existed, so its
+    alert_state snapshot carries no aa_confirms and every flow event lands as
+    'unknown'. Left alone those render as corroborated, which is the wrong way
+    for a gap to fail — it inflates confidence in exactly the largest day.
+
+    The A&A flow for that hour is recoverable: e01 re-fetched it from NOAA into
+    episode/nwm/. The threshold is reconstructible too, since the trigger fired
+    at severity rp against that bridge's Q{rp}. So redo the comparison.
+    """
+    need = ev["map_class"].eq("unknown") & ev["trigger_type"].eq("flow")
+    if not need.any():
+        return ev
+    log.info("Backfilling A&A corroboration for %d pre-digest flow event(s)",
+             int(need.sum()))
+    CFS = 35.3146667
+    for hour, idx in ev[need].groupby("valid_hour").groups.items():
+        nw = load_nwm_hour(pd.Timestamp(hour))
+        if nw is None or "q_aa_cms" not in getattr(nw, "columns", []):
+            log.warning("No A&A slice for %s — %d event(s) stay 'unknown' and will "
+                        "render as unassessed, not as corroborated.", hour, len(idx))
+            continue
+        sub = ev.loc[idx]
+        q_aa = (pd.to_numeric(sub["comid"], errors="coerce").map(nw["q_aa_cms"])
+                * CFS).to_numpy()
+        thr = np.array([cfg.at[b, f"Q{int(rp)}_cfs"] if b in cfg.index else np.nan
+                        for b, rp in zip(sub["bridge_id"], sub["severity_rp"])], float)
+        conf = np.isfinite(q_aa) & np.isfinite(thr) & (q_aa >= thr)
+        ev.loc[idx, "map_class"] = np.where(conf, "flow_conf", "flow_open")
+        ev.loc[idx, "q_aa_cfs"] = q_aa
+        ev.loc[idx, "threshold"] = thr
+        log.info("  %s: %d corroborated, %d open-loop only",
+                 hour, int(conf.sum()), int((~conf).sum()))
+    return ev
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--link-mi", type=float, default=6.0)
@@ -79,6 +117,13 @@ def main() -> None:
     ev["asset"] = ev["bridge_id"].map(cfg[config.ASSET_COL]).fillna(ev["bridge_id"])
     ev["day"] = ev["valid_hour"].dt.tz_convert(TZ).dt.date.astype(str)
     ev = ev[ev["day"].isin(DAYS)].dropna(subset=["lat", "lon"]).reset_index(drop=True)
+    ev = backfill_map_class(ev, cfg)
+    left = int(ev["map_class"].eq("unknown").sum())
+    if left:
+        log.warning("%d event(s) remain unclassified and will render as "
+                    "'confirmation unassessed'.", left)
+    log.info("map_class by day:\n%s",
+             pd.crosstab(ev["day"], ev["map_class"]).to_string())
 
     log.info("Episode: %d events, %d bridges, days %s",
              len(ev), ev["bridge_id"].nunique(), sorted(ev["day"].unique()))
