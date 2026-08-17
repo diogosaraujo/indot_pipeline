@@ -94,8 +94,10 @@ def _frame(ts, extent, day_events, cfg, counties, flow, q100, vmax_p, vmax_q,
                           ("precip", C_PRECIP, "^")):
             s = shown[shown["map_class"] == cls]
             if len(s):
-                ax.scatter(s["lon"], s["lat"], s=sev_sizes(s["severity_rp"], 0.55),
-                           c=c, marker=m, edgecolors="white", linewidths=0.5, zorder=8)
+                # same scale as the static map — the panels are the same size,
+                # so the markers must be too or the two products disagree
+                ax.scatter(s["lon"], s["lat"], s=sev_sizes(s["severity_rp"], 1.25),
+                           c=c, marker=m, edgecolors="white", linewidths=0.8, zorder=8)
         set_geo(ax, la, lo)
 
     cb_rect, ramp_rect = panel_legend_rects()

@@ -50,8 +50,8 @@ def _bridges(ax, de) -> None:
         s = de[de["map_class"] == cls]
         if len(s):
             ax.scatter(s["lon"], s["lat"],
-                       s=sev_sizes(s["severity_rp"], 1.0 if m == "o" else 1.25),
-                       c=c, marker=m, edgecolors="white", linewidths=0.7, zorder=8)
+                       s=sev_sizes(s["severity_rp"], 1.25 if m == "o" else 1.55),
+                       c=c, marker=m, edgecolors="white", linewidths=0.8, zorder=8)
 
 
 def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,

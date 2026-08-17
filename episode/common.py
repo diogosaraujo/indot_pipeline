@@ -266,14 +266,23 @@ def day_peak_flow(day: str) -> pd.DataFrame:
 
 # ── Plot helpers ─────────────────────────────────────────────────────────────
 
+# River colour scale, matching scripts/visualize_lanesville_event.py: plasma_r
+# runs yellow (low) -> magenta -> dark purple (high), so the flooding reaches go
+# dark and prominent on a light basemap instead of fading out the way the light
+# end of a single-hue blue ramp does. Quiet reaches use Lanesville's 0.72 gray.
+RIVER_CMAP = "plasma_r"
+RIVER_QUIET = "0.72"
+
+
 def draw_flowlines(ax, flow, values: pd.Series | None = None, vmax: float = 1.5,
-                   lw_base: float = 0.45, cmap: str = "Blues",
+                   lw_base: float = 0.45, cmap: str = RIVER_CMAP,
                    lat=None, lon=None) -> None:
     """River network, optionally colored by a per-COMID value (e.g. q/Q100).
 
     Reaches with no value are drawn thin and gray so the network still reads as
     a network — the quiet rivers are the context that makes the loud ones mean
-    something.
+    something. Colour AND width both track the value, so the encoding survives
+    greyscale printing and small panel sizes.
     """
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
@@ -297,10 +306,11 @@ def draw_flowlines(ax, flow, values: pd.Series | None = None, vmax: float = 1.5,
             quiet.append(seg)
         else:
             frac = float(np.clip(v / vmax, 0, 1))
-            hot.append(seg); hot_c.append(cm(0.25 + 0.75 * frac))
+            hot.append(seg); hot_c.append(cm(frac))
             hot_w.append(lw_base * (1.0 + 3.5 * frac))
     if quiet:
-        ax.add_collection(LineCollection(quiet, colors="#c7d3dd", linewidths=lw_base, zorder=2))
+        ax.add_collection(LineCollection(quiet, colors=RIVER_QUIET,
+                                         linewidths=lw_base, zorder=2))
     if hot:
         ax.add_collection(LineCollection(hot, colors=hot_c, linewidths=hot_w, zorder=3))
 
@@ -335,16 +345,17 @@ def sev_sizes(sev, scale: float = 1.0) -> np.ndarray:
     return np.array([SEV_SIZE.get(int(s), 40) * scale for s in np.asarray(sev)])
 
 
-def river_ramp_legend(fig, rect, vmax: float = 1.5, cmap: str = "Blues",
+def river_ramp_legend(fig, rect, vmax: float = 1.5, cmap: str = RIVER_CMAP,
                       label: str = "peak flow ÷ reach 100-yr Q") -> None:
     """Horizontal strip decoding the river shading.
 
-    draw_flowlines maps frac -> cmap(0.25 + 0.75*frac), so the strip must show
-    that same sub-range or the legend would lie about the light end.
+    Shows the full 0-1 range because draw_flowlines now samples the whole
+    colormap; if that mapping is ever narrowed again, narrow this to match or
+    the legend lies about the ends.
     """
     import matplotlib.pyplot as plt
     ax = fig.add_axes(rect)
-    grad = np.linspace(0.25, 1.0, 256).reshape(1, -1)
+    grad = np.linspace(0.0, 1.0, 256).reshape(1, -1)
     ax.imshow(grad, aspect="auto", cmap=plt.get_cmap(cmap))
     ax.set_yticks([])
     ax.set_xticks([0, 127, 255])
