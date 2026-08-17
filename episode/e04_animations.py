@@ -35,7 +35,7 @@ from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MUTED, SURFACE,  
                     TZ, active_regions, bucket, draw_counties, draw_flowlines,
                     ep_key, hour_range, load_config, load_counties, load_events,
                     load_flowlines, load_mrms_hour, load_nwm_hour, load_regions,
-                    set_geo)
+                    set_geo, sev_sizes)
 from monitor_common.s3io import write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -91,8 +91,8 @@ def _frame(ts, extent, day_events, cfg, counties, flow, q100, vmax_p, vmax_q, dp
                           ("precip", C_PRECIP, "^")):
             s = shown[shown["map_class"] == cls]
             if len(s):
-                ax.scatter(s["lon"], s["lat"], s=26, c=c, marker=m,
-                           edgecolors="white", linewidths=0.5, zorder=8)
+                ax.scatter(s["lon"], s["lat"], s=sev_sizes(s["severity_rp"], 0.55),
+                           c=c, marker=m, edgecolors="white", linewidths=0.5, zorder=8)
         set_geo(ax, la, lo)
 
     fig.text(0.015, 0.965, f"{local:%A %d %B %Y  ·  %H:%M %Z}   —   {extent['name']}",
@@ -153,6 +153,7 @@ def main() -> None:
               .groupby("bridge_id")
               .agg(lat=("lat", "first"), lon=("lon", "first"),
                    map_class=("map_class", "first"),
+                   severity_rp=("severity_rp", "max"),
                    first_hour=("valid_hour", "min")).reset_index())
 
         extents = [STATE]

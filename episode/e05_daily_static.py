@@ -30,11 +30,11 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 
-from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MUTED, SURFACE,  # noqa: E402
-                    active_regions, bucket, day_accum, day_peak_flow,
+from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MUTED, SEV_SIZE,  # noqa: E402
+                    SURFACE, active_regions, bucket, day_accum, day_peak_flow,
                     draw_counties, draw_flowlines, ep_key, load_config,
                     load_counties, load_events, load_flowlines, load_regions,
-                    set_geo)
+                    river_ramp_legend, set_geo, sev_sizes)
 from monitor_common.s3io import write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -71,8 +71,10 @@ def render(day, extent, acc, lats, lons, nhr, ratio, de, cfg, counties, flow,
                            ("precip", C_PRECIP, "^", "Precipitation")):
         s = de[de["map_class"] == cls]
         if len(s):
-            ax.scatter(s["lon"], s["lat"], s=52 if m == "o" else 66, c=c, marker=m,
-                       edgecolors="white", linewidths=0.7, zorder=8, label=lbl)
+            ax.scatter(s["lon"], s["lat"],
+                       s=sev_sizes(s["severity_rp"], 1.0 if m == "o" else 1.25),
+                       c=c, marker=m, edgecolors="white", linewidths=0.7,
+                       zorder=8, label=lbl)
     set_geo(ax, la, lo)
 
     if pm is not None:
@@ -90,12 +92,6 @@ def render(day, extent, acc, lats, lons, nhr, ratio, de, cfg, counties, flow,
              fontsize=11, color=INK2, va="top")
 
     y = 0.97
-    axk.text(0, y, "River shading", fontsize=10.5, fontweight="bold", color=INK, va="top")
-    y -= 0.10
-    axk.text(0, y, "peak open-loop flow that day\nas a fraction of the reach's\n"
-                   "100-yr Q (dark = at or above).\nGray reaches have no LP3 fit.",
-             fontsize=8.5, color=MUTED, va="top")
-    y -= 0.30
     for cls, c, m, lbl in (("flow_conf", C_CONF, "o", "Flow — A&A corroborates"),
                            ("flow_open", C_OPEN, "o", "Flow — open-loop only"),
                            ("precip", C_PRECIP, "^", "Precipitation")):
@@ -103,6 +99,17 @@ def render(day, extent, acc, lats, lons, nhr, ratio, de, cfg, counties, flow,
         axk.plot([0.03], [y - 0.012], marker=m, ms=8, color=c, mec="white", mew=.9)
         axk.text(0.11, y, f"{lbl} ({n})", fontsize=8.5, color=INK2, va="top")
         y -= 0.085
+    y -= 0.02
+    axk.text(0, y, "Severity = marker size", fontsize=9.5, fontweight="bold",
+             color=INK, va="top")
+    y -= 0.085
+    for rp in (100, 50, 10):
+        n = int((de["severity_rp"] == rp).sum()) if "severity_rp" in de.columns else 0
+        axk.scatter([0.035], [y - 0.010], s=SEV_SIZE[rp] * 0.5, c=INK2,
+                    edgecolors="white", linewidths=0.6)
+        axk.text(0.11, y, f"{rp}-yr ({n})", fontsize=8.5, color=INK2, va="top")
+        y -= 0.078
+    river_ramp_legend(fig, [0.775, 0.30, 0.185, 0.014])
 
     tag = extent["name"].replace(" ", "_")
     fp = pathlib.Path(outdir) / f"accum_{day}_{tag}.png"
@@ -134,7 +141,8 @@ def main() -> None:
             log.info("%s: no alerts, skipped", day); continue
         de = (d.sort_values("severity_rp", ascending=False).groupby("bridge_id")
               .agg(lat=("lat", "first"), lon=("lon", "first"),
-                   map_class=("map_class", "first")).reset_index())
+                   map_class=("map_class", "first"),
+                   severity_rp=("severity_rp", "max")).reset_index())
         acc, lats, lons, nhr = day_accum(day)
         if nhr < 24:
             log.warning("%s: only %d/24 MRMS hours — accumulation is a partial day",

@@ -32,10 +32,11 @@ from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 
 from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MAX_LABELS,  # noqa: E402
-                    MUTED, SURFACE, TIER_C, active_regions, bucket, day_peak_flow,
-                    draw_counties, draw_flowlines, ep_key, hour_range, load_config,
-                    load_counties, load_events, load_flowlines, load_regions,
-                    place_labels, set_geo, tile_region)
+                    MUTED, SEV_SIZE, SURFACE, TIER_C, active_regions, bucket,
+                    day_peak_flow, draw_counties, draw_flowlines, ep_key,
+                    hour_range, load_config, load_counties, load_events,
+                    load_flowlines, load_regions, place_labels, river_ramp_legend,
+                    set_geo, sev_sizes, tile_region)
 from monitor_common.s3io import write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -61,13 +62,15 @@ def _day_events(ev: pd.DataFrame, day: str) -> pd.DataFrame:
     return agg
 
 
-def _scatter(ax, d: pd.DataFrame, size=44, lw=0.6) -> None:
+def _scatter(ax, d: pd.DataFrame, scale=1.0, lw=0.6) -> None:
+    """Colour = which product confirms it; SIZE = severity tier."""
     for cls, col in CLASS_C.items():
         s = d[d["map_class"] == cls]
         if not len(s):
             continue
         mark = "^" if cls == "precip" else "o"
-        ax.scatter(s["lon"], s["lat"], s=size * (1.35 if cls == "precip" else 1.0),
+        ax.scatter(s["lon"], s["lat"],
+                   s=sev_sizes(s["severity_rp"], scale * (1.25 if cls == "precip" else 1.0)),
                    c=col, marker=mark, edgecolors="white", linewidths=lw, zorder=6)
 
 
@@ -128,17 +131,22 @@ def _state_page(pdf, day, d, cfg, counties, flow, regions, act, peak) -> None:
         axk.text(0.075, y, f"{lbl}  ({cnt})", fontsize=9.5, color=INK2, va="top")
         y -= 0.045
     y -= 0.015
-    axk.text(0, y, "Severity (max per bridge)", fontsize=12, fontweight="bold",
+    axk.text(0, y, "Severity = marker size", fontsize=12, fontweight="bold",
              color=INK, va="top")
-    y -= 0.05
+    y -= 0.055
     for rp in (100, 50, 10):
         c = int((d["severity_rp"] == rp).sum())
-        axk.plot([0.025], [y - 0.010], marker="s", ms=8, color=TIER_C[rp])
-        axk.text(0.075, y, f"{rp}-yr  ({c})", fontsize=9.5, color=INK2, va="top")
-        y -= 0.042
-    y -= 0.02
-    axk.text(0, y, "River shading = peak open-loop flow\nas a fraction of the reach's 100-yr Q.\n"
-                   "Gray reaches carry no LP3 fit.", fontsize=8.5, color=MUTED, va="top")
+        axk.scatter([0.030], [y - 0.008], s=SEV_SIZE[rp] * 0.55, c=INK2,
+                    edgecolors="white", linewidths=0.6)
+        axk.text(0.095, y, f"{rp}-yr  ({c})", fontsize=9.5, color=INK2, va="top")
+        y -= 0.048
+    y -= 0.015
+    axk.text(0, y, "Colour is which product confirms the alert;\nsize is the tier it reached — "
+                   "one channel\ncannot carry both.", fontsize=8.5, color=MUTED, va="top")
+    y -= 0.10
+    axk.text(0, y, "Gray reaches carry no LP3 fit, so they\nhave no ratio to shade.",
+             fontsize=8.5, color=MUTED, va="top")
+    river_ramp_legend(fig, [0.695, 0.10, 0.20, 0.016])
     pdf.savefig(fig); plt.close(fig)
 
 
@@ -156,9 +164,10 @@ def _zoom_page(pdf, day, rid, tile, d, cfg, counties, flow, peak, ratio) -> None
     draw_flowlines(ax, flow, ratio, lw_base=0.9, lat=la, lon=lo)
     ctx = cfg[(cfg["lat"].between(*la)) & (cfg["lon"].between(*lo))]
     ax.scatter(ctx["lon"], ctx["lat"], s=5, c=MUTED, alpha=0.30, linewidths=0, zorder=4)
-    _scatter(ax, sub, size=70, lw=0.8)
+    _scatter(ax, sub, scale=1.5, lw=0.8)
     set_geo(ax, la, lo)
     place_labels(ax, sub, "asset", fontsize=7.0)
+    river_ramp_legend(fig, [0.695, 0.055, 0.19, 0.014])
 
     part = f"  (part {tile['part']} of {tile['parts']})" if tile["parts"] > 1 else ""
     fig.text(0.03, 0.965, f"{pd.Timestamp(day):%a %d %b %Y}  —  region {rid}{part}",

@@ -305,6 +305,36 @@ def draw_flowlines(ax, flow, values: pd.Series | None = None, vmax: float = 1.5,
         ax.add_collection(LineCollection(hot, colors=hot_c, linewidths=hot_w, zorder=3))
 
 
+# Severity is encoded as marker SIZE, not colour: colour already carries which
+# product confirms the alert, and one channel cannot do two jobs. Sizes are in
+# matplotlib points^2.
+SEV_SIZE = {10: 26, 50: 58, 100: 108}
+
+
+def sev_sizes(sev, scale: float = 1.0) -> np.ndarray:
+    return np.array([SEV_SIZE.get(int(s), 40) * scale for s in np.asarray(sev)])
+
+
+def river_ramp_legend(fig, rect, vmax: float = 1.5, cmap: str = "Blues",
+                      label: str = "peak flow ÷ reach 100-yr Q") -> None:
+    """Horizontal strip decoding the river shading.
+
+    draw_flowlines maps frac -> cmap(0.25 + 0.75*frac), so the strip must show
+    that same sub-range or the legend would lie about the light end.
+    """
+    import matplotlib.pyplot as plt
+    ax = fig.add_axes(rect)
+    grad = np.linspace(0.25, 1.0, 256).reshape(1, -1)
+    ax.imshow(grad, aspect="auto", cmap=plt.get_cmap(cmap))
+    ax.set_yticks([])
+    ax.set_xticks([0, 127, 255])
+    ax.set_xticklabels(["0", f"{vmax/2:.2g}×", f"≥{vmax:.2g}×"], fontsize=7.5, color=INK2)
+    ax.tick_params(length=2, pad=1.5, colors=INK2)
+    for s in ax.spines.values():
+        s.set_color(BASELINE); s.set_linewidth(0.6)
+    ax.set_title(label, fontsize=8, color=INK2, loc="left", pad=3)
+
+
 def place_labels(ax, pts: pd.DataFrame, text_col: str, fontsize=7.0,
                  min_gap_frac=0.030) -> None:
     """Direct labels with greedy vertical de-confliction and leader lines.
