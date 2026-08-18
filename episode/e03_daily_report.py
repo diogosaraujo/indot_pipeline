@@ -57,6 +57,11 @@ def _day_events(ev: pd.DataFrame, day: str) -> pd.DataFrame:
     d = ev[ev["day"] == day].copy()
     if d.empty:
         return d
+    for c in ("observed", "threshold"):      # tolerate an events table built
+        if c not in d.columns:               # before these were carried through
+            d[c] = np.nan
+    if "aa_confirms" not in d.columns:
+        d["aa_confirms"] = False
     d = d.sort_values("severity_rp", ascending=False)
     agg = d.groupby("bridge_id").agg(
         asset=("asset", "first"), lat=("lat", "first"), lon=("lon", "first"),

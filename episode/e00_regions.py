@@ -138,6 +138,13 @@ def main() -> None:
                                     bridges=("bridge_id", "nunique"))
     log.info("per day:\n%s", per_day.to_string())
 
+    # Normalise dtypes before writing. The Aug 12 snapshot contributes NaN into
+    # columns the pending files fill with real values, leaving object-dtype
+    # mixtures (bool + float) that parquet refuses to encode.
+    ev["aa_confirms"] = ev["aa_confirms"].fillna(False).astype(bool)
+    for c in ("observed", "threshold", "severity_rp", "lat", "lon"):
+        ev[c] = pd.to_numeric(ev[c], errors="coerce")
+    ev["scour"] = ev["scour"].fillna(False).astype(bool)
     write_parquet(ev, bucket(), ep_key("episode_events.parquet"))
 
     regions = derive_regions(ev, link_mi=args.link_mi, min_bridges=args.min_bridges)
