@@ -1,7 +1,7 @@
 """e03 — per-day summary PDF: statewide map + a full bridge table.
 
 One PDF per day:
-  page 1     statewide map of that day's triggered bridges, region boxes outlined
+  page 1     statewide map of that day's triggered bridges
   pages 2..n the bridge list — asset, lat/lon, county, nearest city, river,
              trigger, severity, observed vs threshold, and A&A corroboration
 
@@ -35,10 +35,10 @@ import pandas as pd  # noqa: E402
 from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
 
 from common import (CLASS_STYLE, DAYS, HAIRLINE, INK, INK2, MUTED,  # noqa: E402
-                    SEV_SIZE, SURFACE, TIER_C, active_regions, bucket,
+                    SEV_SIZE, SURFACE, TIER_C, bucket,
                     day_peak_flow, draw_bridges, draw_counties, draw_flowlines,
                     ep_key, load_config, load_counties, load_events,
-                    load_flowlines, load_regions, river_ramp_legend, set_geo)
+                    load_flowlines, river_ramp_legend, set_geo)
 from monitor_common.s3io import read_parquet, write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -81,7 +81,7 @@ def _scatter(ax, d: pd.DataFrame, scale=1.0, lw=0.6) -> None:
     draw_bridges(ax, d, scale, lw=lw, zorder=6)
 
 
-def _state_page(pdf, day, d, cfg, counties, flow, regions, act, peak) -> None:
+def _state_page(pdf, day, d, cfg, counties, flow, peak) -> None:
     fig = plt.figure(figsize=(11.0, 8.5), facecolor=SURFACE)
     ax = fig.add_axes([0.03, 0.05, 0.60, 0.80])
     axk = fig.add_axes([0.66, 0.05, 0.32, 0.80]); axk.axis("off")
@@ -96,37 +96,16 @@ def _state_page(pdf, day, d, cfg, counties, flow, regions, act, peak) -> None:
     ax.scatter(cfg["lon"], cfg["lat"], s=0.8, c=MUTED, alpha=0.20, linewidths=0, zorder=4)
     _scatter(ax, d, scale=0.95, lw=0.6)     # state page is a half-page panel
 
-    for rid in act:
-        r = regions[rid]
-        la, lo = r["lat"], r["lon"]
-        ax.add_patch(plt.Rectangle((lo[0], la[0]), lo[1] - lo[0], la[1] - la[0],
-                                   fill=False, ec=INK2, lw=1.1, ls=(0, (4, 3)), zorder=7))
-        ax.text(lo[1], la[1], f" {rid}", fontsize=9, fontweight="bold", color=INK2,
-                va="bottom", ha="left", zorder=8)
     set_geo(ax, (37.72, 41.83), (-88.12, -84.72))
 
-    n = len(d)
     fig.text(0.03, 0.965, f"{pd.Timestamp(day):%A %d %B %Y} — bridge flood alerts",
              fontsize=19, fontweight="bold", color=INK, va="top")
     fig.text(0.03, 0.925,
-             f"{n} bridge(s) triggered   ·   {int(d['scour'].sum())} scour-critical   ·   "
-             f"{d['comid'].nunique()} reaches   ·   {len(act)} affected region(s)",
+             f"{len(d)} bridge(s) triggered   ·   {int(d['scour'].sum())} scour-critical"
+             f"   ·   {d['comid'].nunique()} reaches",
              fontsize=11.5, color=INK2, va="top")
 
-    y = 0.98
-    axk.text(0, y, "Regions this day", fontsize=12, fontweight="bold", color=INK, va="top")
-    y -= 0.045
-    for rid in act:
-        r = regions[rid]
-        sub = d[(d["lat"].between(*r["lat"])) & (d["lon"].between(*r["lon"]))]
-        axk.text(0.01, y, f"{rid}  —  {len(sub)} bridges", fontsize=10,
-                 fontweight="bold", color=INK, va="top")
-        y -= 0.030
-        axk.text(0.05, y, f"{r['span_mi'][0]}×{r['span_mi'][1]} mi   "
-                          f"centroid {r['centroid'][0]:.2f}, {r['centroid'][1]:.2f}",
-                 fontsize=8.5, color=MUTED, va="top")
-        y -= 0.042
-    y -= 0.02
+    y = 0.97
     axk.text(0, y, "Trigger / confirmation", fontsize=12, fontweight="bold",
              color=INK, va="top")
     y -= 0.05
@@ -229,7 +208,7 @@ def main() -> None:
 
     out = pathlib.Path(args.outdir); out.mkdir(parents=True, exist_ok=True)
     ev, cfg = load_events(), load_config()
-    counties, flow, regions = load_counties(), load_flowlines(), load_regions()
+    counties, flow = load_counties(), load_flowlines()
     try:
         places = read_parquet(bucket(), ep_key("bridge_places.parquet"))
     except Exception as e:  # noqa: BLE001
@@ -242,13 +221,9 @@ def main() -> None:
         if d.empty:
             log.info("%s: no alerts, skipped", day); continue
         peak = day_peak_flow(day)
-        act = [r for r in active_regions(regions, day)
-               if len(d[(d["lat"].between(*regions[r]["lat"]))
-                        & (d["lon"].between(*regions[r]["lon"]))])]
-
         buf = io.BytesIO()
         with PdfPages(buf) as pdf:
-            _state_page(pdf, day, d, cfg, counties, flow, regions, act, peak)
+            _state_page(pdf, day, d, cfg, counties, flow, peak)
             pages = 1 + _table_pages(pdf, day, d, places)
         blob = buf.getvalue()
         fp = out / f"daily_{day}.pdf"
