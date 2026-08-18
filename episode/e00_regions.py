@@ -66,7 +66,39 @@ def collect_events() -> pd.DataFrame:
 
     ev = pd.concat(frames, ignore_index=True)
     ev["valid_hour"] = pd.to_datetime(ev["valid_hour"], utc=True)
+    ev["source"] = "alerted"
     return ev
+
+
+def add_replay(ev: pd.DataFrame) -> pd.DataFrame:
+    """Fold in e06's reconstruction of hours the poller never evaluated.
+
+    Marked source='missed' and never silently merged: these are events the
+    trigger WOULD have fired on, not notifications anyone received. Without
+    them a day like Aug 13 reads as 2 flow alerts when the rivers actually
+    crossed 101 thresholds — the report would understate the event rather than
+    the outage.
+    """
+    keys = [k for k in list_keys(bucket(), ep_key("replay/")) if "events_" in k]
+    if not keys:
+        log.info("No replay events found — report will show alerts only.")
+        return ev
+    rp = pd.concat([read_parquet(bucket(), k) for k in sorted(keys)], ignore_index=True)
+    rp["valid_hour"] = pd.to_datetime(rp["valid_hour"], utc=True)
+    rp["source"] = "missed"
+    for c in COLS:
+        if c not in rp.columns:
+            rp[c] = np.nan
+    out = pd.concat([ev, rp[COLS + ["source"]]], ignore_index=True)
+    # a bridge alerted for real outranks the same bridge reconstructed
+    out["_day"] = out["valid_hour"].dt.tz_convert(TZ).dt.date.astype(str)
+    out["_rank"] = (out["source"] == "alerted").astype(int)
+    out = (out.sort_values(["_rank", "severity_rp"], ascending=[False, False])
+           .drop_duplicates(["bridge_id", "trigger_type", "_day"], keep="first")
+           .drop(columns=["_rank", "_day"]))
+    log.info("Merged replay: %d event(s) total (%s)", len(out),
+             out["source"].value_counts().to_dict())
+    return out
 
 
 def backfill_map_class(ev: pd.DataFrame, cfg: pd.DataFrame) -> pd.DataFrame:
@@ -114,9 +146,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--link-mi", type=float, default=6.0)
     ap.add_argument("--min-bridges", type=int, default=5)
+    ap.add_argument("--no-replay", action="store_true",
+                    help="alerts only; omit e06's reconstructed events")
     args = ap.parse_args()
 
     ev = collect_events()
+    if not args.no_replay:
+        ev = add_replay(ev)
     cfg = load_config().set_index("bridge_id")
     for c in ("lat", "lon", "comid"):
         ev[c] = ev["bridge_id"].map(cfg[c])
@@ -145,6 +181,7 @@ def main() -> None:
     for c in ("observed", "threshold", "severity_rp", "lat", "lon"):
         ev[c] = pd.to_numeric(ev[c], errors="coerce")
     ev["scour"] = ev["scour"].fillna(False).astype(bool)
+    ev["source"] = ev["source"].fillna("alerted")
     write_parquet(ev, bucket(), ep_key("episode_events.parquet"))
 
     regions = derive_regions(ev, link_mi=args.link_mi, min_bridges=args.min_bridges)
