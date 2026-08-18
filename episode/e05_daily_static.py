@@ -72,6 +72,7 @@ def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
                                zorder=2, alpha=PRECIP_ALPHA)
     # no river network here — this panel is the rainfall field, and the NWM
     # channels belong to the two panels that actually encode flow
+    draw_counties(ax, counties, lw=0.6, overlay=True)   # restate geography on top
     draw_bridges(ax, de, mscale); set_geo(ax, la, lo)
     ax.set_title("24-h MRMS accumulation", fontsize=13, color=INK, loc="left", pad=8)
 
@@ -84,6 +85,7 @@ def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
                     ha="center", color=MUTED, fontsize=12)
         else:
             draw_flowlines(ax, flow, ratio, vmax=1.5, lw_base=0.55, lat=la, lon=lo)
+        draw_counties(ax, counties, lw=0.5, overlay=True)
         draw_bridges(ax, de, mscale); set_geo(ax, la, lo)
         ax.set_title(lbl, fontsize=13, color=INK, loc="left", pad=8)
 

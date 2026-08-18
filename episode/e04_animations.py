@@ -74,6 +74,7 @@ def _frame(ts, extent, day_events, cfg, counties, flow, q100, vmax_p, vmax_q,
         ax.text(0.5, 0.5, "no MRMS this hour", transform=ax.transAxes,
                 ha="center", color=MUTED, fontsize=13)
     # no river network here — this panel is the rainfall field
+    draw_counties(ax, counties, lw=0.6, overlay=True)   # restate geography on top
     ax.set_title("MRMS 1-h QPE", fontsize=13, color=INK, loc="left", pad=8)
 
     # panels 2 & 3 — NWM open-loop and A&A, identical scale
@@ -86,6 +87,7 @@ def _frame(ts, extent, day_events, cfg, counties, flow, q100, vmax_p, vmax_q,
         else:
             ax.text(0.5, 0.5, "no NWM this hour", transform=ax.transAxes,
                     ha="center", color=MUTED, fontsize=13)
+        draw_counties(ax, counties, lw=0.5, overlay=True)
         ax.set_title(lbl, fontsize=13, color=INK, loc="left", pad=8)
 
     # bridges triggered at or before this hour, on every panel. Same scale as

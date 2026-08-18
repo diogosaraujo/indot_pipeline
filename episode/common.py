@@ -41,7 +41,7 @@ log = logging.getLogger("episode")
 DAYS = ["2026-08-12", "2026-08-13", "2026-08-14", "2026-08-15", "2026-08-16"]
 TZ = "US/Eastern"                 # days are local days; data is fetched in UTC
 IN_BBOX = dict(lat=(37.70, 41.85), lon=(-88.15, -84.70))    # Indiana + margin
-MAX_LABELS = 40                   # bridges per label page before tiling
+MAX_LABELS = 22                   # bridges per label page before tiling
 
 # ── Palette (dataviz reference instance, slots 1-3 + chrome) ─────────────────
 C_CONF, C_OPEN, C_PRECIP = "#2a78d6", "#eb6834", "#1baf7a"
@@ -140,38 +140,41 @@ def active_regions(regions: dict, day: str) -> list[str]:
     return [k for k, r in regions.items() if r["per_day"].get(day, 0) > 0]
 
 
+def _split_balanced(pts: pd.DataFrame, cap: int) -> list[pd.DataFrame]:
+    """Recursively halve a point set at the MEDIAN of its longer axis.
+
+    A fixed grid splits a region into equal areas, but bridges cluster along
+    rivers, so one cell inherits nearly all of them and stays unreadable while
+    its neighbours sit empty. Splitting at the median balances COUNT instead,
+    which is what determines whether labels fit.
+    """
+    if len(pts) <= cap:
+        return [pts]
+    dlat = (pts["lat"].max() - pts["lat"].min()) * 69.0
+    dlon = (pts["lon"].max() - pts["lon"].min()) * 53.0
+    col = "lat" if dlat >= dlon else "lon"
+    med = pts[col].median()
+    a, b = pts[pts[col] <= med], pts[pts[col] > med]
+    if not len(a) or not len(b):          # ties collapse the median — split by rank
+        s = pts.sort_values(col)
+        h = len(s) // 2
+        a, b = s.iloc[:h], s.iloc[h:]
+    return _split_balanced(a, cap) + _split_balanced(b, cap)
+
+
 def tile_region(region: dict, pts: pd.DataFrame, max_labels: int = MAX_LABELS) -> list[dict]:
     """Split one region into label pages of <= max_labels bridges.
 
-    Halves along the longer axis (in miles) until every tile is under the cap,
-    then shrink-wraps each tile to its own points so a sparse tile is not mostly
-    empty. Tiles inherit nothing from each other, so labels never collide across
-    a page boundary.
+    Each tile is shrink-wrapped to its own points, so a sparse tile is not
+    mostly empty and a dense one gets the magnification it needs. Tiles share
+    no bridges, so labels never collide across a page boundary.
     """
-    n = len(pts)
-    if n <= max_labels:
-        lat, lon = _padded_extent(pts["lat"], pts["lon"])
-        return [dict(lat=lat, lon=lon, n=n, part=1, parts=1)]
-
-    parts = int(math.ceil(n / max_labels))
-    ncol = int(math.ceil(math.sqrt(parts * (region["span_mi"][1] / max(region["span_mi"][0], 1)))))
-    ncol = max(1, ncol)
-    nrow = int(math.ceil(parts / ncol))
-
-    lo0, lo1 = region["lon"]; la0, la1 = region["lat"]
+    groups = _split_balanced(pts, max_labels)
+    groups.sort(key=lambda g: (-g["lat"].mean(), g["lon"].mean()))   # N->S, W->E
     tiles = []
-    for r in range(nrow):
-        for c in range(ncol):
-            x0 = lo0 + (lo1 - lo0) * c / ncol
-            x1 = lo0 + (lo1 - lo0) * (c + 1) / ncol
-            y1 = la1 - (la1 - la0) * r / nrow
-            y0 = la1 - (la1 - la0) * (r + 1) / nrow
-            sel = pts[(pts["lon"] >= x0) & (pts["lon"] < x1)
-                      & (pts["lat"] >= y0) & (pts["lat"] < y1)]
-            if not len(sel):
-                continue
-            lat, lon = _padded_extent(sel["lat"], sel["lon"])
-            tiles.append(dict(lat=lat, lon=lon, n=len(sel)))
+    for g in groups:
+        lat, lon = _padded_extent(g["lat"], g["lon"])
+        tiles.append(dict(lat=lat, lon=lon, n=len(g)))
     for i, t in enumerate(tiles, 1):
         t["part"], t["parts"] = i, len(tiles)
     return tiles
@@ -425,34 +428,54 @@ def place_labels(ax, pts: pd.DataFrame, text_col: str, fontsize=7.0,
     if pts.empty:
         return
     y0, y1 = ax.get_ylim(); x0, x1 = ax.get_xlim()
-    span = y1 - y0
-    gap = span * min_gap_frac
-    d = pts.sort_values("lat", ascending=False).copy()
-    left = d["lon"] > (x0 + x1) / 2          # flip side near the right edge
-    d["ty"] = d["lat"]
-    ys = d["ty"].to_numpy()
-    for i in range(1, len(ys)):              # push down to clear the one above
-        if ys[i - 1] - ys[i] < gap:
-            ys[i] = ys[i - 1] - gap
-    d["ty"] = ys
+    gap = (y1 - y0) * min_gap_frac
     dx = (x1 - x0) * 0.012
-    for (_, r), lft in zip(d.iterrows(), left):
-        sx = r["lon"] - dx if lft else r["lon"] + dx
-        ha = "right" if lft else "left"
-        if abs(r["ty"] - r["lat"]) > gap * 0.55:
-            ax.plot([r["lon"], sx], [r["lat"], r["ty"]], lw=0.4, color=MUTED,
-                    zorder=5, solid_capstyle="round")
-        ax.text(sx, r["ty"], str(r[text_col]), fontsize=fontsize, ha=ha,
-                va="center", color=INK, zorder=6,
-                bbox=dict(boxstyle="round,pad=0.14", fc="white", ec="none", alpha=0.72))
+    mid = (x0 + x1) / 2
+
+    # De-conflict each SIDE independently. Pushing left- and right-hand labels
+    # down a single shared stack wastes half the column and drives the lower
+    # ones off the frame, which is what made the dense pages unreadable.
+    for side in ("left", "right"):
+        d = pts[(pts["lon"] > mid) if side == "left" else (pts["lon"] <= mid)]
+        if d.empty:
+            continue
+        d = d.sort_values("lat", ascending=False).copy()
+        ys = d["lat"].to_numpy(float).copy()
+        for i in range(1, len(ys)):          # push down to clear the one above
+            if ys[i - 1] - ys[i] < gap:
+                ys[i] = ys[i - 1] - gap
+        overflow = ys[-1] - (y0 + gap * 0.5)  # re-centre if the stack ran off
+        if overflow < 0:
+            ys -= overflow
+        for (_, r), ty in zip(d.iterrows(), ys):
+            sx = r["lon"] - dx if side == "left" else r["lon"] + dx
+            ha = "right" if side == "left" else "left"
+            if abs(ty - r["lat"]) > gap * 0.55:
+                ax.plot([r["lon"], sx], [r["lat"], ty], lw=0.4, color=MUTED,
+                        zorder=5, solid_capstyle="round")
+            ax.text(sx, ty, str(r[text_col]), fontsize=fontsize, ha=ha,
+                    va="center", color=INK, zorder=6,
+                    bbox=dict(boxstyle="round,pad=0.14", fc="white", ec="none", alpha=0.80))
 
 
-def draw_counties(ax, counties, lw=0.5, fc="#f4f3ef") -> None:
+def draw_counties(ax, counties, lw=0.5, fc="#f4f3ef", overlay=False,
+                  color="#6f6c65") -> None:
+    """County polygons.
+
+    overlay=False fills them as the basemap, under everything. overlay=True
+    strokes the boundaries ABOVE the data instead — a filled raster at any
+    useful alpha buries a basemap drawn beneath it, so the geography has to be
+    restated on top or the reader loses all sense of where they are.
+    """
     if counties is None or counties.empty:
         return
     for _, ring in counties.groupby("part_id"):
-        ax.fill(ring["lon"].to_numpy(), ring["lat"].to_numpy(),
-                facecolor=fc, edgecolor=HAIRLINE, linewidth=lw, zorder=1)
+        x, y = ring["lon"].to_numpy(), ring["lat"].to_numpy()
+        if overlay:
+            ax.plot(x, y, color=color, linewidth=lw, zorder=6,
+                    solid_joinstyle="round", solid_capstyle="round")
+        else:
+            ax.fill(x, y, facecolor=fc, edgecolor=HAIRLINE, linewidth=lw, zorder=1)
 
 
 def set_geo(ax, lat, lon) -> None:
