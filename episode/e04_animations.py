@@ -1,7 +1,7 @@
 """e04 — hourly 3-panel animations: MRMS | NWM open-loop | NWM A&A.
 
-One GIF per (day, map extent), where extents are the statewide view plus every
-zoom region active that day. Same panel layout as the Lanesville event figure:
+One statewide GIF per day; --regions adds one per active zoom region. Same
+panel layout as the Lanesville event figure:
 precipitation on the left, then the two NWM products side by side so the
 open-loop/A&A divergence is visible frame by frame rather than only in summary.
 
@@ -15,7 +15,7 @@ Writes  episode/anim/{day}_{extent}.gif   (and to S3)
 
 Usage:
     python episode/e04_animations.py
-    python episode/e04_animations.py --days 2026-08-14 --only-state --fps 3
+    python episode/e04_animations.py --days 2026-08-14 --regions --fps 3
 """
 from __future__ import annotations
 
@@ -153,7 +153,9 @@ def main() -> None:
                     help="GIF palette size; lower shrinks files on flat maps")
     ap.add_argument("--marker-scale", type=float, default=1.9,
                     help="bridge symbol size multiplier (severity sets the tier)")
-    ap.add_argument("--only-state", action="store_true")
+    ap.add_argument("--regions", action="store_true",
+                    help="also render one GIF per active zoom region; statewide "
+                         "only by default")
     ap.add_argument("--no-upload", action="store_true")
     args = ap.parse_args()
 
@@ -174,7 +176,7 @@ def main() -> None:
                    first_hour=("valid_hour", "min")).reset_index())
 
         extents = [STATE]
-        if not args.only_state:
+        if args.regions:
             for rid in active_regions(regions, day):
                 r = regions[rid]
                 extents.append(dict(lat=tuple(r["lat"]), lon=tuple(r["lon"]),
