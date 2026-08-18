@@ -266,6 +266,32 @@ def day_peak_flow(day: str) -> pd.DataFrame:
 
 # ── Plot helpers ─────────────────────────────────────────────────────────────
 
+# Bridge marker styling, defined ONCE. Every product iterates this dict rather
+# than its own tuple list: e04 previously listed only three classes, so Aug 12's
+# events — all 'unknown' before the backfill — matched nothing and vanished from
+# the animations entirely. A class missing from one product's list is invisible
+# there while showing fine elsewhere, which is a hard bug to see.
+C_UNKNOWN = "#7d7a72"
+CLASS_STYLE = {
+    "flow_conf": (C_CONF, "o", "Flow — A&A corroborates"),
+    "flow_open": (C_OPEN, "o", "Flow — open-loop only"),
+    "precip": (C_PRECIP, "^", "Precipitation"),
+    "unknown": (C_UNKNOWN, "o", "Flow — corroboration unassessed"),
+}
+
+
+def draw_bridges(ax, d: pd.DataFrame, mscale: float = 1.9, lw: float = 0.9,
+                 zorder: int = 8) -> None:
+    """Every alert class, colour by confirmation and size by severity."""
+    for cls, (col, mark, _lbl) in CLASS_STYLE.items():
+        s = d[d["map_class"] == cls]
+        if not len(s):
+            continue
+        ax.scatter(s["lon"], s["lat"],
+                   s=sev_sizes(s["severity_rp"], mscale * (1.25 if mark == "^" else 1.0)),
+                   c=col, marker=mark, edgecolors="white", linewidths=lw, zorder=zorder)
+
+
 # Precipitation colour scale, lifted from scripts/visualize_lanesville_event.py
 # (its "nws_precip" ramp): transparent at zero, then blues -> greens -> yellow
 # -> orange -> red -> purple. set_under("none") keeps dry cells fully clear so

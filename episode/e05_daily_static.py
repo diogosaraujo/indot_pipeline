@@ -28,13 +28,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MUTED,  # noqa: E402
-                    PANEL_FIG, PRECIP_ALPHA, SEV_SIZE, SURFACE, active_regions,
-                    bucket, day_accum, day_peak_flow, draw_counties,
+from common import (CLASS_STYLE, DAYS, INK, INK2, MUTED, PANEL_FIG,  # noqa: E402
+                    PRECIP_ALPHA, SEV_SIZE, SURFACE, active_regions, bucket,
+                    day_accum, day_peak_flow, draw_bridges, draw_counties,
                     draw_flowlines, ep_key, load_config, load_counties,
                     load_events, load_flowlines, load_regions,
                     panel_legend_rects, panel_rects, precip_cmap,
-                    river_ramp_legend, set_geo, sev_sizes)
+                    river_ramp_legend, set_geo)
 from monitor_common.s3io import write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -43,16 +43,6 @@ log = logging.getLogger("episode.e05")
 
 CFS = 35.3146667
 STATE = dict(lat=(37.72, 41.83), lon=(-88.12, -84.72), name="statewide")
-
-
-def _bridges(ax, de, mscale=1.9) -> None:
-    for cls, c, m in (("flow_conf", C_CONF, "o"), ("flow_open", C_OPEN, "o"),
-                      ("precip", C_PRECIP, "^")):
-        s = de[de["map_class"] == cls]
-        if len(s):
-            ax.scatter(s["lon"], s["lat"],
-                       s=sev_sizes(s["severity_rp"], mscale * (1.0 if m == "o" else 1.25)),
-                       c=c, marker=m, edgecolors="white", linewidths=0.9, zorder=8)
 
 
 def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
@@ -82,7 +72,7 @@ def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
                                zorder=2, alpha=PRECIP_ALPHA)
     # no river network here — this panel is the rainfall field, and the NWM
     # channels belong to the two panels that actually encode flow
-    _bridges(ax, de, mscale); set_geo(ax, la, lo)
+    draw_bridges(ax, de, mscale); set_geo(ax, la, lo)
     ax.set_title("24-h MRMS accumulation", fontsize=13, color=INK, loc="left", pad=8)
 
     # panels 2 & 3 — peak NWM, identical scale so they can be compared
@@ -94,7 +84,7 @@ def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
                     ha="center", color=MUTED, fontsize=12)
         else:
             draw_flowlines(ax, flow, ratio, vmax=1.5, lw_base=0.55, lat=la, lon=lo)
-        _bridges(ax, de, mscale); set_geo(ax, la, lo)
+        draw_bridges(ax, de, mscale); set_geo(ax, la, lo)
         ax.set_title(lbl, fontsize=13, color=INK, loc="left", pad=8)
 
     # legends: rainfall under panel 1, one shared streamflow ramp under 2 & 3
@@ -116,10 +106,10 @@ def render(day, extent, acc, lats, lons, nhr, ratio_ol, ratio_aa, de, cfg,
 
     # marker key, laid out along the header so it steals no map area
     x = 0.545
-    for cls, c, m, lbl in (("flow_conf", C_CONF, "o", "A&A corroborates"),
-                           ("flow_open", C_OPEN, "o", "open-loop only"),
-                           ("precip", C_PRECIP, "^", "precipitation")):
+    for cls, (c, m, lbl) in CLASS_STYLE.items():
         n = int((de["map_class"] == cls).sum())
+        if not n:
+            continue
         fig.text(x, 0.975, "●" if m == "o" else "▲", fontsize=13, color=c, va="top")
         fig.text(x + 0.013, 0.973, f"{lbl} ({n})", fontsize=10.5, color=INK2, va="top")
         x += 0.115

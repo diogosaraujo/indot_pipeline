@@ -29,12 +29,12 @@ import matplotlib.pyplot as plt  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
 
-from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MAX_LABELS,  # noqa: E402
-                    MUTED, SEV_SIZE, SURFACE, TIER_C, active_regions, bucket,
-                    day_peak_flow, draw_counties, draw_flowlines, ep_key,
-                    load_config, load_counties, load_events, load_flowlines,
-                    load_regions, place_labels, river_ramp_legend, set_geo,
-                    sev_sizes, tile_region)
+from common import (CLASS_STYLE, DAYS, INK, INK2, MAX_LABELS, MUTED,  # noqa: E402
+                    SEV_SIZE, SURFACE, TIER_C, active_regions, bucket,
+                    day_peak_flow, draw_bridges, draw_counties, draw_flowlines,
+                    ep_key, load_config, load_counties, load_events,
+                    load_flowlines, load_regions, place_labels,
+                    river_ramp_legend, set_geo, tile_region)
 from monitor_common.s3io import write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -45,8 +45,7 @@ log = logging.getLogger("episode.e03")
 # colour rather than folding into flow_conf: a gap must not read as a
 # confirmation, which is how the pre-digest Aug 12 run silently rendered all
 # 213 of its flow alerts as A&A-corroborated.
-CLASS_C = {"flow_conf": C_CONF, "flow_open": C_OPEN, "precip": C_PRECIP,
-           "unknown": "#7d7a72"}
+CLASS_C = {k: v[0] for k, v in CLASS_STYLE.items()}
 
 
 def _day_events(ev: pd.DataFrame, day: str) -> pd.DataFrame:
@@ -67,14 +66,7 @@ def _day_events(ev: pd.DataFrame, day: str) -> pd.DataFrame:
 
 def _scatter(ax, d: pd.DataFrame, scale=1.0, lw=0.6) -> None:
     """Colour = which product confirms it; SIZE = severity tier."""
-    for cls, col in CLASS_C.items():
-        s = d[d["map_class"] == cls]
-        if not len(s):
-            continue
-        mark = "^" if cls == "precip" else "o"
-        ax.scatter(s["lon"], s["lat"],
-                   s=sev_sizes(s["severity_rp"], scale * (1.25 if cls == "precip" else 1.0)),
-                   c=col, marker=mark, edgecolors="white", linewidths=lw, zorder=6)
+    draw_bridges(ax, d, scale, lw=lw, zorder=6)
 
 
 def _state_page(pdf, day, d, cfg, counties, flow, regions, act, peak) -> None:
@@ -126,14 +118,10 @@ def _state_page(pdf, day, d, cfg, counties, flow, regions, act, peak) -> None:
     axk.text(0, y, "Trigger / confirmation", fontsize=12, fontweight="bold",
              color=INK, va="top")
     y -= 0.05
-    for cls, col, mark, lbl in (("flow_conf", C_CONF, "o", "Flow — A&A corroborates"),
-                                ("flow_open", C_OPEN, "o", "Flow — open-loop only"),
-                                ("precip", C_PRECIP, "^", "Precipitation"),
-                                ("unknown", CLASS_C["unknown"], "o",
-                                 "Flow — corroboration unassessed")):
+    for cls, (col, mark, lbl) in CLASS_STYLE.items():
         cnt = int((d["map_class"] == cls).sum())
-        if cls == "unknown" and not cnt:
-            continue                       # only shown when the gap actually exists
+        if not cnt:
+            continue
         axk.plot([0.025], [y - 0.012], marker=mark, ms=8, color=col, mec="white", mew=.9)
         axk.text(0.075, y, f"{lbl}  ({cnt})", fontsize=9.5, color=INK2, va="top")
         y -= 0.045

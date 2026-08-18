@@ -30,12 +30,12 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from common import (C_CONF, C_OPEN, C_PRECIP, DAYS, INK, INK2, MUTED, SURFACE,  # noqa: E402
-                    PANEL_FIG, PRECIP_ALPHA, TZ, active_regions, bucket,
+from common import (DAYS, INK, INK2, MUTED, PANEL_FIG, PRECIP_ALPHA,  # noqa: E402
+                    SURFACE, TZ, active_regions, bucket, draw_bridges,
                     draw_counties, draw_flowlines, ep_key, hour_range, load_config,
                     load_counties, load_events, load_flowlines, load_mrms_hour,
                     load_nwm_hour, load_regions, panel_legend_rects, panel_rects,
-                    precip_cmap, river_ramp_legend, set_geo, sev_sizes)
+                    precip_cmap, river_ramp_legend, set_geo)
 from monitor_common.s3io import write_bytes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -88,18 +88,12 @@ def _frame(ts, extent, day_events, cfg, counties, flow, q100, vmax_p, vmax_q,
                     ha="center", color=MUTED, fontsize=13)
         ax.set_title(lbl, fontsize=13, color=INK, loc="left", pad=8)
 
-    # bridges triggered at or before this hour, on every panel
+    # bridges triggered at or before this hour, on every panel. Same scale as
+    # the static map — the panels are identical in size, so the markers must be
+    # too, or the two products disagree about the same event.
     shown = day_events[day_events["first_hour"] <= ts]
     for ax in axes:
-        for cls, c, m in (("flow_conf", C_CONF, "o"), ("flow_open", C_OPEN, "o"),
-                          ("precip", C_PRECIP, "^")):
-            s = shown[shown["map_class"] == cls]
-            if len(s):
-                # same scale as the static map — the panels are the same size,
-                # so the markers must be too or the two products disagree
-                ax.scatter(s["lon"], s["lat"],
-                           s=sev_sizes(s["severity_rp"], mscale * (1.0 if m == "o" else 1.25)),
-                           c=c, marker=m, edgecolors="white", linewidths=0.9, zorder=8)
+        draw_bridges(ax, shown, mscale)
         set_geo(ax, la, lo)
 
     cb_rect, ramp_rect = panel_legend_rects()
