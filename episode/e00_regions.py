@@ -31,7 +31,8 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s")
 log = logging.getLogger("episode.e00")
 
-COLS = ["bridge_id", "trigger_type", "severity_rp", "valid_hour", "map_class"]
+COLS = ["bridge_id", "trigger_type", "severity_rp", "valid_hour", "map_class",
+        "observed", "threshold", "aa_confirms"]
 
 
 def collect_events() -> pd.DataFrame:
@@ -42,6 +43,9 @@ def collect_events() -> pd.DataFrame:
         if "valid_hour" not in a.columns:
             a["valid_hour"] = pd.Timestamp("2026-08-12 15:00", tz="UTC")
         a["map_class"] = np.where(a["trigger_type"] == "precip", "precip", "unknown")
+        for c in COLS:                      # snapshot predates observed/threshold
+            if c not in a.columns:
+                a[c] = np.nan
         frames.append(a[COLS])
         log.info("Aug 12 snapshot: %d events", len(a))
     except Exception as e:  # noqa: BLE001
@@ -90,14 +94,17 @@ def backfill_map_class(ev: pd.DataFrame, cfg: pd.DataFrame) -> pd.DataFrame:
                         "render as unassessed, not as corroborated.", hour, len(idx))
             continue
         sub = ev.loc[idx]
-        q_aa = (pd.to_numeric(sub["comid"], errors="coerce").map(nw["q_aa_cms"])
-                * CFS).to_numpy()
+        comid = pd.to_numeric(sub["comid"], errors="coerce")
+        q_aa = (comid.map(nw["q_aa_cms"]) * CFS).to_numpy()
+        q_ol = (comid.map(nw["q_ol_cms"]) * CFS).to_numpy()
         thr = np.array([cfg.at[b, f"Q{int(rp)}_cfs"] if b in cfg.index else np.nan
                         for b, rp in zip(sub["bridge_id"], sub["severity_rp"])], float)
         conf = np.isfinite(q_aa) & np.isfinite(thr) & (q_aa >= thr)
         ev.loc[idx, "map_class"] = np.where(conf, "flow_conf", "flow_open")
         ev.loc[idx, "q_aa_cfs"] = q_aa
         ev.loc[idx, "threshold"] = thr
+        ev.loc[idx, "observed"] = q_ol       # the value the trigger fired on
+        ev.loc[idx, "aa_confirms"] = conf
         log.info("  %s: %d corroborated, %d open-loop only",
                  hour, int(conf.sum()), int((~conf).sum()))
     return ev
