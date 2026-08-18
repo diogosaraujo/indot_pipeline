@@ -22,6 +22,10 @@ from monitor_common.triggers import evaluate
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s")
+# Lambda configures the root logger before user code runs, so basicConfig above
+# is a no-op and INFO is filtered out — which is why a quiet failure left no
+# trace in CloudWatch. Set the level explicitly.
+logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger("monitor.poller")
 
 
@@ -146,6 +150,71 @@ def _dispatch_digest(fires: list[dict], cfg: pd.DataFrame,
         return 0
 
 
+def _lag_hours(now, ts):
+    return None if ts is None else round((now - ts).total_seconds() / 3600.0, 2)
+
+
+def _check_staleness(now, hours: dict) -> dict:
+    """Compare each source's newest available hour against the warn threshold.
+
+    The poller cannot tell a quiet river from a stalled feed: both look like
+    'no new alerts'. This makes the difference explicit, and notifies only on
+    the healthy<->stale transition so a multi-hour mirror backlog produces two
+    emails rather than one an hour.
+    """
+    lags = {k: _lag_hours(now, v) for k, v in hours.items()}
+    stale = {k: v for k, v in lags.items()
+             if v is None or v > config.STALE_WARN_HOURS}
+    is_stale = bool(stale)
+    for k, v in lags.items():
+        (log.warning if (v is None or v > config.STALE_WARN_HOURS) else log.info)(
+            "source %s lag = %s h (warn above %.1f)", k,
+            "unavailable" if v is None else f"{v:.2f}", config.STALE_WARN_HOURS)
+
+    prev = state.read_health()
+    was_stale = bool(prev.get("stale"))
+    if is_stale != was_stale:
+        _notify_health(is_stale, lags, now)
+    state.write_health({"stale": is_stale, "lags": lags,
+                        "checked": now.isoformat(),
+                        "since": (prev.get("since") if is_stale == was_stale
+                                  else now.isoformat())})
+    return lags
+
+
+def _notify_health(is_stale: bool, lags: dict, now) -> None:
+    if not config.ALERT_SENDER or not config.ALERT_RECIPIENTS:
+        log.warning("Staleness state changed to stale=%s but SES is not configured "
+                    "on the poller — no email sent.", is_stale)
+        return
+    detail = "\n".join(
+        f"  {k:<8} {'unavailable' if v is None else f'{v:.2f} h behind'}"
+        for k, v in lags.items())
+    if is_stale:
+        subject = "[BRIDGE MONITOR] source data is stale"
+        body = (f"As of {now:%Y-%m-%d %H:%M} UTC the monitor is evaluating old data.\n\n"
+                f"{detail}\n\n"
+                f"Warn threshold: {config.STALE_WARN_HOURS:.1f} h. Normal publication lag\n"
+                "is about 1 h. Triggers are still being evaluated, but against the\n"
+                "newest hour available, which is older than that.\n\n"
+                "Most often this is a NODD mirror backlog rather than an outage: check\n"
+                "whether NOMADS has hours the S3 mirror does not.\n")
+    else:
+        subject = "[BRIDGE MONITOR] source data current again"
+        body = (f"As of {now:%Y-%m-%d %H:%M} UTC source lag is back within "
+                f"{config.STALE_WARN_HOURS:.1f} h.\n\n{detail}\n")
+    import boto3
+    try:
+        boto3.client("ses", region_name=config.REGION).send_email(
+            Source=config.ALERT_SENDER,
+            Destination={"ToAddresses": config.ALERT_RECIPIENTS},
+            Message={"Subject": {"Data": subject},
+                     "Body": {"Text": {"Data": body}}})
+        log.info("Health notice emailed (stale=%s)", is_stale)
+    except Exception as e:  # noqa: BLE001  — never let a notice break the poll
+        log.error("Health notice failed to send: %s", e)
+
+
 def handler(event=None, context=None):
     cfg = catalog.load()
     now = pd.Timestamp.now(tz="UTC")
@@ -154,6 +223,7 @@ def handler(event=None, context=None):
     ol_hour = nwm.latest_available_hour(now, config.NWM_PRODUCT_TRIGGER)
     aa_hour = nwm.latest_available_hour(now, config.NWM_PRODUCT_DISPLAY)
     log.info("Latest available -> MRMS=%s  NWM_ol=%s  NWM_aa=%s", mrms_hour, ol_hour, aa_hour)
+    lags = _check_staleness(now, {"mrms": mrms_hour, "nwm_ol": ol_hour, "nwm_aa": aa_hour})
 
     if mrms_hour is not None:
         _ingest_mrms(cfg, mrms_hour)
@@ -181,4 +251,6 @@ def handler(event=None, context=None):
              len(cfg), len(fires), sent)
     return {"bridges": len(cfg), "fires": len(fires), "alerts": sent,
             "mrms_hour": None if mrms_hour is None else mrms_hour.isoformat(),
-            "nwm_hour": None if nwm_hour is None else nwm_hour.isoformat()}
+            "nwm_hour": None if nwm_hour is None else nwm_hour.isoformat(),
+            "lag_hours": lags,
+            "stale": any(v is None or v > config.STALE_WARN_HOURS for v in lags.values())}

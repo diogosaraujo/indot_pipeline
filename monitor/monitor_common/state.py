@@ -105,3 +105,26 @@ def read_alert_state() -> pd.DataFrame:
 def write_alert_state(df: pd.DataFrame) -> None:
     k = config.keys()
     write_parquet(df[_ALERT_COLS], k["bucket"], k["alert_state"])
+
+
+# ── Source-health state ──────────────────────────────────────────────────────
+# One tiny JSON holding whether the sources were last seen stale. Only the
+# TRANSITION is notified: a mirror backlog can last many hours, and an email per
+# hour through it would train the reader to ignore the alarm.
+
+def read_health() -> dict:
+    import json
+    from .s3io import read_bytes
+    k = config.keys()
+    try:
+        return json.loads(read_bytes(k["bucket"], k["health"]).decode())
+    except Exception:  # noqa: BLE001  (absent on first run)
+        return {}
+
+
+def write_health(d: dict) -> None:
+    import json
+    from .s3io import write_bytes
+    k = config.keys()
+    write_bytes(json.dumps(d, default=str).encode(), k["bucket"], k["health"],
+                content_type="application/json")

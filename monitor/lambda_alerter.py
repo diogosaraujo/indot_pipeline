@@ -27,6 +27,9 @@ from monitor_common import catalog, config, figure, mrms, state
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s")
+# Lambda pre-configures the root logger, so basicConfig above is a no-op and
+# INFO never reaches CloudWatch. Set the level explicitly.
+logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger("monitor.alerter")
 
 _REACH: dict[int, list] = {}     # warm-container COMID -> [(lon,lat), ...] cache

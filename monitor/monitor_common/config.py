@@ -28,6 +28,13 @@ BACKFILL_MAX_HOURS = int(os.environ.get("MONITOR_BACKFILL_MAX_HOURS", "6"))
 MRMS_SEARCH_BACK = int(os.environ.get("MONITOR_MRMS_SEARCH_BACK", "6"))
 NWM_SEARCH_BACK = int(os.environ.get("MONITOR_NWM_SEARCH_BACK", "6"))
 
+# ── Source staleness ─────────────────────────────────────────────────────────
+# MRMS and NWM normally publish ~1 h behind valid time. When a NODD mirror falls
+# behind, the poller keeps succeeding while silently evaluating old conditions —
+# that is the failure this threshold makes visible. 3 h allows the usual latency
+# plus a missed cycle without crying wolf.
+STALE_WARN_HOURS = float(os.environ.get("MONITOR_STALE_WARN_HOURS", "3"))
+
 # ── Email (Amazon SES) ───────────────────────────────────────────────────────
 ALERT_SENDER = os.environ.get("MONITOR_ALERT_SENDER", "")            # SES-verified identity
 ALERT_RECIPIENTS = [e.strip() for e in
@@ -86,4 +93,5 @@ def keys() -> dict:
         "alerts": f"{p}monitor/alerts/",             # archived PDFs
         "pending": f"{p}monitor/alerts/pending/",    # + {YYYYMMDDHH}.parquet (poller -> alerter)
         "counties": f"{p}monitor/assets/in_counties.parquet",   # digest-map outlines (p07)
+        "health": f"{p}monitor/health.json",         # last-known source-staleness state
     }
