@@ -16,7 +16,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from monitor_common import catalog, config, mrms, nwm, state
+from monitor_common import catalog, config, maps as mapsmod, mrms, nwm, state
 from monitor_common.s3io import write_parquet
 from monitor_common.triggers import evaluate
 
@@ -43,13 +43,16 @@ def _ingest_mrms(cfg: pd.DataFrame, latest: pd.Timestamp) -> None:
     if latest not in want and latest not in have:
         want.append(latest)
     for ts in want:
-        vals = mrms.sample_points(ts, lats, lons)
-        if vals is None:
+        grid = mrms.read_grid(ts)
+        if grid is None:
             continue
-        state.write_slice("mrms", ts, pd.DataFrame({"bridge_id": cfg["bridge_id"].to_numpy(),
-                                                     "precip_in": vals}))
-        log.info("MRMS slice written %s (mean=%.3f in, wet cells=%d)",
-                 state.stamp(ts), float(np.nanmean(vals)), int((vals > 0).sum()))
+        vals = mrms.sample_from_grid(grid, lats, lons)
+        state.write_slice("mrms", ts, pd.DataFrame(
+            {"bridge_id": cfg["bridge_id"].to_numpy(), "precip_in": vals}))
+        # Bank the Indiana window too. The grid is already in memory here; the
+        # alerter cannot afford to re-read 24 CONUS gribs for its map.
+        state.write_grid(ts, *mrms.subset(grid, mapsmod.IN_BBOX))
+        log.info("MRMS slice + grid written %s", state.stamp(ts))
 
 
 def _ingest_nwm(comids: np.ndarray, ol_hour, aa_hour) -> pd.DataFrame | None:
@@ -241,7 +244,7 @@ def handler(event=None, context=None):
     state.write_alert_state(new_state)
 
     # housekeeping
-    for kind in ("mrms", "nwm"):
+    for kind in ("mrms", "nwm", "grid"):
         removed = state.prune(kind, keep_after)
         if removed:
             log.info("Pruned %d stale %s slices", removed, kind)

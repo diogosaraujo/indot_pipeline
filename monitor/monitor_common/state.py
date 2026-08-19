@@ -32,20 +32,72 @@ def stamp(ts: pd.Timestamp) -> str:
 
 
 def _parse_stamp(key: str) -> pd.Timestamp | None:
-    base = key.rsplit("/", 1)[-1].replace(".parquet", "")
+    base = key.rsplit("/", 1)[-1].rsplit(".", 1)[0]   # .parquet or .npz
     try:
         return pd.Timestamp(pd.to_datetime(base, format=STAMP)).tz_localize("UTC")
     except Exception:  # noqa: BLE001
         return None
 
 
+_PREFIX_KEY = {"mrms": "state_mrms", "nwm": "state_nwm", "grid": "state_grid"}
+
+
 def _prefix(kind: str) -> str:
-    return config.keys()["state_mrms" if kind == "mrms" else "state_nwm"]
+    return config.keys()[_PREFIX_KEY[kind]]
 
 
 def write_slice(kind: str, ts: pd.Timestamp, df: pd.DataFrame) -> None:
     b = config.keys()["bucket"]
     write_parquet(df, b, f"{_prefix(kind)}{stamp(ts)}.parquet")
+
+
+# ── Gridded MRMS slices ──────────────────────────────────────────────────────
+# The digest map needs a 24-h accumulation FIELD, not point samples. Re-reading
+# 24 CONUS gribs in the alerter would take minutes and blow its timeout, so the
+# poller — which already has each grid in memory — stores the Indiana window
+# here (~0.5 MB/h) and the alerter just sums them.
+
+def write_grid(ts: pd.Timestamp, arr, lats, lons) -> None:
+    import io
+    import numpy as np
+    from .s3io import write_bytes
+    buf = io.BytesIO()
+    np.savez_compressed(buf, arr=arr, lats=lats, lons=lons)
+    write_bytes(buf.getvalue(), config.keys()["bucket"],
+                f"{_prefix('grid')}{stamp(ts)}.npz",
+                content_type="application/octet-stream")
+
+
+def read_grid(ts: pd.Timestamp):
+    """(arr, lats, lons) for one stored hour, or None if absent."""
+    import io
+    import numpy as np
+    from .s3io import read_bytes
+    try:
+        z = np.load(io.BytesIO(read_bytes(config.keys()["bucket"],
+                                          f"{_prefix('grid')}{stamp(ts)}.npz")))
+    except Exception:  # noqa: BLE001
+        return None
+    return z["arr"], z["lats"], z["lons"]
+
+
+def accumulate_grid(hours: list[pd.Timestamp]):
+    """Summed depth over `hours`, plus how many were actually found.
+
+    Returns (arr, lats, lons, n_found). The count is reported rather than
+    silently absorbed so a partial window can be labelled as such.
+    """
+    import numpy as np
+    acc = lats = lons = None
+    n = 0
+    for ts in hours:
+        got = read_grid(ts)
+        if got is None:
+            continue
+        a, lats, lons = got
+        acc = a.astype(np.float64) if acc is None else acc + a
+        n += 1
+    return acc, lats, lons, n
 
 
 def existing_hours(kind: str) -> dict[pd.Timestamp, str]:

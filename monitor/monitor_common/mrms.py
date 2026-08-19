@@ -77,16 +77,24 @@ def read_grid(ts: pd.Timestamp):
             os.unlink(tmp_path)
 
 
-def sample_points(ts: pd.Timestamp, lats: np.ndarray, lons: np.ndarray) -> np.ndarray | None:
-    """Hourly MRMS 1-h QPE (inches) at the grid cell nearest each (lat, lon).
+def subset(grid, bbox) -> tuple:
+    """Clip a CONUS grid to a lat/lon box — the state store keeps only Indiana.
 
-    Missing/negative sentinels become 0.0 (dry), matching the study's precip
-    fill convention (08_trigger_analysis: missing precip -> 0).
+    A CONUS grid is ~98 MB; the Indiana window is ~0.5 MB, which is what makes
+    keeping an hourly grid history affordable at all.
     """
-    got = read_grid(ts)
-    if got is None:
-        return None
-    arr, glat_desc, glon_asc = got
+    arr, glat_desc, glon_asc = grid
+    la0, la1 = bbox["lat"]; lo0, lo1 = bbox["lon"]
+    r = np.where((glat_desc >= la0) & (glat_desc <= la1))[0]
+    c = np.where((glon_asc >= lo0) & (glon_asc <= lo1))[0]
+    sub = np.asarray(arr[np.ix_(r, c)], dtype=np.float32)
+    return (np.where(np.isfinite(sub), sub, 0.0).astype(np.float32),
+            glat_desc[r].astype(np.float32), glon_asc[c].astype(np.float32))
+
+
+def sample_from_grid(grid, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Nearest-cell values for each point, from a grid already in memory."""
+    arr, glat_desc, glon_asc = grid
     # canonicalize returns lats DESCENDING; flip to ascending for searchsorted.
     glat_asc = glat_desc[::-1]
     ilat_asc = _nearest_indices(glat_asc, np.asarray(lats, float))
@@ -95,3 +103,13 @@ def sample_points(ts: pd.Timestamp, lats: np.ndarray, lons: np.ndarray) -> np.nd
     vals = arr[ilat, ilon]
     vals = np.where(np.isfinite(vals), vals, 0.0)
     return vals.astype(float)
+
+
+def sample_points(ts: pd.Timestamp, lats: np.ndarray, lons: np.ndarray) -> np.ndarray | None:
+    """Hourly MRMS 1-h QPE (inches) at the cell nearest each (lat, lon).
+
+    Missing/negative sentinels become 0.0 (dry), matching the study's precip
+    fill convention (08_trigger_analysis: missing precip -> 0).
+    """
+    got = read_grid(ts)
+    return None if got is None else sample_from_grid(got, lats, lons)

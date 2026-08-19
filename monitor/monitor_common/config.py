@@ -88,10 +88,13 @@ def keys() -> dict:
         "prefix": p,
         "config": f"{p}monitor/bridge_monitor_config.parquet",
         "state_mrms": f"{p}monitor/state/mrms/",     # + {YYYYMMDDHH}.parquet
+        "state_grid": f"{p}monitor/state/mrms_grid/",  # + {YYYYMMDDHH}.npz (IN subset)
         "state_nwm": f"{p}monitor/state/nwm/",       # + {YYYYMMDDHH}.parquet
         "alert_state": f"{p}monitor/alert_state.parquet",
         "alerts": f"{p}monitor/alerts/",             # archived PDFs
         "pending": f"{p}monitor/alerts/pending/",    # + {YYYYMMDDHH}.parquet (poller -> alerter)
         "counties": f"{p}monitor/assets/in_counties.parquet",   # digest-map outlines (p07)
         "health": f"{p}monitor/health.json",         # last-known source-staleness state
+        "flowlines": f"{p}monitor/assets/flowlines.parquet",   # river network (e02)
+        "places": f"{p}monitor/assets/bridge_places.parquet",  # county/city/river (e07)
     }

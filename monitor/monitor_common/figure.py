@@ -11,6 +11,7 @@ Renders to PDF bytes (matplotlib's built-in pdf backend — no extra deps).
 from __future__ import annotations
 
 import io
+import logging
 
 import matplotlib
 matplotlib.use("Agg")
@@ -21,7 +22,9 @@ import pandas as pd  # noqa: E402
 from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
 from matplotlib.gridspec import GridSpec  # noqa: E402
 
-from . import config  # noqa: E402
+from . import config, maps, state  # noqa: E402
+
+log = logging.getLogger("monitor.figure")
 
 PRECIP_RPS = config.SEVERITY_RPS          # [10, 50, 100]
 FLOW_RPS = config.SEVERITY_RPS
@@ -195,159 +198,189 @@ def build_pdf(bridge: dict, valid_hour: pd.Timestamp, fired: list[dict],
 
 ROWS_PER_PAGE = 34
 
-
-def _draw_counties(ax, counties: pd.DataFrame | None) -> None:
-    """County outlines from the flattened p07 table (no geopandas in Lambda)."""
-    if counties is None or counties.empty:
-        return
-    for _, ring in counties.groupby("part_id"):
-        ax.fill(ring["lon"].to_numpy(), ring["lat"].to_numpy(),
-                facecolor="#f4f3ef", edgecolor="#e1e0d9", linewidth=0.5, zorder=1)
-
-
-def _digest_map(ax, ev: pd.DataFrame, cfg: pd.DataFrame, counties) -> None:
-    _draw_counties(ax, counties)
-    if cfg is not None and len(cfg):
-        ax.scatter(cfg["lon"], cfg["lat"], s=1.2, c=MUTED, alpha=0.28,
-                   linewidths=0, zorder=2)
-    groups = (("flow_conf", C_CONF, "o", 34), ("flow_open", C_OPEN, "o", 34),
-              ("precip", C_PRECIP, "^", 46))
-    for cls, col, mark, size in groups:
-        d = ev[ev["map_class"] == cls]
-        if len(d):
-            ax.scatter(d["lon"], d["lat"], s=size, c=col, marker=mark,
-                       edgecolors="white", linewidths=0.5, zorder=4)
-    ax.set_aspect(1.0 / np.cos(np.radians(39.8)))
-    if counties is not None and not counties.empty:      # tight to the state
-        ax.set_xlim(counties["lon"].min() - 0.08, counties["lon"].max() + 0.08)
-        ax.set_ylim(counties["lat"].min() - 0.08, counties["lat"].max() + 0.08)
-    ax.set_xticks([]); ax.set_yticks([])
-    for s in ax.spines.values():
-        s.set_visible(False)
+# x position and alignment per column, kept as data so widths can be retuned
+# without touching the drawing loop.
+COLS = [("Bridge  (* = scour-critical)", 0.022, "l"), ("Lat", 0.300, "r"),
+        ("Lon", 0.363, "r"), ("County", 0.372, "l"), ("City", 0.462, "l"),
+        ("River", 0.572, "l"), ("Trigger", 0.700, "l"), ("Sev", 0.775, "r"),
+        ("Observed", 0.878, "r"), ("Thresh", 0.968, "r")]
+HA = {"l": "left", "r": "right"}
 
 
-def _digest_cover(pdf, ev: pd.DataFrame, cfg, counties, mrms_hour, nwm_hour) -> None:
-    fig = plt.figure(figsize=(11.0, 8.5), facecolor="white")
-    gs = GridSpec(1, 2, width_ratios=[1.05, 1], left=0.04, right=0.97,
-                  top=0.80, bottom=0.05, wspace=0.06)
+def _asset(key_name):
+    """Load a digest asset, degrading the page rather than failing the alert."""
+    from .s3io import read_parquet
+    k = config.keys()
+    try:
+        return read_parquet(k["bucket"], k[key_name])
+    except Exception as e:  # noqa: BLE001
+        log.warning("digest asset %s unavailable (%s) — page will omit it", key_name, e)
+        return None
 
-    n_flow = int((ev["trigger_type"] == "flow").sum())
-    n_prec = int((ev["trigger_type"] == "precip").sum())
-    n_conf = int((ev["map_class"] == "flow_conf").sum())
-    n_open = int((ev["map_class"] == "flow_open").sum())
-    n_scour = int(ev["scour"].astype(bool).sum())
-    n_reach = int(ev.loc[ev["trigger_type"] == "flow", "comid"].nunique())
+
+def _digest_cover(pdf, ev, cfg, mrms_hour, nwm_hour) -> None:
+    """Three panels: rainfall accumulated over the 24 h ENDING at the alert
+    hour, then each NWM product AT the alert hour — the values the trigger just
+    read, not a daily summary."""
+    counties, flow = _asset("counties"), _asset("flowlines")
     hour = nwm_hour or mrms_hour
+    la, lo = maps.STATE_EXTENT["lat"], maps.STATE_EXTENT["lon"]
 
-    fig.text(0.04, 0.965, "INDOT BRIDGE FLOOD ALERT — DIGEST", fontsize=19,
-             fontweight="bold", color=INK, va="top")
-    fig.text(0.04, 0.922,
-             f"{ev['bridge_id'].nunique()} bridges triggered   ·   valid "
-             f"{hour:%Y-%m-%d %H:%M} UTC   ·   MRMS {mrms_hour:%H%M}Z / NWM {nwm_hour:%H%M}Z"
-             if (mrms_hour is not None and nwm_hour is not None) else
-             f"{ev['bridge_id'].nunique()} bridges triggered",
-             fontsize=11.5, color=INK2, va="top")
+    fig = plt.figure(figsize=maps.PANEL_FIG, facecolor=maps.SURFACE)
+    axes = [fig.add_axes(r) for r in maps.panel_rects()]
 
-    bits = [f"{n_flow} streamflow", f"{n_prec} precipitation",
-            f"{n_scour} scour-critical", f"{n_reach} distinct reaches"]
-    fig.text(0.04, 0.884, "   ·   ".join(bits), fontsize=11, color=INK2, va="top")
-    sev = ev.groupby("severity_rp").size().to_dict()
-    fig.text(0.04, 0.850, "Severity:   " + "   ".join(
-        f"{sev.get(rp, 0)} × {rp}-yr" for rp in config.SEVERITY_RPS),
-        fontsize=11, color=INK2, va="top")
+    # panel 1 — trailing 24 h, summed from the grids the poller banked hourly
+    acc = lats = lons = None
+    nhr = 0
+    if mrms_hour is not None:
+        hrs = list(pd.date_range(mrms_hour - pd.Timedelta(hours=23), mrms_hour, freq="1h"))
+        acc, lats, lons, nhr = state.accumulate_grid(hrs)
+    ax, pm = axes[0], None
+    maps.draw_counties(ax, counties, lw=0.5, fc="#f7f6f2")
+    if acc is not None:
+        pm = ax.pcolormesh(lons, lats, np.ma.masked_less(acc, 0.05),
+                           cmap=maps.precip_cmap(), vmin=0.05,
+                           vmax=max(0.5, float(np.nanpercentile(acc, 99.8))),
+                           shading="nearest", zorder=2, alpha=maps.PRECIP_ALPHA)
+    else:
+        ax.text(0.5, 0.5, "no stored MRMS grids yet", transform=ax.transAxes,
+                ha="center", color=maps.MUTED, fontsize=12)
+    maps.draw_counties(ax, counties, lw=0.6, overlay=True)
+    ax.set_title("MRMS 24-h accumulation"
+                 + (f" to {mrms_hour:%H%M}Z" if mrms_hour is not None else ""),
+                 fontsize=13, color=maps.INK, loc="left", pad=8)
 
-    ax = fig.add_subplot(gs[0])
-    _digest_map(ax, ev, cfg, counties)
+    # panels 2 & 3 — NWM at the alert hour, sharing one scale
+    q100 = (cfg.dropna(subset=["comid"]).drop_duplicates("comid")
+            .set_index("comid")["Q100_cfs"]) if cfg is not None else pd.Series(dtype=float)
+    cur = state.read_recent("nwm", [hour]).get(hour) if hour is not None else None
+    for ax, col, lbl in ((axes[1], "q_ol_cms", "NWM open-loop (trigger)"),
+                         (axes[2], "q_aa_cms", "NWM A&A (with DA)")):
+        maps.draw_counties(ax, counties, lw=0.5, fc="#f7f6f2")
+        if cur is not None and col in cur.columns:
+            c = cur.set_index("comid")
+            maps.draw_flowlines(ax, flow,
+                                (c[col] * config.CFS_PER_CMS) / q100.reindex(c.index),
+                                vmax=1.5, lw_base=0.55, lat=la, lon=lo)
+        else:
+            ax.text(0.5, 0.5, "product unavailable", transform=ax.transAxes,
+                    ha="center", color=maps.MUTED, fontsize=12)
+        maps.draw_counties(ax, counties, lw=0.5, overlay=True)
+        ax.set_title(lbl + (f" at {hour:%H%M}Z" if hour is not None else ""),
+                     fontsize=13, color=maps.INK, loc="left", pad=8)
 
-    # Fixed 0-1 coordinate frame: markers and text must share one transform or
-    # autoscaling on the marker points throws the labels off-panel.
-    axl = fig.add_subplot(gs[1]); axl.axis("off")
-    axl.set_xlim(0, 1); axl.set_ylim(0, 1); axl.set_autoscale_on(False)
-    y = 0.97
-    axl.text(0, y, "What confirms each alert", fontsize=13, fontweight="bold",
-             va="top", color=INK)
-    y -= 0.075
-    for col, mark, lbl, n in (
-            (C_CONF, "o", "Streamflow — NWM A&A corroborates", n_conf),
-            (C_OPEN, "o", "Streamflow — open-loop only, A&A disagrees", n_open),
-            (C_PRECIP, "^", "Precipitation — MRMS ≥ Atlas-14", n_prec)):
-        axl.plot([0.025], [y - 0.014], marker=mark, ms=9, color=col,
-                 mec="white", mew=1.0, clip_on=False)
-        axl.text(0.075, y, f"{lbl}   ({n})", fontsize=10, va="top", color=INK2)
-        y -= 0.062
-    y -= 0.02
-    axl.text(0, y, "The open-loop product drives the trigger because it is\n"
-                   "gauge-free. Where A&A disagrees, treat the alert as\n"
-                   "unconfirmed — data assimilation did not reproduce it.",
-             fontsize=9.5, va="top", color=MUTED)
-    y -= 0.16
-    axl.text(0, y, "Top 12 by exceedance", fontsize=12, fontweight="bold",
-             va="top", color=INK)
-    y -= 0.055
-    top = ev.assign(r=ev["observed"] / ev["threshold"]).nlargest(12, "r")
-    for _, r in top.iterrows():
-        axl.text(0.02, y, f"{str(r['asset'])[:24]:<24}", fontsize=8.6, va="top",
-                 color=INK, family="monospace")
-        axl.text(0.55, y, f"{r['trigger_type'][:4].upper()}  {r['severity_rp']:>3}-yr"
-                          f"   {r['observed'] / r['threshold']:.2f}×",
-                 fontsize=8.6, va="top", color=INK2, family="monospace")
-        y -= 0.038
+    one = ev.drop_duplicates("bridge_id")
+    for ax in axes:
+        maps.draw_bridges(ax, one, 1.9)
+        maps.set_geo(ax, la, lo)
 
-    fig.text(0.04, 0.018,
-             "Precip: trailing round(Tc)-h MRMS ≥ Atlas-14 P.   "
-             "Flow: NWM open-loop ≥ retro-LP3 Q (04c).   "
-             "Scour-critical fire at ≥10-yr; all others at ≥50-yr.   "
-             "24-h event separation applied.",
-             fontsize=7.5, color=MUTED)
+    cb_rect, ramp_rect = maps.panel_legend_rects()
+    if pm is not None:
+        cb = fig.colorbar(pm, cax=fig.add_axes(cb_rect), orientation="horizontal")
+        cb.set_label("24-h accumulation (in)", fontsize=9, color=maps.INK2)
+        cb.ax.tick_params(labelsize=8, colors=maps.INK2)
+    maps.river_ramp_legend(fig, ramp_rect,
+                           label="flow ÷ reach 100-yr Q  (both NWM panels share this scale)")
+
+    n_scour = int(ev["scour"].astype(bool).sum())
+    fig.text(0.028, 0.975, f"INDOT BRIDGE FLOOD ALERT — {ev['bridge_id'].nunique()} bridge(s)",
+             fontsize=20, fontweight="bold", color=maps.INK, va="top")
+    bits = [f"valid {hour:%Y-%m-%d %H:%M} UTC" if hour is not None else "valid time unknown",
+            f"{int((ev['trigger_type'] == 'flow').sum())} streamflow",
+            f"{int((ev['trigger_type'] == 'precip').sum())} precipitation"]
+    if n_scour:
+        bits.append(f"{n_scour} scour-critical")
+    if 0 < nhr < 24:
+        bits.append(f"{nhr}/24 MRMS hours available")
+    fig.text(0.028, 0.938, "   ·   ".join(bits), fontsize=11.5, color=maps.INK2, va="top")
+
+    x = 0.560
+    for cls, (c, m, lbl) in maps.CLASS_STYLE.items():
+        n = int((ev["map_class"] == cls).sum())
+        if not n:
+            continue
+        fig.text(x, 0.975, "●" if m == "o" else "▲", fontsize=13, color=c, va="top")
+        fig.text(x + 0.013, 0.973, f"{lbl} ({n})", fontsize=10.5, color=maps.INK2, va="top")
+        x += 0.150
+    x = 0.560
+    fig.text(x, 0.938, "severity = size:", fontsize=10.5, color=maps.INK, va="top")
+    x += 0.082
+    for rp in (10, 50, 100):
+        n = int((ev["severity_rp"] == rp).sum())
+        fig.text(x, 0.938, "•", fontsize=6 + np.sqrt(maps.SEV_SIZE[rp]) * 0.95,
+                 color=maps.INK2, va="top")
+        fig.text(x + 0.016, 0.938, f"{rp}-yr ({n})", fontsize=10, color=maps.INK2, va="top")
+        x += 0.098
     pdf.savefig(fig); plt.close(fig)
 
 
 def _digest_table(pdf, ev: pd.DataFrame) -> None:
-    cols = [("Bridge  (* = scour-critical)", 0.030, "l"), ("Lat", 0.330, "r"),
-            ("Lon", 0.405, "r"), ("Trigger", 0.455, "l"), ("Sev", 0.585, "r"),
-            ("Observed", 0.700, "r"), ("Threshold", 0.820, "r"), ("A&A", 0.900, "l")]
-    ev = ev.sort_values(["severity_rp", "observed"], ascending=[False, False])
-    pages = int(np.ceil(len(ev) / ROWS_PER_PAGE))
+    """The bridges in THIS alert, with the location context the daily reports
+    carry — county, nearest city, and the named waterway."""
+    places = _asset("places")
+    d = ev.sort_values(["severity_rp", "observed"], ascending=[False, False])
+    if places is not None:
+        d = d.merge(places, on="bridge_id", how="left")
+    for c in ("county", "city", "city_mi", "river"):
+        if c not in d.columns:
+            d[c] = np.nan
+
+    pages = int(np.ceil(len(d) / ROWS_PER_PAGE)) or 1
     for pg in range(pages):
-        chunk = ev.iloc[pg * ROWS_PER_PAGE:(pg + 1) * ROWS_PER_PAGE]
+        chunk = d.iloc[pg * ROWS_PER_PAGE:(pg + 1) * ROWS_PER_PAGE]
         fig = plt.figure(figsize=(11.0, 8.5), facecolor="white")
-        fig.text(0.030, 0.968, f"Triggered bridges — page {pg + 1} of {pages}",
-                 fontsize=14, fontweight="bold", color=INK, va="top")
-        y = 0.915
-        for name, x, al in cols:
-            fig.text(x, y, name, fontsize=9, fontweight="bold", color=INK2,
-                     ha={"l": "left", "r": "right"}[al])
-        fig.lines.append(plt.Line2D([0.030, 0.970], [y - 0.012, y - 0.012],
-                                    transform=fig.transFigure, color=HAIRLINE, lw=0.8))
-        y -= 0.032
+        fig.text(0.022, 0.968, "Triggered bridges", fontsize=16, fontweight="bold",
+                 color=maps.INK, va="top")
+        fig.text(0.022, 0.934,
+                 f"page {pg + 1} of {pages}   ·   {len(d)} row(s)   ·   "
+                 "city is the NEAREST place   ·   FLOW·NO = open-loop only, "
+                 "A&A does not corroborate",
+                 fontsize=9, color=maps.MUTED, va="top")
+        y = 0.900
+        for name, x, al in COLS:
+            fig.text(x, y, name, fontsize=8, fontweight="bold", color=maps.INK2, ha=HA[al])
+        fig.lines.append(plt.Line2D([0.022, 0.978], [y - 0.011, y - 0.011],
+                                    transform=fig.transFigure, color=maps.HAIRLINE, lw=0.8))
+        y -= 0.030
         for _, r in chunk.iterrows():
             unit = "in" if r["trigger_type"] == "precip" else "cfs"
-            fmt = "{:,.2f}" if r["trigger_type"] == "precip" else "{:,.0f}"
-            tier = TIER_C.get(int(r["severity_rp"]), INK)
-            aa = "—" if r["trigger_type"] == "precip" else (
-                "yes" if r["aa_confirms"] else "NO")
-            name = str(r["asset"])[:26] + ("*" if bool(r["scour"]) else "")
-            vals = [(name, 0.030, "l", INK),
-                    (f"{r['lat']:.4f}", 0.330, "r", INK2),
-                    (f"{r['lon']:.4f}", 0.405, "r", INK2),
-                    ("FLOW" if r["trigger_type"] == "flow" else "PRECIP", 0.455, "l", INK2),
-                    (f"{int(r['severity_rp'])}-yr", 0.585, "r", tier),
-                    (fmt.format(r["observed"]) + " " + unit, 0.700, "r", INK),
-                    (fmt.format(r["threshold"]) + " " + unit, 0.820, "r", INK2),
-                    (aa, 0.900, "l", INK2 if aa != "NO" else C_OPEN)]
+            fmt = "{:,.2f}" if unit == "in" else "{:,.0f}"
+            tier = maps.TIER_C.get(int(r["severity_rp"]), maps.INK)
+            trig = ("PRECIP" if r["trigger_type"] == "precip"
+                    else ("FLOW" if r.get("aa_confirms") else "FLOW·NO"))
+            city = str(r["city"])[:12] if pd.notna(r["city"]) else "—"
+            if pd.notna(r.get("city_mi")):
+                city = f"{city} {r['city_mi']:.0f}mi"
+            vals = [
+                (str(r["asset"])[:26] + ("*" if bool(r["scour"]) else ""), 0.022, "l", maps.INK),
+                (f"{r['lat']:.4f}", 0.300, "r", maps.INK2),
+                (f"{r['lon']:.4f}", 0.363, "r", maps.INK2),
+                (str(r["county"])[:11] if pd.notna(r["county"]) else "—", 0.372, "l", maps.INK2),
+                (city, 0.462, "l", maps.INK2),
+                (str(r["river"])[:19] if pd.notna(r["river"]) else "unnamed", 0.572, "l",
+                 maps.INK2 if pd.notna(r["river"]) else maps.MUTED),
+                (trig, 0.700, "l", maps.C_OPEN if trig == "FLOW·NO" else maps.INK2),
+                (f"{int(r['severity_rp'])}-yr", 0.775, "r", tier),
+                (fmt.format(r["observed"]) + " " + unit, 0.878, "r", maps.INK),
+                (fmt.format(r["threshold"]) + " " + unit, 0.968, "r", maps.INK2),
+            ]
             for txt, x, al, col in vals:
-                fig.text(x, y, txt, fontsize=8.0, color=col, va="top",
-                         ha={"l": "left", "r": "right"}[al], family="monospace")
-            y -= 0.0255
+                fig.text(x, y, txt, fontsize=6.8, color=col, va="top",
+                         ha=HA[al], family="monospace")
+            y -= 0.0245
         pdf.savefig(fig); plt.close(fig)
 
 
 def build_digest_pdf(ev: pd.DataFrame, cfg: pd.DataFrame | None,
-                     counties: pd.DataFrame | None,
-                     mrms_hour, nwm_hour) -> bytes:
-    """One PDF for the whole run: cover map + paginated bridge table."""
+                     counties: pd.DataFrame | None = None,
+                     mrms_hour=None, nwm_hour=None) -> bytes:
+    """One PDF per run: 3-panel cover + paginated bridge table.
+
+    `counties` is accepted for backward compatibility and ignored — the cover
+    loads the assets it needs so callers don't have to know which those are.
+    """
     buf = io.BytesIO()
     with PdfPages(buf) as pdf:
-        _digest_cover(pdf, ev, cfg, counties, mrms_hour, nwm_hour)
+        _digest_cover(pdf, ev, cfg, mrms_hour, nwm_hour)
         _digest_table(pdf, ev)
     return buf.getvalue()
