@@ -3,3 +3,5 @@ deploy/config.env
 deploy/monitor-inline.json
 __pycache__/
 *.pyc
+out.json
+deploy/out.json
