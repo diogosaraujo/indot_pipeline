@@ -85,10 +85,11 @@ def draw_counties(ax, counties, lw=0.5, fc="#f4f3ef", overlay=False,
     for _, ring in counties.groupby("part_id"):
         x, y = ring["lon"].to_numpy(), ring["lat"].to_numpy()
         if overlay:
-            ax.plot(x, y, color=color, linewidth=lw, zorder=6,
+            ax.plot(x, y, color=color, linewidth=lw, zorder=6, rasterized=True,
                     solid_joinstyle="round", solid_capstyle="round")
         else:
-            ax.fill(x, y, facecolor=fc, edgecolor=HAIRLINE, linewidth=lw, zorder=1)
+            ax.fill(x, y, facecolor=fc, edgecolor=HAIRLINE, linewidth=lw,
+                    zorder=1, rasterized=True)
 
 
 def draw_flowlines(ax, flow, values: pd.Series | None = None, vmax: float = 1.5,
@@ -124,11 +125,16 @@ def draw_flowlines(ax, flow, values: pd.Series | None = None, vmax: float = 1.5,
             frac = float(np.clip(v / vmax, 0, 1))
             hot.append(seg); hot_c.append(cm(frac))
             hot_w.append(lw_base * (1.0 + 3.5 * frac))
+    # rasterized: the network is ~300k vertices, and three vector copies of it
+    # pushed the digest PDF past the 10 MB SES limit. Text and markers stay
+    # vector because they are drawn above these.
     if quiet:
         ax.add_collection(LineCollection(quiet, colors=RIVER_QUIET,
-                                         linewidths=lw_base, zorder=2))
+                                         linewidths=lw_base, zorder=2,
+                                         rasterized=True))
     if hot:
-        ax.add_collection(LineCollection(hot, colors=hot_c, linewidths=hot_w, zorder=3))
+        ax.add_collection(LineCollection(hot, colors=hot_c, linewidths=hot_w,
+                                         zorder=3, rasterized=True))
 
 
 def draw_bridges(ax, d: pd.DataFrame, mscale: float = 1.9, lw: float = 0.9,

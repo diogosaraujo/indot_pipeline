@@ -98,24 +98,56 @@ def _reach_geometry(comid: int | None):
     return reach
 
 
-def _send_email(subject: str, body: str, pdf: bytes, filename: str) -> bool:
+# SES caps a raw message at 10 MB, and MIME base64 inflates the payload by ~33%.
+# Budget against the ENCODED size so a large PDF degrades to a link rather than
+# failing the send: an oversized attachment must never cost the whole alert.
+SES_RAW_LIMIT = 10 * 1024 * 1024
+ATTACH_BUDGET = int(SES_RAW_LIMIT * 0.72)      # ~7.2 MB of PDF once encoded
+
+
+def _presign(key: str, days: int = 7) -> str | None:
+    import boto3
+    try:
+        return boto3.client("s3", region_name=config.REGION).generate_presigned_url(
+            "get_object", Params={"Bucket": config.keys()["bucket"], "Key": key},
+            ExpiresIn=days * 86400)
+    except Exception as e:  # noqa: BLE001
+        log.warning("presign failed for %s: %s", key, e)
+        return None
+
+
+def _send_email(subject: str, body: str, pdf: bytes, filename: str,
+                pdf_key: str | None = None) -> bool:
     if not config.ALERT_SENDER or not config.ALERT_RECIPIENTS:
         log.warning("SES not configured (MONITOR_ALERT_SENDER / MONITOR_ALERT_RECIPIENTS) "
                     "— PDF archived only, no email sent.")
         return False
     import boto3
+    attach = pdf is not None and len(pdf) <= ATTACH_BUDGET
+    if pdf is not None and not attach:
+        link = _presign(pdf_key) if pdf_key else None
+        log.warning("PDF is %.1f MB, over the %.1f MB attachment budget — sending a "
+                    "link instead of the attachment.",
+                    len(pdf) / 1e6, ATTACH_BUDGET / 1e6)
+        body += ("\n\n" + "-" * 78 +
+                 f"\nThe report ({len(pdf) / 1e6:.1f} MB) was too large to attach.\n"
+                 + (f"Download (link valid 7 days):\n{link}\n" if link else
+                    f"It is archived at s3://{config.keys()['bucket']}/{pdf_key}\n"))
+
     msg = MIMEMultipart()
     msg["Subject"] = subject
     msg["From"] = config.ALERT_SENDER
     msg["To"] = ", ".join(config.ALERT_RECIPIENTS)
     msg.attach(MIMEText(body, "plain"))
-    att = MIMEApplication(pdf, _subtype="pdf")
-    att.add_header("Content-Disposition", "attachment", filename=filename)
-    msg.attach(att)
+    if attach:
+        att = MIMEApplication(pdf, _subtype="pdf")
+        att.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(att)
     boto3.client("ses", region_name=config.REGION).send_raw_email(
         Source=config.ALERT_SENDER, Destinations=config.ALERT_RECIPIENTS,
         RawMessage={"Data": msg.as_string()})
-    log.info("Alert emailed to %s", config.ALERT_RECIPIENTS)
+    log.info("Alert emailed to %s (%s)", config.ALERT_RECIPIENTS,
+             "with attachment" if attach else "link only")
     return True
 
 
@@ -195,7 +227,8 @@ def _digest_handler(event):
     subject = (f"[BRIDGE FLOOD ALERT] {n_b} bridge(s) — up to {top}-yr"
                + (f", {n_scour} scour-critical" if n_scour else "")
                + f" ({hour:%Y-%m-%d %H:%MZ})")
-    emailed = _send_email(subject, _digest_body(ev, mrms_hour, nwm_hour), pdf, fname)
+    emailed = _send_email(subject, _digest_body(ev, mrms_hour, nwm_hour), pdf, fname,
+                          pdf_key=f"{k['alerts']}{fname}")
     log.info("Digest built for %d bridges -> %s (emailed=%s)", n_b, fname, emailed)
     return {"bridges": n_b, "pdf": fname, "emailed": emailed}
 

@@ -241,7 +241,8 @@ def _digest_cover(pdf, ev, cfg, mrms_hour, nwm_hour) -> None:
         pm = ax.pcolormesh(lons, lats, np.ma.masked_less(acc, 0.05),
                            cmap=maps.precip_cmap(), vmin=0.05,
                            vmax=max(0.5, float(np.nanpercentile(acc, 99.8))),
-                           shading="nearest", zorder=2, alpha=maps.PRECIP_ALPHA)
+                           shading="nearest", zorder=2, alpha=maps.PRECIP_ALPHA,
+                           rasterized=True)
     else:
         ax.text(0.5, 0.5, "no stored MRMS grids yet", transform=ax.transAxes,
                 ha="center", color=maps.MUTED, fontsize=12)
@@ -311,7 +312,7 @@ def _digest_cover(pdf, ev, cfg, mrms_hour, nwm_hour) -> None:
                  color=maps.INK2, va="top")
         fig.text(x + 0.016, 0.938, f"{rp}-yr ({n})", fontsize=10, color=maps.INK2, va="top")
         x += 0.098
-    pdf.savefig(fig); plt.close(fig)
+    pdf.savefig(fig, dpi=150); plt.close(fig)
 
 
 def _digest_table(pdf, ev: pd.DataFrame) -> None:
