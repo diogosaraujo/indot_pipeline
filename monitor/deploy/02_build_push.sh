@@ -29,7 +29,8 @@ if [[ -z "$DIGEST" ]]; then
   echo "         03 will fall back to the :${IMAGE_TAG} tag — verify afterwards that"
   echo "         both functions resolve to the same image."
 else
-  echo "${ECR_URI}@${DIGEST}" > "$(dirname "$0")/.last_image"
+  # CWD is already the deploy dir (the cd at the top), so this is relative to it.
+  echo "${ECR_URI}@${DIGEST}" > .last_image
   echo "Digest ${DIGEST}  (written to deploy/.last_image for 03 to use)"
 fi
 

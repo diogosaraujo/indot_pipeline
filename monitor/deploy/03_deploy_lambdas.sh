@@ -7,8 +7,8 @@ cd "$(dirname "$0")"; source ./config.env
 # Prefer the digest 02 just pushed. A tag is resolved by Lambda at update time,
 # and ECR propagation lags the push, so deploying by tag can silently pin an
 # older image on whichever function updates first.
-if [[ -f "$(dirname "$0")/.last_image" ]]; then
-  ECR_URI="$(cat "$(dirname "$0")/.last_image")"
+if [[ -f .last_image ]]; then          # CWD is the deploy dir (cd at the top)
+  ECR_URI="$(cat .last_image)"
   echo "Deploying by digest: ${ECR_URI##*@}"
 else
   ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
