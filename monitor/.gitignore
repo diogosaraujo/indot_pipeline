@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 out.json
 deploy/out.json
+deploy/.last_image

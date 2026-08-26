@@ -18,4 +18,13 @@ docker build --platform linux/amd64 -f "${REPO_ROOT}/monitor/Dockerfile" \
   -t "${ECR_URI}:${IMAGE_TAG}" "${REPO_ROOT}"
 docker push "${ECR_URI}:${IMAGE_TAG}"
 
+# Resolve the tag to an immutable digest and hand it to 03. Lambda resolves a
+# tag at update time, and ECR tag propagation lags the push by seconds — long
+# enough that a deploy run immediately after a push once pinned the ALERTER to
+# the previous image while the poller got the new one. Deploying by digest
+# removes the race entirely.
+DIGEST="$(aws ecr describe-images --repository-name "$ECR_REPO" --region "$AWS_REGION"   --image-ids imageTag="$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)"
+echo "${ECR_URI}@${DIGEST}" > "$(dirname "$0")/.last_image"
+
 echo "Pushed ${ECR_URI}:${IMAGE_TAG}"
+echo "Digest ${DIGEST}  (written to deploy/.last_image for 03 to use)"
