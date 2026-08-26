@@ -16,15 +16,21 @@ aws ecr get-login-password --region "$AWS_REGION" \
 
 docker build --platform linux/amd64 -f "${REPO_ROOT}/monitor/Dockerfile" \
   -t "${ECR_URI}:${IMAGE_TAG}" "${REPO_ROOT}"
-docker push "${ECR_URI}:${IMAGE_TAG}"
+# Capture the digest from docker's own push output. Reading it back from ECR
+# would need ecr:DescribeImages, which the EC2 role deliberately does not have,
+# and this is the authoritative digest of what was just pushed anyway.
+PUSH_LOG="$(mktemp)"
+docker push "${ECR_URI}:${IMAGE_TAG}" | tee "$PUSH_LOG"
+DIGEST="$(awk '/digest: sha256:/ {print $3}' "$PUSH_LOG" | tail -1)"
+rm -f "$PUSH_LOG"
 
-# Resolve the tag to an immutable digest and hand it to 03. Lambda resolves a
-# tag at update time, and ECR tag propagation lags the push by seconds — long
-# enough that a deploy run immediately after a push once pinned the ALERTER to
-# the previous image while the poller got the new one. Deploying by digest
-# removes the race entirely.
-DIGEST="$(aws ecr describe-images --repository-name "$ECR_REPO" --region "$AWS_REGION"   --image-ids imageTag="$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)"
-echo "${ECR_URI}@${DIGEST}" > "$(dirname "$0")/.last_image"
+if [[ -z "$DIGEST" ]]; then
+  echo "WARNING: could not parse a digest from the push output."
+  echo "         03 will fall back to the :${IMAGE_TAG} tag — verify afterwards that"
+  echo "         both functions resolve to the same image."
+else
+  echo "${ECR_URI}@${DIGEST}" > "$(dirname "$0")/.last_image"
+  echo "Digest ${DIGEST}  (written to deploy/.last_image for 03 to use)"
+fi
 
 echo "Pushed ${ECR_URI}:${IMAGE_TAG}"
-echo "Digest ${DIGEST}  (written to deploy/.last_image for 03 to use)"
