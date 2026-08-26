@@ -6,18 +6,33 @@ Merges p01 (COMID + Tc), p02 (Atlas-14 cell DDF), p03 (retro-LP3 Q) into:
         bridge_id, Asset Name, lat, lon, comid, over_waterway, scour_critical,
         tc_hr, tc_dur_hr, P10, P50, P100, Q10_cfs, Q50_cfs, Q100_cfs
 
-P{rp} = Atlas-14 depth at the bridge's round(Tc)-hour accumulation duration,
-by log-log interpolation across the published DDF durations — identical to
+P{rp} = Atlas-14 depth at the bridge's accumulation duration, by log-log
+interpolation across the published DDF durations — identical to
 scripts/08c_tc_trigger_analysis.py::depth_at_duration.
+
+Tc CAP (2026-08-26 decision, reversing 2026-08-04): Kirpich Tc runs to 2121 h on
+continental main stems, and any bridge whose Tc exceeds the 48 h state window
+could never fill its accumulation — 12% of the fleet had a permanently dead
+precipitation trigger. Tc is now capped at TC_CAP_HOURS, and the cap applies to
+BOTH halves of the comparison: the trailing window AND the Atlas-14 duration the
+depth is read at. Clipping only the window would test 24 h of rain against a
+multi-day design depth. Native Tc is retained as tc_dur_native_hr, and tc_capped
+flags the affected bridges.
 """
 from __future__ import annotations
 
+import argparse
 import logging
 
 import numpy as np
 import pandas as pd
 
 from common import config, pre_key
+
+# Cap on the trailing accumulation window AND the Atlas-14 duration it is
+# compared against. 24 h keeps the window inside the 48 h state buffer with
+# room for backfill, and matches the flashy-basin reading of a point gauge.
+TC_CAP_HOURS = 24
 from monitor_common.s3io import read_parquet, write_parquet
 
 logging.basicConfig(level=logging.INFO,
@@ -39,6 +54,12 @@ def loglog(x, y, xq: float) -> float:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tc-cap", type=int, default=TC_CAP_HOURS,
+                    help="cap the accumulation duration (and the Atlas-14 duration "
+                         "read against it) at this many hours")
+    args = ap.parse_args()
+
     b, prefix = config.bucket_prefix()
     tc = read_parquet(b, pre_key("bridge_comid_tc.parquet"))
     ddf = read_parquet(b, pre_key("bridge_atlas14.parquet"))
@@ -49,8 +70,14 @@ def main() -> None:
 
     tc["bridge_id"] = tc["bridge_id"].astype(str)
     tc["comid"] = pd.to_numeric(tc["comid"], errors="coerce").astype("Int64")
-    tc["tc_dur_hr"] = (pd.to_numeric(tc["tc_hr"], errors="coerce")
-                       .round().fillna(1).astype(int).clip(lower=1))
+    tc["tc_dur_native_hr"] = (pd.to_numeric(tc["tc_hr"], errors="coerce")
+                              .round().fillna(1).astype(int).clip(lower=1))
+    tc["tc_dur_hr"] = tc["tc_dur_native_hr"].clip(upper=args.tc_cap)
+    tc["tc_capped"] = tc["tc_dur_native_hr"] > args.tc_cap
+    n_cap = int(tc["tc_capped"].sum())
+    log.info("Tc cap %d h: %d of %d bridges capped (%.1f%%); native max %d h",
+             args.tc_cap, n_cap, len(tc), n_cap / max(len(tc), 1) * 100,
+             int(tc["tc_dur_native_hr"].max()))
     tc["cell"] = tc["lat"].round(3).astype(str) + "_" + tc["lon"].round(3).astype(str)
 
     # ── P10/P50/P100 at Tc duration, computed once per (cell, tc_dur) ─────────
@@ -80,6 +107,7 @@ def main() -> None:
 
     keep = ["bridge_id", config.ASSET_COL, "lat", "lon", "comid",
             config.WATERWAY_COL, config.SCOUR_COL, "tc_hr", "tc_dur_hr",
+            "tc_dur_native_hr", "tc_capped",
             *[f"P{rp}" for rp in RPS], *qcols]
     out = out[[c for c in keep if c in out.columns]].drop_duplicates("bridge_id")
     for rp in RPS:

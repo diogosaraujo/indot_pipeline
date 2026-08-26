@@ -1,4 +1,11 @@
-"""Load and normalize the precomputed bridge monitor config (warm-cached)."""
+"""Load and normalize the precomputed bridge monitor config.
+
+Cached per warm container, but keyed on the object's ETag: a precompute that
+rewrites thresholds underneath a running function would otherwise keep serving
+the old ones until the container recycled, so a Tc-cap or threshold change
+could take hours to take effect and apply inconsistently across containers in
+the meantime. A HEAD per invocation costs a few milliseconds.
+"""
 from __future__ import annotations
 
 import logging
@@ -7,18 +14,22 @@ import numpy as np
 import pandas as pd
 
 from . import config
-from .s3io import read_parquet
+from .s3io import etag, read_parquet
 
 log = logging.getLogger("monitor.catalog")
 
 _CFG: pd.DataFrame | None = None
+_ETAG: str | None = None
 
 
 def load(force: bool = False) -> pd.DataFrame:
-    global _CFG
-    if _CFG is not None and not force:
-        return _CFG
+    global _CFG, _ETAG
     k = config.keys()
+    tag = etag(k["bucket"], k["config"])
+    if _CFG is not None and not force and tag is not None and tag == _ETAG:
+        return _CFG
+    if _CFG is not None and tag != _ETAG:
+        log.info("Monitor config changed on S3 — reloading thresholds")
     df = read_parquet(k["bucket"], k["config"])
     df["bridge_id"] = df["bridge_id"].astype(str)
     df["comid"] = pd.to_numeric(df["comid"], errors="coerce").astype("Int64")
@@ -29,9 +40,11 @@ def load(force: bool = False) -> pd.DataFrame:
         for c in (f"P{rp}", f"Q{rp}_cfs"):
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-    _CFG = df
-    log.info("Loaded monitor config: %d bridges (%d scour-critical, %d with COMID)",
-             len(df), int(df[config.SCOUR_COL].sum()), int(df["comid"].notna().sum()))
+    _CFG, _ETAG = df, tag
+    capped = int(df["tc_capped"].sum()) if "tc_capped" in df.columns else 0
+    log.info("Loaded monitor config: %d bridges (%d scour-critical, %d with COMID, "
+             "%d Tc-capped)", len(df), int(df[config.SCOUR_COL].sum()),
+             int(df["comid"].notna().sum()), capped)
     return df
 
 

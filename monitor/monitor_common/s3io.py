@@ -46,6 +46,15 @@ def read_bytes(bucket: str, key: str) -> bytes:
     return s3().get_object(Bucket=bucket, Key=key)["Body"].read()
 
 
+def etag(bucket: str, key: str) -> str | None:
+    """Current ETag, or None if the object is unreadable. Used to invalidate a
+    warm-container cache when a precompute rewrites the config underneath it."""
+    try:
+        return s3().head_object(Bucket=bucket, Key=key).get("ETag")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def object_exists(bucket: str, key: str) -> bool:
     resp = s3().list_objects_v2(Bucket=bucket, Prefix=key, MaxKeys=1)
     return any(o["Key"] == key for o in resp.get("Contents", []))
