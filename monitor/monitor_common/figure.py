@@ -203,7 +203,7 @@ ROWS_PER_PAGE = 34
 COLS = [("Bridge  (* = scour-critical)", 0.022, "l"), ("Lat", 0.300, "r"),
         ("Lon", 0.363, "r"), ("County", 0.372, "l"), ("City", 0.462, "l"),
         ("River", 0.572, "l"), ("Trigger", 0.700, "l"), ("Sev", 0.775, "r"),
-        ("Observed", 0.878, "r"), ("Thresh", 0.968, "r")]
+        ("Observed", 0.862, "r"), ("Thresh", 0.940, "r"), ("Age", 0.988, "r")]
 HA = {"l": "left", "r": "right"}
 
 
@@ -362,8 +362,11 @@ def _digest_table(pdf, ev: pd.DataFrame) -> None:
                  maps.INK2 if pd.notna(r["river"]) else maps.MUTED),
                 (trig, 0.700, "l", maps.C_OPEN if trig == "FLOW·NO" else maps.INK2),
                 (f"{int(r['severity_rp'])}-yr", 0.775, "r", tier),
-                (fmt.format(r["observed"]) + " " + unit, 0.878, "r", maps.INK),
-                (fmt.format(r["threshold"]) + " " + unit, 0.968, "r", maps.INK2),
+                (fmt.format(r["observed"]) + " " + unit, 0.862, "r", maps.INK),
+                (fmt.format(r["threshold"]) + " " + unit, 0.940, "r", maps.INK2),
+                (f"{r['event_hours']:.0f}h" if pd.notna(r.get("event_hours"))
+                 else "—", 0.988, "r",
+                 maps.C_OPEN if (r.get("event_hours") or 0) >= 24 else maps.INK2),
             ]
             for txt, x, al, col in vals:
                 fig.text(x, y, txt, fontsize=6.8, color=col, va="top",

@@ -134,7 +134,12 @@ def _dispatch_digest(fires: list[dict], cfg: pd.DataFrame,
     hour = nwm_hour or mrms_hour
     key = f"{config.keys()['pending']}{state.stamp(hour)}.parquet"
     out = ev.copy()
-    out["valid_hour"] = pd.to_datetime(out["valid_hour"], utc=True)
+    for c in ("valid_hour", "event_start_hour"):
+        if c in out.columns:
+            out[c] = pd.to_datetime(out[c], utc=True)
+    for c, default in (("event_hours", 0.0), ("alert_reason", "new")):
+        if c not in out.columns:
+            out[c] = default
     write_parquet(out, config.keys()["bucket"], key)
 
     payload = {"events_key": key,

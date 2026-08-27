@@ -160,6 +160,7 @@ def _digest_body(ev: pd.DataFrame, mrms_hour, nwm_hour) -> str:
     n_scour = int(ev["scour"].astype(bool).sum())
     hour = nwm_hour or mrms_hour
 
+    n_ongoing = int((ev.get("alert_reason", pd.Series(dtype=str)) == "ongoing").sum())
     L = [f"INDOT BRIDGE FLOOD ALERT — {n_b} bridge(s) triggered",
          f"Valid {hour:%Y-%m-%d %H:%M} UTC"
          + (f"   (MRMS {mrms_hour:%H%M}Z, NWM {nwm_hour:%H%M}Z)"
@@ -170,15 +171,21 @@ def _digest_body(ev: pd.DataFrame, mrms_hour, nwm_hour) -> str:
              f"{int((ev['severity_rp'] == rp).sum())} x {rp}-yr"
              for rp in config.SEVERITY_RPS),
          ]
+    if n_ongoing:
+        longest = ev.loc[ev["alert_reason"] == "ongoing", "event_hours"].max()
+        L += ["", f"  {n_ongoing} of these are ONGOING events, still above threshold since",
+              f"  their first alert — the longest has run {longest:.0f} h "
+              f"({longest/24:.1f} days). Age is shown per bridge below."]
     if n_open:
         L += ["", f"  NOTE: {n_open} streamflow alert(s) are open-loop only — NWM's",
               "        data-assimilation run does not reproduce them. Marked 'A&A: NO'",
               "        below and orange on the map. Treat as unconfirmed."]
     L += ["", "The attached PDF has a statewide map (colored by which product",
           "confirms each alert) and the full table.", "",
-          "-" * 78,
-          f"{'BRIDGE':<28}{'TRIGGER':<10}{'SEV':>7}{'OBSERVED':>14}{'THRESHOLD':>14}{'  A&A':<6}",
-          "-" * 78]
+          "-" * 103,
+          f"{'BRIDGE':<28}{'TRIGGER':<10}{'SEV':>7}{'OBSERVED':>14}{'THRESHOLD':>14}"
+          f"{'  A&A':<6}{'  SINCE':<18}{'AGE':>7}",
+          "-" * 103]
 
     ev = ev.sort_values(["severity_rp", "observed"], ascending=[False, False])
     for _, r in ev.iterrows():
@@ -186,11 +193,15 @@ def _digest_body(ev: pd.DataFrame, mrms_hour, nwm_hour) -> str:
         fmt = "{:,.2f}" if r["trigger_type"] == "precip" else "{:,.0f}"
         aa = "  -" if r["trigger_type"] == "precip" else ("  yes" if r["aa_confirms"] else "  NO")
         name = str(r["asset"])[:26] + ("*" if bool(r["scour"]) else "")
+        since = (f"  {r['event_start_hour']:%d %b %H:%MZ}"
+                 if pd.notna(r.get("event_start_hour")) else "  —")
+        age = f"{r.get('event_hours', 0):.0f} h" if pd.notna(r.get("event_hours")) else "—"
         L.append(f"{name:<28}{r['trigger_type'].upper():<10}"
                  f"{int(r['severity_rp']):>4}-yr"
                  f"{fmt.format(r['observed']) + ' ' + unit:>14}"
-                 f"{fmt.format(r['threshold']) + ' ' + unit:>14}{aa:<6}")
-    L += ["-" * 78, "* = scour-critical (fires at the 10-yr; all others at the 50-yr)", "",
+                 f"{fmt.format(r['threshold']) + ' ' + unit:>14}{aa:<6}"
+                 f"{since:<18}{age:>7}")
+    L += ["-" * 103, "* = scour-critical (fires at the 10-yr; all others at the 50-yr)", "",
           "Precip trigger: trailing round(Kirpich Tc)-h MRMS >= Atlas-14 depth.",
           "Flow trigger:   NWM open-loop streamflow >= retrospective LP3 Q (04c).",
           "Alerts are de-duplicated on a 24-h event separation.", ""]

@@ -22,6 +22,12 @@ SEVERITY_RPS = [10, 50, 100]
 # ── Event separation (matches scripts/08_trigger_analysis.py MERGE_GAP_HOURS) ─
 DECLUSTER_GAP_HOURS = int(os.environ.get("MONITOR_DECLUSTER_GAP_HOURS", "24"))
 
+# While a bridge stays continuously above threshold the declustering above sees
+# one ongoing event and never re-fires — I-65 sat over its 100-yr flow for nine
+# days on a single notification. Re-alert this often for as long as it remains
+# wet, so a sustained event stays visible instead of ageing out of the inbox.
+REALERT_HOURS = float(os.environ.get("MONITOR_REALERT_HOURS", "24"))
+
 # ── Rolling state window ─────────────────────────────────────────────────────
 STATE_HOURS = int(os.environ.get("MONITOR_STATE_HOURS", "48"))       # hours kept
 BACKFILL_MAX_HOURS = int(os.environ.get("MONITOR_BACKFILL_MAX_HOURS", "6"))

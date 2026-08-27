@@ -127,23 +127,43 @@ def evaluate(cfg: pd.DataFrame,
     if not rows:
         return [], alert_state
 
-    # ── 24-h declustering vs prior alert state ───────────────────────────────
+    # ── Declustering, and re-alerting while an event persists ────────────────
+    # A NEW event needs a gap of more than DECLUSTER_GAP_HOURS since the bridge
+    # was last wet (matching group_wet_events in the study). But a bridge that
+    # stays wet refreshes last_wet_hour every hour, so the gap never opens and a
+    # multi-day flood would notify exactly once. So also re-fire when the event
+    # is still running and REALERT_HOURS have passed since the last alert, and
+    # carry the event's start so the digest can say how long it has been going.
     gap = pd.Timedelta(hours=config.DECLUSTER_GAP_HOURS)
-    prev = {(r.bridge_id, r.trigger_type): r.last_wet_hour
-            for r in alert_state.itertuples()}
+    regap = pd.Timedelta(hours=config.REALERT_HOURS)
     st = alert_state.set_index(["bridge_id", "trigger_type"]).to_dict("index")
 
     fires: list[dict] = []
     for r in rows:
         keyt = (r["bridge_id"], r["trigger_type"])
-        last_wet = prev.get(keyt)
-        new_event = last_wet is None or pd.isna(last_wet) or (r["valid_hour"] - last_wet) > gap
-        rec = st.get(keyt, {})
-        rec["last_wet_hour"] = r["valid_hour"]
-        if new_event:
-            rec["last_alert_hour"] = r["valid_hour"]
+        rec = dict(st.get(keyt, {}))
+        now_h = r["valid_hour"]
+        last_wet = rec.get("last_wet_hour")
+        last_alert = rec.get("last_alert_hour")
+        start = rec.get("event_start_hour")
+
+        is_new = last_wet is None or pd.isna(last_wet) or (now_h - last_wet) > gap
+        if is_new:
+            start = now_h
+            fire, reason = True, "new"
+        else:
+            due = (last_alert is None or pd.isna(last_alert)
+                   or (now_h - last_alert) >= regap)
+            fire, reason = due, ("ongoing" if due else "")
+
+        rec["last_wet_hour"] = now_h
+        rec["event_start_hour"] = start
+        if fire:
+            rec["last_alert_hour"] = now_h
             rec["last_severity_rp"] = r["severity_rp"]
-            fires.append(r)
+            hours = 0.0 if pd.isna(start) else (now_h - start).total_seconds() / 3600.0
+            fires.append({**r, "event_start_hour": start,
+                          "event_hours": round(hours, 1), "alert_reason": reason})
         else:
             rec.setdefault("last_alert_hour", pd.NaT)
             rec.setdefault("last_severity_rp", r["severity_rp"])

@@ -33,6 +33,8 @@ from common import config, pre_key
 # compared against. 24 h keeps the window inside the 48 h state buffer with
 # room for backfill, and matches the flashy-basin reading of a point gauge.
 TC_CAP_HOURS = 24
+# Q100/Q10 below this means the fit collapsed to a point — not a real curve.
+DEGENERATE_RATIO = 1.05
 from monitor_common.s3io import read_parquet, write_parquet
 
 logging.basicConfig(level=logging.INFO,
@@ -113,6 +115,20 @@ def main() -> None:
     for rp in RPS:
         if f"Q{rp}_cfs" not in out.columns:
             out[f"Q{rp}_cfs"] = np.nan
+
+    # A collapsed LP3 (Q10 == Q50 == Q100) is worse than a missing one: the
+    # trigger's flow >= Q100 passes on equality, so the bridge fires at 100-yr
+    # every hour forever. Null the quantiles instead and let the bridge fall back
+    # to precipitation-only monitoring, which p09 then reports as a known gap.
+    qq = [f"Q{rp}_cfs" for rp in RPS]
+    have = out[qq].notna().all(axis=1)
+    ratio = out["Q100_cfs"] / out["Q10_cfs"].replace(0, np.nan)
+    degen = have & (ratio < DEGENERATE_RATIO)
+    if int(degen.sum()):
+        log.warning("Nulling %d degenerate LP3 fit(s) on %d reach(es): %s",
+                    int(degen.sum()), out.loc[degen, "comid"].nunique(),
+                    ", ".join(str(int(c)) for c in out.loc[degen, "comid"].dropna().unique()))
+        out.loc[degen, qq] = np.nan
 
     dest = config.keys()["config"]
     write_parquet(out.reset_index(drop=True), b, dest)

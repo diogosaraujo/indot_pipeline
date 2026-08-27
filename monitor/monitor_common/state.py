@@ -139,7 +139,7 @@ def prune(kind: str, keep_after: pd.Timestamp) -> int:
 # ── Alert-dedup state ────────────────────────────────────────────────────────
 
 _ALERT_COLS = ["bridge_id", "trigger_type", "last_wet_hour",
-               "last_alert_hour", "last_severity_rp"]
+               "last_alert_hour", "last_severity_rp", "event_start_hour"]
 
 
 def read_alert_state() -> pd.DataFrame:
@@ -149,13 +149,18 @@ def read_alert_state() -> pd.DataFrame:
     except Exception:  # noqa: BLE001  (missing on first run)
         return pd.DataFrame(columns=_ALERT_COLS)
     df["bridge_id"] = df["bridge_id"].astype(str)
-    for c in ("last_wet_hour", "last_alert_hour"):
+    if "event_start_hour" not in df.columns:      # state written before re-alerting
+        df["event_start_hour"] = df.get("last_alert_hour", pd.NaT)
+    for c in ("last_wet_hour", "last_alert_hour", "event_start_hour"):
         df[c] = pd.to_datetime(df[c], utc=True)
     return df
 
 
 def write_alert_state(df: pd.DataFrame) -> None:
     k = config.keys()
+    for c in _ALERT_COLS:
+        if c not in df.columns:
+            df[c] = pd.NaT if c.endswith("_hour") else None
     write_parquet(df[_ALERT_COLS], k["bucket"], k["alert_state"])
 
 
