@@ -138,8 +138,15 @@ def prune(kind: str, keep_after: pd.Timestamp) -> int:
 
 # ── Alert-dedup state ────────────────────────────────────────────────────────
 
+# last_observed / last_threshold are refreshed on every WET hour, not only on
+# the hour that alerted. The daily summary reports what a standing exceedance is
+# doing now; without these it could only report the reading from the day it
+# first tripped, which for a multi-day event is stale by definition.
 _ALERT_COLS = ["bridge_id", "trigger_type", "last_wet_hour",
-               "last_alert_hour", "last_severity_rp", "event_start_hour"]
+               "last_alert_hour", "last_severity_rp", "event_start_hour",
+               "last_observed", "last_threshold"]
+
+_TIME_COLS = ("last_wet_hour", "last_alert_hour", "event_start_hour")
 
 
 def read_alert_state() -> pd.DataFrame:
@@ -149,9 +156,12 @@ def read_alert_state() -> pd.DataFrame:
     except Exception:  # noqa: BLE001  (missing on first run)
         return pd.DataFrame(columns=_ALERT_COLS)
     df["bridge_id"] = df["bridge_id"].astype(str)
-    if "event_start_hour" not in df.columns:      # state written before re-alerting
+    if "event_start_hour" not in df.columns:      # state predating event tracking
         df["event_start_hour"] = df.get("last_alert_hour", pd.NaT)
-    for c in ("last_wet_hour", "last_alert_hour", "event_start_hour"):
+    for c in ("last_observed", "last_threshold"):  # state predating the summary
+        if c not in df.columns:
+            df[c] = float("nan")
+    for c in _TIME_COLS:
         df[c] = pd.to_datetime(df[c], utc=True)
     return df
 
@@ -161,7 +171,10 @@ def write_alert_state(df: pd.DataFrame) -> None:
     for c in _ALERT_COLS:
         if c not in df.columns:
             df[c] = pd.NaT if c.endswith("_hour") else None
-    write_parquet(df[_ALERT_COLS], k["bucket"], k["alert_state"])
+    out = df[_ALERT_COLS].copy()
+    for c in _TIME_COLS:                 # object dtype breaks the parquet write
+        out[c] = pd.to_datetime(out[c], utc=True, errors="coerce")
+    write_parquet(out, k["bucket"], k["alert_state"])
 
 
 # ── Source-health state ──────────────────────────────────────────────────────

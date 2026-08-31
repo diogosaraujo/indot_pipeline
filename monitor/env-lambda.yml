@@ -18,4 +18,9 @@ dependencies:
   - requests
   - boto3
   - pyyaml
+  # The daily summary resolves "America/New_York" to pick its window. The IANA
+  # database arrives transitively today (pandas -> pytz), but a summary that
+  # silently shifts an hour — or throws at 06:00 — because a transitive dep
+  # moved is not a dependency worth leaving implicit.
+  - tzdata
   - pip

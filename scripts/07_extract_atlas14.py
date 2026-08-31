@@ -52,12 +52,21 @@ log = logging.getLogger("07_atlas14")
 PFDS_URL = "https://hdsc.nws.noaa.gov/cgi-bin/hdsc/new/cgi_readH5.py"
 REQUEST_PAUSE_SEC = 1.0
 
-# Standard Atlas 14 Volume 2 (Ohio River Basin) duration sequence in order.
-# The PFDS API does not return duration labels — order is fixed by the dataset.
+# Atlas 14 Volume 2 (Ohio River Basin) duration sequence, in the order the js
+# endpoint returns them. It carries no duration labels, so this list IS the
+# alignment — get it wrong and every depth silently lands on the wrong duration.
+#
+# It had 20 entries including "5-day". VOLUME 2 DOES NOT PUBLISH A 5-DAY ROW: it
+# returns 19 durations, going 4-day -> 7-day. The old code absorbed the mismatch
+# with ATLAS14_DURATION_LABELS[-n:], which dropped "5-min" off the FRONT and
+# shifted every remaining label one step longer — so each stored duration held
+# the NEXT SHORTER duration's depth, and every precipitation threshold built
+# from this table was 8-25% too low (worst at short Tc). Verified 2026-08-31
+# against both the labelled csv endpoint and the gridded Atlas-14 raster.
 ATLAS14_DURATION_LABELS = [
     "5-min", "10-min", "15-min", "30-min", "60-min",
     "2-hr",  "3-hr",   "6-hr",   "12-hr",  "24-hr",
-    "2-day", "3-day",  "4-day",  "5-day",  "7-day",
+    "2-day", "3-day",  "4-day",  "7-day",
     "10-day","20-day", "30-day", "45-day", "60-day",
 ]
 
@@ -66,7 +75,7 @@ DURATION_MAP: dict[str, int] = {
     "60-min": 1,
     "2-hr":   2,   "3-hr":   3,   "6-hr":   6,   "12-hr":  12,
     "24-hr":  24,  "2-day":  48,  "3-day":  72,  "4-day":  96,
-    "5-day":  120, "7-day":  168, "10-day": 240, "20-day": 480,
+    "7-day":  168, "10-day": 240, "20-day": 480,
     "30-day": 720, "45-day": 1080,"60-day": 1440,
 }
 
@@ -129,12 +138,16 @@ def parse_atlas14(site_no: str, text: str) -> pd.DataFrame:
     n_durations = len(quantiles)
     expected = len(ATLAS14_DURATION_LABELS)
     if n_durations != expected:
-        log.warning(
-            "Site %s: got %d duration rows, expected %d — "
-            "using last %d labels from ATLAS14_DURATION_LABELS",
-            site_no, n_durations, expected, n_durations,
-        )
-    duration_labels = ATLAS14_DURATION_LABELS[-n_durations:]
+        # NEVER realign by slicing. The previous code took the last n labels,
+        # which turns "I do not know which durations these are" into a silent,
+        # confident, wrong answer — a whole-table one-step shift that survived
+        # for months behind a log line nobody read. Refuse the row instead.
+        raise ValueError(
+            f"Site {site_no}: PFDS returned {n_durations} duration rows but "
+            f"ATLAS14_DURATION_LABELS has {expected}. The label list must match "
+            f"the volume's published duration sequence exactly — do not guess "
+            f"the alignment.")
+    duration_labels = ATLAS14_DURATION_LABELS
 
     records = []
     for dur_label, depths in zip(duration_labels, quantiles):

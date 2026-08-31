@@ -22,11 +22,22 @@ SEVERITY_RPS = [10, 50, 100]
 # ── Event separation (matches scripts/08_trigger_analysis.py MERGE_GAP_HOURS) ─
 DECLUSTER_GAP_HOURS = int(os.environ.get("MONITOR_DECLUSTER_GAP_HOURS", "24"))
 
-# While a bridge stays continuously above threshold the declustering above sees
-# one ongoing event and never re-fires — I-65 sat over its 100-yr flow for nine
-# days on a single notification. Re-alert this often for as long as it remains
-# wet, so a sustained event stays visible instead of ageing out of the inbox.
-REALERT_HOURS = float(os.environ.get("MONITOR_REALERT_HOURS", "24"))
+# A bridge that stays continuously above threshold is ONE event and alerts once,
+# when it first crosses. Keeping a sustained event visible after that is the
+# daily summary's job, not a re-alert's — an hourly poller re-firing on a
+# multi-day flood produces a stream of near-identical mails that trains the
+# reader to ignore the one that is new. (2026-08-31 decision, replacing the
+# short-lived REALERT_HOURS re-fire.)
+
+# ── Daily summary ────────────────────────────────────────────────────────────
+# Sent every morning regardless of whether anything fired: a summary that only
+# arrives on bad days cannot distinguish "nothing happened" from "the monitor
+# is dead", which is exactly the ambiguity that hid a 13-day outage.
+DAILY_TZ = os.environ.get("MONITOR_DAILY_TZ", "America/New_York")
+DAILY_SEND_HOUR = int(os.environ.get("MONITOR_DAILY_SEND_HOUR", "6"))    # local
+# The window is the previous LOCAL calendar day, 00:00–24:00, so "yesterday"
+# means the same thing to the reader as it does to the report.
+DAILY_WINDOW_HOURS = int(os.environ.get("MONITOR_DAILY_WINDOW_HOURS", "24"))
 
 # ── Rolling state window ─────────────────────────────────────────────────────
 STATE_HOURS = int(os.environ.get("MONITOR_STATE_HOURS", "48"))       # hours kept
@@ -99,8 +110,11 @@ def keys() -> dict:
         "alert_state": f"{p}monitor/alert_state.parquet",
         "alerts": f"{p}monitor/alerts/",             # archived PDFs
         "pending": f"{p}monitor/alerts/pending/",    # + {YYYYMMDDHH}.parquet (poller -> alerter)
+        "daily": f"{p}monitor/daily/",               # + {YYYYMMDD}.pdf archived summaries
         "counties": f"{p}monitor/assets/in_counties.parquet",   # digest-map outlines (p07)
         "health": f"{p}monitor/health.json",         # last-known source-staleness state
         "flowlines": f"{p}monitor/assets/flowlines.parquet",   # river network (e02)
         "places": f"{p}monitor/assets/bridge_places.parquet",  # county/city/river (e07)
+        # Gridded Atlas-14 24-h depths on the MRMS grid (p10). Static product.
+        "atlas14_grid": f"{p}monitor/assets/atlas14_grid_24h.npz",
     }

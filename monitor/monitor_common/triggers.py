@@ -13,6 +13,9 @@ Event separation mirrors group_wet_events (08_trigger_analysis.py): a new alert
 is raised only when the current wet hour is > DECLUSTER_GAP_HOURS (24 h) after
 the previous wet hour for that (bridge, trigger); wet hours within the gap are
 one ongoing event and are suppressed.
+
+So a bridge alerts ONCE per event, at first crossing. The daily summary carries
+it from there, reading the state this module maintains for every wet hour.
 """
 from __future__ import annotations
 
@@ -127,15 +130,20 @@ def evaluate(cfg: pd.DataFrame,
     if not rows:
         return [], alert_state
 
-    # ── Declustering, and re-alerting while an event persists ────────────────
+    # ── Declustering ─────────────────────────────────────────────────────────
     # A NEW event needs a gap of more than DECLUSTER_GAP_HOURS since the bridge
-    # was last wet (matching group_wet_events in the study). But a bridge that
-    # stays wet refreshes last_wet_hour every hour, so the gap never opens and a
-    # multi-day flood would notify exactly once. So also re-fire when the event
-    # is still running and REALERT_HOURS have passed since the last alert, and
-    # carry the event's start so the digest can say how long it has been going.
+    # was last wet (matching group_wet_events in the study). A bridge that stays
+    # wet refreshes last_wet_hour every hour, so the gap never opens and the
+    # event alerts exactly ONCE, when it first crosses.
+    #
+    # That single alert is deliberate. Keeping a multi-day event visible is the
+    # DAILY SUMMARY's job — an hourly poller re-firing on the same standing
+    # flood produces a stream of near-identical mails that trains the reader to
+    # ignore the one that is new. What the summary needs from here is not more
+    # alerts but durable state: event_start_hour (when this event first tripped)
+    # and last_wet_hour (whether it is still above threshold), both carried on
+    # every row whether or not it fired this hour.
     gap = pd.Timedelta(hours=config.DECLUSTER_GAP_HOURS)
-    regap = pd.Timedelta(hours=config.REALERT_HOURS)
     st = alert_state.set_index(["bridge_id", "trigger_type"]).to_dict("index")
 
     fires: list[dict] = []
@@ -144,29 +152,26 @@ def evaluate(cfg: pd.DataFrame,
         rec = dict(st.get(keyt, {}))
         now_h = r["valid_hour"]
         last_wet = rec.get("last_wet_hour")
-        last_alert = rec.get("last_alert_hour")
         start = rec.get("event_start_hour")
 
         is_new = last_wet is None or pd.isna(last_wet) or (now_h - last_wet) > gap
         if is_new:
             start = now_h
-            fire, reason = True, "new"
-        else:
-            due = (last_alert is None or pd.isna(last_alert)
-                   or (now_h - last_alert) >= regap)
-            fire, reason = due, ("ongoing" if due else "")
 
         rec["last_wet_hour"] = now_h
         rec["event_start_hour"] = start
-        if fire:
+        # Severity is refreshed every wet hour, not only on the alerting one, so
+        # the summary reports what the bridge is doing now rather than what it
+        # was doing when it first tripped days ago.
+        rec["last_severity_rp"] = r["severity_rp"]
+        rec["last_observed"] = r["observed"]
+        rec["last_threshold"] = r["threshold"]
+        if is_new:
             rec["last_alert_hour"] = now_h
-            rec["last_severity_rp"] = r["severity_rp"]
-            hours = 0.0 if pd.isna(start) else (now_h - start).total_seconds() / 3600.0
             fires.append({**r, "event_start_hour": start,
-                          "event_hours": round(hours, 1), "alert_reason": reason})
+                          "event_hours": 0.0, "alert_reason": "new"})
         else:
             rec.setdefault("last_alert_hour", pd.NaT)
-            rec.setdefault("last_severity_rp", r["severity_rp"])
         st[keyt] = rec
 
     new_state = (pd.DataFrame([{"bridge_id": k[0], "trigger_type": k[1], **v}

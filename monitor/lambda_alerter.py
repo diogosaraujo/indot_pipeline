@@ -245,6 +245,10 @@ def _digest_handler(event):
 
 
 def handler(event, context=None):
+    # Three event shapes, one function: the daily EventBridge tick, the poller's
+    # per-run digest, and a manual single-bridge re-render.
+    if event.get("daily"):
+        return _daily_handler(event)
     if "events_key" in event:
         return _digest_handler(event)
     cfg = catalog.load()
@@ -282,3 +286,70 @@ def handler(event, context=None):
             + "\n\nSee attached PDF for maps and 24-h time series.\n")
     _send_email(subject, body, pdf, fname)
     return {"bridge_id": bridge["bridge_id"], "pdf": fname, "severity_rp": sev}
+
+
+# ── Daily summary ────────────────────────────────────────────────────────────
+
+def _daily_body(meta: dict, ev) -> str:
+    """Plain-text lede. The PDF is the report; this is what a phone shows."""
+    day, n, above = meta["day"], meta["bridges"], meta["still_above"]
+    if n == 0:
+        head = (f"No bridge was above its firing threshold on {day}.\n\n"
+                "This summary is sent every day, including quiet ones, so that "
+                "silence from the monitor is distinguishable from a dead monitor.")
+    else:
+        head = (f"{day}: {n} bridge(s) involved, {above} STILL ABOVE THRESHOLD "
+                f"at the latest evaluated hour.")
+    lines = [head, ""]
+    if n:
+        s = ev[ev["still_above"]].sort_values("severity_rp", ascending=False)
+        s = s.drop_duplicates("bridge_id")
+        if len(s):
+            lines.append("Still above threshold:")
+            for _, r in s.head(25).iterrows():
+                unit = "in" if r["trigger_type"] == "precip" else "cfs"
+                fmt = "{:,.2f}" if unit == "in" else "{:,.0f}"
+                obs = fmt.format(r["observed"]) if pd.notna(r["observed"]) else "—"
+                ft = r.get("first_trigger")
+                since = f"since {ft:%Y-%m-%d %H:%M}Z" if pd.notna(ft) else "start unknown"
+                lines.append(f"  {str(r['asset'])[:34]:<34} "
+                             f"{int(r['severity_rp'])}-yr  {obs} {unit}  {since}")
+            if len(s) > 25:
+                lines.append(f"  … and {len(s) - 25} more (see PDF)")
+            lines.append("")
+    lines += [
+        f"Window: {meta['start']} to {meta['end']} ({meta['window_hours']} h, "
+        f"{config.DAILY_TZ} calendar day).",
+        f"NWM hours available in window: {meta['nwm_hours']}/{meta['window_hours']}.",
+        "",
+        "Page 1 precipitation + ARI, page 2 NWM A&A, page 3 NWM open-loop, "
+        "page 4+ the bridges.",
+    ]
+    return "\n".join(lines)
+
+
+def _daily_handler(event) -> dict:
+    from monitor_common import daily, state as st
+    from monitor_common.s3io import write_bytes
+
+    cfg = catalog.load()
+    alert_state = st.read_alert_state()
+    now = event.get("now")          # tests/backfill can pin the clock
+    pdf, meta, ev = daily.build_daily_pdf(cfg, alert_state,
+                                          now_utc=pd.Timestamp(now) if now else None)
+
+    k = config.keys()
+    fname = f"daily_{str(meta['day']).replace('-', '')}.pdf"
+    pdf_key = f"{k['daily']}{fname}"
+    # Archive BEFORE emailing: a send failure must never lose the report.
+    write_bytes(pdf, k["bucket"], pdf_key, content_type="application/pdf")
+
+    above = meta["still_above"]
+    subject = (f"INDOT bridges — daily summary {meta['day']} — "
+               + (f"{above} above threshold" if above else
+                  (f"{meta['bridges']} involved, none still above" if meta["bridges"]
+                   else "all clear")))
+    emailed = _send_email(subject, _daily_body(meta, ev), pdf, fname, pdf_key=pdf_key)
+    log.info("Daily summary %s -> %s (%.2f MB, bridges=%d, above=%d, emailed=%s)",
+             meta["day"], fname, len(pdf) / 1e6, meta["bridges"], above, emailed)
+    return {**meta, "pdf": fname, "emailed": emailed}
