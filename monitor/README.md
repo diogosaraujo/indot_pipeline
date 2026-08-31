@@ -21,8 +21,9 @@ retrospective LP3 quantiles, `group_wet_events` 24-h declustering).
 
 - **Precip trigger** — trailing `round(Kirpich Tc)`-hour MRMS accumulation ≥ the
   Atlas-14 depth at that duration (per `scripts/08c_tc_trigger_analysis.py`).
-  Native Tc is used as-is; bridges whose Tc exceeds `STATE_HOURS` (48 h) can't
-  fill their accumulation window and are effectively flow-trigger only.
+  Tc is capped at 24 h (`p04`, `TC_CAP_HOURS`) on both the window and the
+  Atlas-14 duration it is read against; uncapped Kirpich reaches 2121 h and left
+  12% of the fleet with a precipitation trigger that could never fill.
 - **Flow trigger** — NWM **open-loop** (`analysis_assim_no_da`) hourly streamflow
   ≥ the retro-LP3 `Q` from `scripts/04c` (the gauge-free operating point from
   `scripts/08f`). The PDF also shows **A&A** (`analysis_assim`, with DA) for context.
@@ -31,6 +32,32 @@ retrospective LP3 quantiles, `group_wet_events` 24-h declustering).
   `group_wet_events` (`MERGE_GAP_HOURS = 24`). Nowcast only — no forecast.
 
 Every PDF shows all of P10/P50/P100 and Q10/Q50/Q100 regardless of which tier fired.
+
+### One alert per event, then the daily summary
+
+A bridge alerts **once**, when it first crosses. It does **not** re-alert while it
+stays above threshold: an hourly poller re-firing on the same standing flood
+produces a stream of near-identical mails that trains the reader to ignore the
+one that is new.
+
+Keeping a multi-day event visible is the **daily summary**'s job — one email at
+**06:00 America/New_York** covering the previous local calendar day, sent **every
+day including quiet ones**. That last part is deliberate: a report that only
+arrives on bad days cannot distinguish *nothing happened* from *the monitor is
+dead*, and that ambiguity once hid a 13-day outage.
+
+| Page | Left | Right |
+|---|---|---|
+| 1 | MRMS 24-h accumulation | ARI of that accumulation (gridded Atlas-14) |
+| 2 | NWM **A&A** daily peak flow | ARI of that peak (retro-LP3) |
+| 3 | NWM **open-loop** daily peak flow | ARI of that peak |
+| 4+ | Bridges involved — still-above rows highlighted, with first-trigger time and duration |
+
+Flow is summarised by the **daily peak**: page 1's panel is an aggregate over the
+day, streamflow cannot be summed, and a value at an arbitrary cutoff hour would
+miss a crest that passed at 03:00. Bridges plotted come from the hourly **alarm
+state** — never derived from the ARI rasters, which describe weather, not risk to
+a structure.
 
 ---
 
@@ -65,17 +92,33 @@ monitor/
     mrms.py nwm.py        #   live readers (point sampling; per-COMID streamflow+velocity)
     state.py              #   rolling per-hour slices + 24-h alert-dedup state
     triggers.py           #   trigger eval + 24-h declustering  ← core logic
+    maps.py               #   shared symbology (colours, ARI bins, flowlines)
     catalog.py figure.py  #   config loader; alert-PDF builder
+    daily.py              #   daily-summary PDF (window, ARI, peaks, table)
   lambda_poller.py        # hourly fan-in handler
-  lambda_alerter.py       # per-bridge PDF + SES handler
+  lambda_alerter.py       # per-bridge PDF, run digest, AND daily summary + SES
   precompute/             # RUN ONCE on EC2 (full conda env) → bridge_monitor_config.parquet
     p01_bridge_comid_tc.py    #   COMID + Kirpich Tc (NLDI + 3DEP)
     p02_atlas14.py            #   Atlas-14 depths (PFDS), deduped per ~110 m cell
+    p02b_relabel_durations.py #   ONE-TIME repair of the duration off-by-one (see below)
     p03_retro_lp3.py          #   retro-LP3 Q10/Q50/Q100 per COMID (04c machinery)
     p04_assemble_config.py    #   merge → monitor/bridge_monitor_config.parquet
+    p09_coverage_audit.py     #   which bridges cannot be alerted, and why
+    p10_atlas14_grid.py       #   ONCE: gridded Atlas-14 24-h ARI raster on the MRMS grid
   Dockerfile env-lambda.yml
   deploy/  00_ses_setup 01_iam 02_build_push 03_deploy_lambdas 04_schedule
+           05_alarms 06_daily_schedule
 ```
+
+> **Atlas-14 duration off-by-one (fixed 2026-08-31).** PFDS Volume 2 — the volume
+> containing Indiana — publishes **19** durations, not 20: it has no 5-day row.
+> `parse_atlas14` aligned the unlabelled `js` response against a 20-entry list and
+> absorbed the mismatch with `LABELS[-n:]`, shifting every label one step longer,
+> so each stored duration held the **next shorter** duration's depth and every
+> P10/P50/P100 was **8–25% too low** (worst at short Tc). Nothing was lost, only
+> mislabelled, so `p02b` relabels in place — no refetch. `parse_atlas14` now
+> raises on a count mismatch rather than realigning. **Not yet assessed:**
+> `08c`/`08g`/`08h` read the same table.
 
 ### S3 layout (under `s3://<bucket>/<prefix>`)
 
@@ -84,8 +127,11 @@ monitor/bridge_monitor_config.parquet     # the one table the Lambdas read
 monitor/precompute/*.parquet              # intermediate precompute outputs
 monitor/state/mrms/{YYYYMMDDHH}.parquet   # rolling 48-h slices (auto-pruned)
 monitor/state/nwm/{YYYYMMDDHH}.parquet
-monitor/alert_state.parquet               # last wet/alert hour per (bridge,trigger)
+monitor/alert_state.parquet               # last wet/alert hour, event start, last reading
 monitor/alerts/alert_<asset>_<YYYYMMDDHH>.pdf
+monitor/daily/daily_<YYYYMMDD>.pdf        # archived daily summaries
+monitor/assets/atlas14_grid_24h.npz       # gridded Atlas-14 24-h ARI (p10, static)
+monitor/assets/{in_counties,flowlines,bridge_places}.parquet
 ```
 
 ---
@@ -101,10 +147,25 @@ python monitor/precompute/p01_bridge_comid_tc.py     # hours  (NLDI + 3DEP; resu
 python monitor/precompute/p02_atlas14.py             # ~1 hr  (PFDS; deduped, resumable)
 python monitor/precompute/p03_retro_lp3.py           # hours  (retrospective Zarr; batched)
 python monitor/precompute/p04_assemble_config.py     # seconds → bridge_monitor_config.parquet
+python monitor/precompute/p09_coverage_audit.py      # seconds  which bridges can't be alerted
 ```
 
-All four are checkpointed to S3 and safe to re-run (they skip completed work).
+All are checkpointed to S3 and safe to re-run (they skip completed work).
 Re-run annually (or when the bridge inventory changes) to refresh thresholds.
+
+The gridded Atlas-14 raster behind the daily summary's ARI panel is fetched
+**once** and never again — NOAA Atlas 14 is a fixed publication, not a rolling
+product. It can run anywhere with S3 credentials; it needs no conda env:
+
+```bash
+python monitor/precompute/p10_atlas14_grid.py        # ~1 min, 10 ARI grids → assets/
+```
+
+It validates itself against **live PFDS point queries** and fails loudly if the
+Atlas-14 volume does not cover the target grid. (Indiana is Volume 2, `orb` —
+*not* the deceptively named Volume 8 "Midwestern States", `mw`, whose data ends
+near 91 W and would render a convincingly dry map.) Revisit only if NOAA
+**Atlas 15**, which adds nonstationarity, supersedes it.
 
 ### 2. Deploy the Lambdas
 
@@ -117,10 +178,18 @@ source config.env
 ./02_build_push.sh         # docker build + push to ECR  (needs Docker + the repo checked out)
 ./03_deploy_lambdas.sh     # create/update poller + alerter from the image
 ./04_schedule.sh           # hourly EventBridge rule → poller
+./05_alarms.sh             # CloudWatch alarms on the monitor itself (confirm the SNS email!)
+./06_daily_schedule.sh     # 06:00 local daily summary → alerter {"daily": true}
 
-# smoke test
-aws lambda invoke --function-name "$POLLER_FN" /tmp/out.json && cat /tmp/out.json
+# smoke tests
+aws lambda invoke --function-name "$POLLER_FN" --cli-read-timeout 0 /tmp/out.json && cat /tmp/out.json
+aws lambda invoke --function-name "$ALERTER_FN" --cli-read-timeout 0 \
+  --payload '{"daily":true}' /tmp/daily.json && cat /tmp/daily.json
 ```
+
+`06_daily_schedule.sh` uses **EventBridge Scheduler**, not an EventBridge rule:
+only Scheduler honours a timezone, and a UTC-pinned "06:00 Eastern" silently
+becomes 05:00 every winter.
 
 NOAA source buckets are read **anonymously**, so the IAM role only needs your own
 bucket, SES, and invoke permissions.
