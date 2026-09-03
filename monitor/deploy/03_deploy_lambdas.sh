@@ -17,6 +17,34 @@ else
 fi
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 
+# ── recipient pre-flight ─────────────────────────────────────────────────────
+# In the SES sandbox an unverified recipient does not merely miss its own mail:
+# SendRawEmail rejects the WHOLE message, so one unverified address silently
+# takes down alerting for everyone on the list. Deploying that config is worse
+# than not adding the recipient at all, so refuse to.
+if [[ "$(aws sesv2 get-account --region "$AWS_REGION" \
+          --query ProductionAccessEnabled --output text)" != "True" ]]; then
+  IFS=',' read -ra _R <<< "$MONITOR_ALERT_RECIPIENTS"
+  _bad=()
+  for r in "${_R[@]}" "$MONITOR_ALERT_SENDER"; do
+    st="$(aws ses get-identity-verification-attributes --identities "$r" \
+          --region "$AWS_REGION" \
+          --query "VerificationAttributes.\"${r}\".VerificationStatus" \
+          --output text 2>/dev/null || echo None)"
+    [[ "$st" == "Success" ]] || _bad+=("$r ($st)")
+  done
+  if (( ${#_bad[@]} )); then
+    echo "REFUSING TO DEPLOY — SES is in the sandbox and these identities are not verified:"
+    printf '    %s\n' "${_bad[@]}"
+    echo
+    echo "  Each must click the AWS verification link in their own inbox."
+    echo "  Re-send with:  aws ses verify-email-identity --email-address <addr> --region $AWS_REGION"
+    echo "  Or remove the restriction entirely by requesting SES production access."
+    exit 1
+  fi
+  echo "SES sandbox: all ${#_R[@]} recipient(s) + sender verified."
+fi
+
 COMMON_ENV="MONITOR_BUCKET=${MONITOR_BUCKET},MONITOR_PREFIX=${MONITOR_PREFIX}"
 # The poller also needs the SES identities: it sends the source-staleness notice
 # itself rather than routing a plain-text warning through the PDF alerter.
