@@ -45,13 +45,38 @@ if [[ "$(aws sesv2 get-account --region "$AWS_REGION" \
   echo "SES sandbox: all ${#_R[@]} recipient(s) + sender verified."
 fi
 
-COMMON_ENV="MONITOR_BUCKET=${MONITOR_BUCKET},MONITOR_PREFIX=${MONITOR_PREFIX}"
+# Environment is passed as JSON, not the Key=Value,Key=Value shorthand. The
+# shorthand delimits pairs on commas, so the moment MONITOR_ALERT_RECIPIENTS
+# holds more than one address the parser reads the second address as a new key
+# and the deploy dies. JSON quotes the value, so commas inside it are just data.
+env_json () {            # env_json K V K V ... -> {"Variables":{"K":"V",...}}
+  python -c '
+import json,sys
+a=sys.argv[1:]
+print(json.dumps({"Variables":dict(zip(a[::2],a[1::2]))}))' "$@"
+}
+
 # The poller also needs the SES identities: it sends the source-staleness notice
 # itself rather than routing a plain-text warning through the PDF alerter.
-POLLER_ENV="{${COMMON_ENV},MONITOR_ALERTER_FUNCTION=${ALERTER_FN},MONITOR_FIRE_RP_SCOUR=${MONITOR_FIRE_RP_SCOUR},MONITOR_FIRE_RP_OTHER=${MONITOR_FIRE_RP_OTHER},MONITOR_ALERT_SENDER=${MONITOR_ALERT_SENDER},MONITOR_ALERT_RECIPIENTS=${MONITOR_ALERT_RECIPIENTS},MONITOR_STALE_WARN_HOURS=${MONITOR_STALE_WARN_HOURS:-3}}"
+POLLER_ENV="$(env_json \
+  MONITOR_BUCKET "$MONITOR_BUCKET" \
+  MONITOR_PREFIX "$MONITOR_PREFIX" \
+  MONITOR_ALERTER_FUNCTION "$ALERTER_FN" \
+  MONITOR_FIRE_RP_SCOUR "$MONITOR_FIRE_RP_SCOUR" \
+  MONITOR_FIRE_RP_OTHER "$MONITOR_FIRE_RP_OTHER" \
+  MONITOR_ALERT_SENDER "$MONITOR_ALERT_SENDER" \
+  MONITOR_ALERT_RECIPIENTS "$MONITOR_ALERT_RECIPIENTS" \
+  MONITOR_STALE_WARN_HOURS "${MONITOR_STALE_WARN_HOURS:-3}")"
+
 # The alerter also renders the daily summary ({"daily": true}), so it needs the
 # window's timezone — the report is built for the previous LOCAL calendar day.
-ALERTER_ENV="{${COMMON_ENV},MONITOR_ALERT_SENDER=${MONITOR_ALERT_SENDER},MONITOR_ALERT_RECIPIENTS=${MONITOR_ALERT_RECIPIENTS},MONITOR_DAILY_TZ=${MONITOR_DAILY_TZ:-America/New_York},MONITOR_DAILY_SEND_HOUR=${MONITOR_DAILY_SEND_HOUR:-6}}"
+ALERTER_ENV="$(env_json \
+  MONITOR_BUCKET "$MONITOR_BUCKET" \
+  MONITOR_PREFIX "$MONITOR_PREFIX" \
+  MONITOR_ALERT_SENDER "$MONITOR_ALERT_SENDER" \
+  MONITOR_ALERT_RECIPIENTS "$MONITOR_ALERT_RECIPIENTS" \
+  MONITOR_DAILY_TZ "${MONITOR_DAILY_TZ:-America/New_York}" \
+  MONITOR_DAILY_SEND_HOUR "${MONITOR_DAILY_SEND_HOUR:-6}")"
 
 deploy () {   # name handler memory timeout env
   local NAME="$1" HANDLER="$2" MEM="$3" TMO="$4" ENV="$5"
@@ -63,14 +88,14 @@ deploy () {   # name handler memory timeout env
     aws lambda update-function-configuration --function-name "$NAME" \
       --memory-size "$MEM" --timeout "$TMO" --role "$ROLE_ARN" \
       --image-config "Command=[$HANDLER]" \
-      --environment "Variables=$ENV" --region "$AWS_REGION" >/dev/null
+      --environment "$ENV" --region "$AWS_REGION" >/dev/null
   else
     echo "Creating $NAME ..."
     aws lambda create-function --function-name "$NAME" --package-type Image \
       --code ImageUri="$ECR_URI" --role "$ROLE_ARN" \
       --image-config "Command=[$HANDLER]" \
       --memory-size "$MEM" --timeout "$TMO" --architectures x86_64 \
-      --environment "Variables=$ENV" --region "$AWS_REGION" >/dev/null
+      --environment "$ENV" --region "$AWS_REGION" >/dev/null
   fi
   aws lambda wait function-updated --function-name "$NAME" --region "$AWS_REGION"
   echo "  $NAME ready."
