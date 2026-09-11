@@ -22,3 +22,6 @@ exports/
 streamstats_batches/
 mrms_shards_nearest/
 mrms_shards_watershed/
+.tilecache/
+results/*.zip
+results/indiana_nwm_comids.*
