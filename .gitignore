@@ -25,3 +25,4 @@ mrms_shards_watershed/
 .tilecache/
 results/*.zip
 results/indiana_nwm_comids.*
+results/bridge_reach_snapping_audit.*
