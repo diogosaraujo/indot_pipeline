@@ -2,8 +2,8 @@
 """Map the 12 permanently-firing bridges on COMID 13437963, over satellite imagery.
 
 The defect is spatial and the imagery is the point: on the aerial you can see the
-ditched farmland these bridges actually cross, and see that the NWM flowline
-network does not represent it. Twelve bridges spread over ~25 km were all
+ditched farmland these bridges cross. NHDPlus maps those ditches; the NWM
+network does not ROUTE it. Twelve bridges spread over ~25 km were all
 assigned to one 3.6 km reach, and the flow trigger judges every one of them
 against that reach's streamflow.
 
@@ -249,9 +249,10 @@ def main() -> None:
         ("ordinary flow reads as a 100-year event -", PAPER),
         ("every hour since 18 Aug.", PAPER),
         ("", PAPER),
-        ("Only bridge 1 is within 300 m. On the imagery", PAPER),
-        ("the ditches these bridges actually cross are", C_NET),
-        ("visible, and absent from the NWM network.", C_NET),
+        ("Only bridge 1 is within 300 m. Eleven have a", PAPER),
+        ("mapped reach within 20-70 m - the ditches on", C_NET),
+        ("the imagery. NHDPlus maps them; NWM does NOT", C_NET),
+        ("route them, so they carry no streamflow.", C_NET),
     ]:
         fig.text(px, y, t, fontsize=9.3, color=c, va="top")
         y -= 0.0212 * rs
