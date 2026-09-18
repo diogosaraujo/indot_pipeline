@@ -209,6 +209,57 @@ def load_flowlines() -> pd.DataFrame | None:
         return None
 
 
+def load_counties_named() -> pd.DataFrame | None:
+    """County rings WITH names: part_id, lon, lat, name, geoid.
+
+    The plain in_counties.parquet has no names, so it cannot answer "stroke
+    Wayne County". Built by scripts/build_in_counties_named.py.
+    """
+    _, prefix = config.bucket_prefix()
+    try:
+        return read_parquet(bucket(),
+                            f"{prefix}monitor/assets/in_counties_named.parquet")
+    except Exception as e:  # noqa: BLE001
+        log.warning("named counties unavailable (%s)", e)
+        return None
+
+
+def draw_county_outline(ax, cnamed, name: str, color: str = "#1c1a17",
+                        lw: float = 2.0, zorder: int = 7) -> None:
+    """Stroke ONE county's boundary above the data — the frame's subject.
+
+    Carries a white casing so the line stays readable where it crosses the
+    rainfall raster, which is the same trick the city labels use.
+    """
+    import matplotlib.patheffects as pe
+
+    if cnamed is None or getattr(cnamed, "empty", True) or not name:
+        return
+    d = cnamed[cnamed["name"].astype(str).str.upper() == str(name).upper()]
+    if d.empty:
+        log.warning("county %r not found in the named-counties asset", name)
+        return
+    for _pid, g in d.groupby("part_id", sort=False):
+        ax.plot(g["lon"].to_numpy(), g["lat"].to_numpy(), color=color,
+                linewidth=lw, zorder=zorder, solid_joinstyle="round",
+                solid_capstyle="round",
+                path_effects=[pe.withStroke(linewidth=lw + 1.8, foreground="white")])
+
+
+def load_roads() -> pd.DataFrame | None:
+    """Flattened TIGER primary+secondary roads: part_id, lon, lat, cls, name.
+
+    Same shape as flowlines — plain lon/lat rows, no geometry library — so it
+    draws with the rest of the basemap. Built by scripts/build_in_roads.py.
+    """
+    _, prefix = config.bucket_prefix()
+    try:
+        return read_parquet(bucket(), f"{prefix}monitor/assets/in_roads.parquet")
+    except Exception as e:  # noqa: BLE001
+        log.warning("roads unavailable (%s) — run scripts/build_in_roads.py", e)
+        return None
+
+
 def hour_range(day: str) -> list[pd.Timestamp]:
     """The 24 UTC hours whose LOCAL timestamp falls on `day`."""
     start = pd.Timestamp(f"{day} 00:00", tz=TZ).tz_convert("UTC")
@@ -281,6 +332,78 @@ CLASS_STYLE = {
     "precip": (C_PRECIP, "^", "Precipitation"),
     "unknown": (C_UNKNOWN, "o", "Flow — corroboration unassessed"),
 }
+
+
+# Road weights. Interstates carry the widest, darkest stroke because on a
+# county map they are the landmark a reader orients from; state routes stay
+# hairline so they never compete with the river network, which is the subject.
+ROAD_STYLE = {
+    "interstate": ("#6b6760", 1.4),
+    "us": ("#918d84", 0.8),
+    "state": ("#b0aca2", 0.45),
+}
+
+
+def draw_roads(ax, roads, lat=None, lon=None, zorder: int = 4,
+               highlight: str | None = None, highlight_color: str = "#33302a",
+               scale: float = 1.0) -> None:
+    """Roads above the county fill, below the bridge markers.
+
+    `highlight` is a route name such as "I-70"; matching parts are drawn heavier
+    and darker so the named road reads as the landmark. TIGER writes interstate
+    names with a space after the dash ("I- 70"), so the match strips spaces from
+    both sides rather than comparing literally — a plain == "I-70" finds nothing.
+    """
+    from matplotlib.collections import LineCollection
+
+    if roads is None or getattr(roads, "empty", True):
+        return
+    r = roads
+    if lat is not None and lon is not None:
+        r = r[(r["lat"] >= lat[0] - .05) & (r["lat"] <= lat[1] + .05)
+              & (r["lon"] >= lon[0] - .05) & (r["lon"] <= lon[1] + .05)]
+        if r.empty:
+            return
+    key = highlight.replace(" ", "").upper() if highlight else None
+
+    segs, cols, widths, hi = [], [], [], []
+    for _pid, g in r.groupby("part_id", sort=False):
+        xy = g[["lon", "lat"]].to_numpy()
+        if len(xy) < 2:
+            continue
+        if key and key in str(g["name"].iloc[0]).replace(" ", "").upper():
+            hi.append(xy)
+            continue
+        c, w = ROAD_STYLE.get(str(g["cls"].iloc[0]), ROAD_STYLE["state"])
+        segs.append(xy); cols.append(c); widths.append(w * scale)
+
+    if segs:
+        ax.add_collection(LineCollection(segs, colors=cols, linewidths=widths,
+                                         zorder=zorder, alpha=0.85,
+                                         capstyle="round", joinstyle="round"))
+    if hi:
+        ax.add_collection(LineCollection(hi, colors=highlight_color,
+                                         linewidths=2.4 * scale, zorder=zorder + 0.5,
+                                         capstyle="round", joinstyle="round"))
+        # Label the highlighted route on the map. Placed at the midpoint of its
+        # LONGEST part, which keeps the tag on open road rather than on a stub
+        # near the frame edge. Horizontal rather than rotated: set_geo applies an
+        # aspect correction, so a rotation computed in degrees of lon/lat does
+        # not match the drawn angle and the text ends up visibly off the road.
+        longest = max(hi, key=len)
+        mx, my = longest[len(longest) // 2]
+        # Offset the tag OFF the carriageway, and make its plate opaque. Centred
+        # on the line with a 0.92-alpha box, the 2.4 pt highlight showed through
+        # and read as a strike-through. It sits just north of the road instead,
+        # the way a route shield is placed on a printed map.
+        if lat is not None:
+            my = float(my) + (lat[1] - lat[0]) * 0.030
+        # zorder 9 puts it above the bridge markers (8): a route label buried
+        # under a cluster of alerts is a label that does not do its job.
+        ax.text(mx, my, highlight, fontsize=12.5, fontweight="bold",
+                color=highlight_color, ha="center", va="center", zorder=9,
+                bbox=dict(boxstyle="round,pad=0.22", fc="white",
+                          ec=highlight_color, lw=0.9))
 
 
 def draw_bridges(ax, d: pd.DataFrame, mscale: float = 1.9, lw: float = 0.9,
@@ -366,23 +489,42 @@ def draw_flowlines(ax, flow, values: pd.Series | None = None, vmax: float = 1.5,
         ax.add_collection(LineCollection(hot, colors=hot_c, linewidths=hot_w, zorder=3))
 
 
-# Shared 3-panel geometry (MRMS | NWM open-loop | NWM A&A). e04 and e05 both
-# use it so an animation frame and the static map for the same day are the same
-# size and land on the same ground — you can flip between them without the eye
-# having to re-register the map.
-PANEL_FIG = (24.0, 9.6)
-PANEL_W, PANEL_X0, PANEL_GAP = 0.293, 0.028, 0.014
+# Shared 2-panel geometry (MRMS | NWM). e04 and e05 both use it so an animation
+# frame and the static map for the same day are the same size and land on the
+# same ground — you can flip between them without the eye having to re-register
+# the map.
+#
+# The canvas is the PowerPoint slide's TRUE width, and that is the whole reason
+# the text reads. Font sizes are absolute points on the figure, so a 24-inch
+# canvas dropped into a 13.33-inch slide is scaled to 56% and every label
+# shrinks with it — 13 pt panel titles arrived at ~7 pt on screen. Raising the
+# point sizes on an oversized canvas would not have fixed that. Sizing the
+# figure to the slide makes points map 1:1, so 12 pt here is 12 pt in the deck.
+# If you ever change this canvas, scale every font in e04/e05 by the same factor
+# or the deck silently goes back to being unreadable.
+#
+# Height is capped at 6 in by request — shorter than a full 16:9 slide (7.5 in),
+# leaving room on the slide under the figure. Because the fonts do NOT shrink
+# with it, that lost 1.5 in comes straight out of the panels, which is why the
+# header below packs two rows instead of four.
+PANEL_FIG = (13.333, 6.0)
+PANELS = 2
+PANEL_W, PANEL_X0, PANEL_GAP = 0.445, 0.030, 0.020
 
 
-def panel_rects(y: float = 0.125, h: float = 0.715) -> list[list[float]]:
-    return [[PANEL_X0 + i * (PANEL_W + PANEL_GAP), y, PANEL_W, h] for i in range(3)]
+# Two header rows, not four: with the explanatory clauses dropped, the title is
+# short enough to share row 1 with the class key and the subtitle to share row 2
+# with the severity key. On a 6 in canvas that recovered the panel height the
+# shorter figure would otherwise have cost.
+def panel_rects(y: float = 0.165, h: float = 0.625) -> list[list[float]]:
+    return [[PANEL_X0 + i * (PANEL_W + PANEL_GAP), y, PANEL_W, h]
+            for i in range(PANELS)]
 
 
-def panel_legend_rects(y: float = 0.062, h: float = 0.016):
-    """(rainfall colourbar rect, shared streamflow ramp rect)."""
+def panel_legend_rects(y: float = 0.090, h: float = 0.026):
+    """(rainfall colourbar rect, streamflow ramp rect) — one under each panel."""
     cb = [PANEL_X0 + 0.035, y, PANEL_W - 0.07, h]
-    ramp = [PANEL_X0 + (PANEL_W + PANEL_GAP) + 0.055, y,
-            (PANEL_W * 2 + PANEL_GAP) - 0.11, h]
+    ramp = [PANEL_X0 + (PANEL_W + PANEL_GAP) + 0.035, y, PANEL_W - 0.07, h]
     return cb, ramp
 
 
@@ -410,11 +552,13 @@ def river_ramp_legend(fig, rect, vmax: float = 1.5, cmap: str = RIVER_CMAP,
     ax.imshow(grad, aspect="auto", cmap=plt.get_cmap(cmap))
     ax.set_yticks([])
     ax.set_xticks([0, 127, 255])
-    ax.set_xticklabels(["0", f"{vmax/2:.2g}×", f"≥{vmax:.2g}×"], fontsize=7.5, color=INK2)
-    ax.tick_params(length=2, pad=1.5, colors=INK2)
+    # 12 pt is the floor for this deck: these ramp ticks are the smallest text
+    # on the figure, so nothing else may go below them.
+    ax.set_xticklabels(["0", f"{vmax/2:.2g}×", f"≥{vmax:.2g}×"], fontsize=12, color=INK2)
+    ax.tick_params(length=3, pad=3, colors=INK2)
     for s in ax.spines.values():
         s.set_color(BASELINE); s.set_linewidth(0.6)
-    ax.set_title(label, fontsize=8, color=INK2, loc="left", pad=3)
+    ax.set_title(label, fontsize=13, color=INK2, loc="left", pad=5)
 
 
 def place_labels(ax, pts: pd.DataFrame, text_col: str, fontsize=7.0,
