@@ -32,9 +32,18 @@ testing each fit against the record it was fitted from.
 D1  exceedance-count audit   years exceeding Q_T vs the expected N/T, scored
                              against Binomial(N, 1/T).  A direct statement of
                              what "return period" means.  Both directions.
-D2  record-max ratios        a 45-yr record's largest annual max is ~a 45-yr
-                             event, so expect Q50 ~ max and Q100 > max.
-                             Q100 < max is near-certain underestimation.
+D2  record-max position      where the largest annual max falls ON the fitted
+                             curve, as an implied return period, judged against
+                             1/(1-0.5^(1/N)) — the median plotting position of
+                             the maximum of N draws (~62 yr for N=43).
+                             NOTE: "Q100 < record max" is NOT a defect.  For a
+                             correct fit that happens with probability
+                             1-(1-1/T)^N = 35% at N=43, and the 2026-10-09
+                             fleet run measured 32.4%.  An earlier version of
+                             this script used it as the UNDER criterion and so
+                             reported a third of the fleet as underestimated.
+                             Any detector here must be calibrated against what
+                             a correct fit does on a FINITE record.
 D2b empirical quantile       Q_T,fit vs the Cunnane plotting-position estimate
                              from the same sample, computed ONLY where the
                              record actually supports that return period.
@@ -101,6 +110,17 @@ CEILING_MARGIN = 2.0    # negative-skew ceiling must clear this x the record max
 EMP_LOW        = 0.5    # Q_fit / Q_empirical below this -> underestimation
 EMP_HIGH       = 2.0    # ...above this -> overestimation
 R100_MAX_HIGH  = 5.0    # Q100 more than this x the record max -> wild extrapolation
+
+# Q100 < record max is NOT evidence of underestimation.  For a correctly
+# specified fit, P(at least one of N annual maxima exceeds Q_T) = 1-(1-1/T)^N,
+# which for N=43, T=100 is 35%.  The 2026-10-09 fleet run measured 32.4%
+# against that 35.1% prediction, so an earlier version of this script flagged
+# the EXPECTED outcome as a defect and reported 32% of the fleet as "UNDER".
+# The calibrated test is where the record max falls ON the fitted curve: its
+# implied return period should sit near the median plotting position of the
+# maximum of N draws, 1/(1-0.5^(1/N)) ~ 62 yr for N=43 (measured p50 65.5).
+# Only a max implying a return period many times that is a real outlier.
+RECORD_RP_FACTOR = 10.0   # implied RP of the record max above this x n_years -> flag
 PPCC_MIN       = 0.95   # probability-plot correlation below this -> poor fit
 KS_MIN         = 0.05   # KS p-value below this -> reject the LP3 shape
 CENSOR_MAX     = 0.30   # Grubbs-Beck censoring above this fraction -> biased sample
@@ -120,6 +140,40 @@ def empirical_quantile(ann_sorted: np.ndarray, rp: float) -> float:
     if target > p_ne[-1] or target < p_ne[0]:
         return float("nan")
     return float(10.0 ** np.interp(target, p_ne, np.log10(ann_sorted)))
+
+
+def implied_return_period(q: float, mean_log: float, std_log: float,
+                          skew: float) -> float:
+    """Return period at which the fitted LP3 reaches discharge q, by bisection.
+
+    Inverts lp3_quantile rather than interpolating the stored ladder, so a
+    record max far beyond the 500-yr point is still quantified instead of
+    being clipped.  Returns NaN if q sits below the 1.01-yr point.
+    """
+    if not (np.isfinite(q) and q > 0 and std_log > 0):
+        return float("nan")
+    target = np.log10(q)
+    lo, hi = 1.01, 1.0e6
+    if mean_log + b04b.k_factor(1.0 / lo, skew) * std_log > target:
+        return float("nan")
+    if mean_log + b04b.k_factor(1.0 / hi, skew) * std_log < target:
+        return float(hi)
+    for _ in range(80):                       # bisect on log T
+        mid = 10.0 ** (0.5 * (np.log10(lo) + np.log10(hi)))
+        if mean_log + b04b.k_factor(1.0 / mid, skew) * std_log < target:
+            lo = mid
+        else:
+            hi = mid
+    return float(0.5 * (lo + hi))
+
+
+def expected_max_rp(n: int) -> float:
+    """Median return period of the largest of n annual maxima: 1/(1-0.5^(1/n)).
+
+    The yardstick for implied_return_period — for N=43 this is ~62.5 yr, and
+    the 2026-10-09 fleet run measured a median of 65.5.
+    """
+    return float(1.0 / (1.0 - 0.5 ** (1.0 / n))) if n > 0 else float("nan")
 
 
 def lp3_upper_bound(mean_log: float, std_log: float, skew: float) -> float:
@@ -187,9 +241,15 @@ def audit_one(comid: int, retro_site: pd.DataFrame, lat: float) -> tuple[dict, p
         row[f"exc{rp}_p_hi"] = float(stats.binom.sf(k - 1, n, p))   # too many -> under
         row[f"exc{rp}_p_lo"] = float(stats.binom.cdf(k, n, p))      # too few  -> over
 
-    # ── D2 record-max ratios ─────────────────────────────────────────────────
+    # ── D2 record-max position on the fitted curve ───────────────────────────
+    # r50_max / r100_max are kept as diagnostics but are NOT verdict triggers:
+    # see RECORD_RP_FACTOR above for why "Q100 < record max" means nothing.
     row["r50_max"] = q[50] / max_ann if max_ann > 0 else np.nan
     row["r100_max"] = q[100] / max_ann if max_ann > 0 else np.nan
+    row["implied_rp_max"] = implied_return_period(max_ann, mean_log, std_log, skew)
+    row["expected_rp_max"] = expected_max_rp(n)
+    row["rp_max_ratio"] = (row["implied_rp_max"] / row["expected_rp_max"]
+                           if np.isfinite(row["implied_rp_max"]) else np.nan)
 
     # ── D2b empirical quantiles, only where the record supports them ─────────
     for rp in (10, 50):
@@ -207,8 +267,8 @@ def audit_one(comid: int, retro_site: pd.DataFrame, lat: float) -> tuple[dict, p
     flags: list[str] = []
     under, over = [], []
 
-    if np.isfinite(row["r100_max"]) and row["r100_max"] < 1.0:
-        under.append("Q100_below_record_max")
+    if np.isfinite(row["implied_rp_max"]) and row["implied_rp_max"] > RECORD_RP_FACTOR * n:
+        under.append("record_max_far_beyond_curve")
     if row["exc10_p_hi"] < BINOM_P:
         under.append("too_many_Q10_exceedances")
     if np.isfinite(row["bound_over_max"]) and row["bound_over_max"] < CEILING_MARGIN:
@@ -216,8 +276,11 @@ def audit_one(comid: int, retro_site: pd.DataFrame, lat: float) -> tuple[dict, p
     if np.isfinite(row.get("r10_emp", np.nan)) and row["r10_emp"] < EMP_LOW:
         under.append("Q10_below_empirical")
 
-    if n >= 30 and row["exc10_obs"] == 0:
-        over.append("never_reached_own_Q10")
+    # A zero Q10 exceedance count is only notable when it is actually unlikely:
+    # P(0) = 0.9^N is 1.07% at N=43, so a bare "exc10 == 0" test flagged 0.76%
+    # of the fleet for behaving exactly as expected.  Use the binomial tail.
+    if row["exc10_p_lo"] < BINOM_P:
+        over.append("too_few_Q10_exceedances")
     if np.isfinite(row.get("r10_emp", np.nan)) and row["r10_emp"] > EMP_HIGH:
         over.append("Q10_above_empirical")
     if np.isfinite(row["r100_max"]) and row["r100_max"] > R100_MAX_HIGH:
@@ -252,8 +315,8 @@ def audit_one(comid: int, retro_site: pd.DataFrame, lat: float) -> tuple[dict, p
 
     # Fold-error for ranking: how many times wrong, >= 1 by construction.
     sev = [1.0]
-    if np.isfinite(row["r100_max"]) and row["r100_max"] < 1.0:
-        sev.append(1.0 / row["r100_max"])
+    if np.isfinite(row["rp_max_ratio"]) and row["rp_max_ratio"] > 1.0:
+        sev.append(row["rp_max_ratio"])
     r10e = row.get("r10_emp", np.nan)
     if np.isfinite(r10e) and r10e > 0:
         sev.append(max(r10e, 1.0 / r10e))
@@ -317,6 +380,33 @@ def report(audit: pd.DataFrame) -> None:
             "reproduction vs stored p03: worst deviation %.4f%% (%d compared)%s",
             worst, len(dev), "" if worst < 1.0 else "  <-- audit may not describe live fits")
 
+    # ── calibration against the null hypothesis ──────────────────────────────
+    # A finite record does NOT reproduce nominal exceedance rates exactly, and
+    # mistaking that for a defect is how this script once reported 32% of the
+    # fleet as underestimated.  Print what a CORRECT fit would do, so any
+    # detector whose hit-rate merely matches the null is visibly not a finding.
+    log.info("")
+    log.info("calibration — observed vs what a correctly specified fit predicts:")
+    nyr = audit["n_years"].to_numpy(float)
+    for rp in TRIGGER_RPS:
+        col = f"r{rp}_max"
+        if col in audit.columns:
+            obs = float((audit[col] < 1.0).mean())
+            pred = float(np.mean(1.0 - (1.0 - 1.0 / rp) ** nyr))
+            log.info("  Q%-4d < record max   observed %5.1f%%   predicted %5.1f%%   ratio %.2f",
+                     rp, obs * 100, pred * 100, obs / pred if pred else np.nan)
+    for rp in TRIGGER_RPS:
+        o = float(audit[f"exc{rp}_obs"].mean())
+        e = float(audit[f"exc{rp}_exp"].mean())
+        log.info("  Q%-4d mean exceedances  observed %6.3f   expected %6.3f   ratio %.3f",
+                 rp, o, e, o / e if e else np.nan)
+    if "rp_max_ratio" in audit.columns:
+        s = audit["implied_rp_max"].replace([np.inf, -np.inf], np.nan).dropna()
+        ex = audit["expected_rp_max"].median()
+        if len(s):
+            log.info("  implied RP of record max  p50 %.1f yr   expected median %.1f yr",
+                     s.median(), ex)
+
     log.info("")
     for v in ("DEGENERATE", "UNDER", "OVER", "UNSTABLE", "OK"):
         k = int((audit["verdict"] == v).sum())
@@ -344,11 +434,11 @@ def report(audit: pd.DataFrame) -> None:
     cols = ["comid", "verdict", "severity", "n_years", "std_log", "skew",
             "Q10_cfs", "Q100_cfs", "max_ann_cfs", "r100_max", "exc10_obs", "flags"]
     for _, r in audit.head(20).iterrows():
-        log.info("  %-10d %-8s x%-9.1f n=%-3d sd=%-6.3f g=%-7.3f Q10=%-10.1f "
-                 "Q100=%-10.1f max=%-10.1f r=%-6.2f exc10=%-3d %s",
+        log.info("  %-10d %-10s x%-8.1f n=%-3d sd=%-6.3f g=%-7.3f Q100=%-10.1f "
+                 "max=%-10.1f impRP=%-8.0f exc10=%-3d %s",
                  r["comid"], r["verdict"], r["severity"], r["n_years"],
-                 r["std_log"], r["skew"], r["Q10_cfs"], r["Q100_cfs"],
-                 r["max_ann_cfs"], r["r100_max"], r["exc10_obs"], r["flags"])
+                 r["std_log"], r["skew"], r["Q100_cfs"], r["max_ann_cfs"],
+                 r.get("implied_rp_max", float("nan")), r["exc10_obs"], r["flags"])
     _ = cols
 
 
@@ -360,7 +450,10 @@ def main() -> None:
     ap.add_argument("--comids", type=int, nargs="+", default=None,
                     help="audit only these COMIDs (smoke test)")
     ap.add_argument("--no-resume", action="store_true",
-                    help="ignore any existing audit table and start clean")
+                    help="ignore any existing audit table and start clean. REQUIRED "
+                         "after any change to the detectors or thresholds: a resume "
+                         "keeps previously-written rows verbatim, so stale verdicts "
+                         "would survive and only new COMIDs would get the new logic")
     ap.add_argument("--dry-run", action="store_true",
                     help="fit and report but write nothing to S3")
     args = ap.parse_args()
