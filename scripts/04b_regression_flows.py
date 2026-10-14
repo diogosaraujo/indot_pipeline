@@ -430,6 +430,46 @@ def compute_gof(log_q: np.ndarray, params: dict) -> dict:
     }
 
 
+# ── Fit-parameter record ──────────────────────────────────────────────────────
+# The fitted parameters used to live only in the plot-side summary CSV, which
+# left them unqueryable: per_gauge_flow_stats.parquet carried the quantiles but
+# nothing about the fit that produced them, so comparing an NWM fit with its
+# observed-peak counterpart meant reading numbers off a PNG annotation box.
+
+FIT_PARAM_COLS = [
+    "fitting_method", "n_censored", "n_uncensored", "threshold_cfs",
+    "mean_log", "std_log", "skew_at_site", "skew_regional",
+    "weight_at_site", "weight_regional", "skew_weighted",
+    "ppcc", "rmse_log", "ks_stat", "ks_pval",
+]
+
+
+def fit_param_record(params: dict, gof: dict) -> dict:
+    """The fitted LP3 parameters and goodness-of-fit flattened into one record.
+
+    Shared by 04b and 04c, and written to BOTH the per-gauge parquet and the
+    summary CSV, so the two can never drift apart.  Keys are exactly
+    FIT_PARAM_COLS.  The caller adds its own record-length columns, which differ
+    in meaning: n_peaks for observed instantaneous peaks, n_years for NWM
+    water-year maxima.
+    """
+    return {
+        "fitting_method":  params.get("fitting_method", "MOM"),
+        "n_censored":      int(params.get("n_censored", 0)),
+        "n_uncensored":    int(params.get("n_uncensored", params["n"])),
+        "threshold_cfs":   (round(10 ** params["threshold_log"], 1)
+                            if params.get("threshold_log") is not None else None),
+        "mean_log":        round(params["mean_log"],       4),
+        "std_log":         round(params["std_log"],        4),
+        "skew_at_site":    round(params["skew_at_site"],  4),
+        "skew_regional":   round(params["skew_regional"], 4),
+        "weight_at_site":  params["weight_at_site"],
+        "weight_regional": params["weight_regional"],
+        "skew_weighted":   round(params["skew"],          4),
+        **gof,
+    }
+
+
 # ── Frequency curve plot ──────────────────────────────────────────────────────
 
 def plot_frequency_curve(
@@ -609,6 +649,10 @@ def main() -> None:
     log.info("Evaluating %d stations against the peak-flow series...", n_total)
 
     summary_rows: list[dict] = []
+    # Parameters are collected here and merged into the parquet after the loop
+    # rather than assigned in place, so pandas infers each column's dtype once
+    # instead of upcasting a float column the first time a method string lands.
+    param_by_site: dict[str, dict] = {}
     counts = {"lp3": 0, "regulated": 0, "short": 0, "no_peaks": 0}
 
     for i, site_no in enumerate(sites, 1):
@@ -662,27 +706,18 @@ def main() -> None:
         flow_stats.at[site_no, "source"] = "lp3_peak_series"
         counts["lp3"] += 1
 
+        meta = {"n_peaks":  n_peaks,
+                "wy_start": int(peaks_s.index.min()),
+                "wy_end":   int(peaks_s.index.max())}
+        fit_rec = fit_param_record(params, gof)
+        param_by_site[site_no] = {**meta, **fit_rec}
+
         summary_rows.append({
             "site_no":          site_no,
-            "n_peaks":          n_peaks,
-            "wy_start":         int(peaks_s.index.min()),
-            "wy_end":           int(peaks_s.index.max()),
+            **meta,
             "status":           "lp3_peak_series",
-            "fitting_method":   params.get("fitting_method", "MOM"),
-            "n_censored":       params.get("n_censored", 0),
-            "threshold_cfs":    (
-                round(10 ** params["threshold_log"], 1)
-                if params.get("threshold_log") is not None else None
-            ),
-            "mean_log":         round(params["mean_log"],       4),
-            "std_log":          round(params["std_log"],        4),
-            "skew_at_site":     round(params["skew_at_site"],  4),
-            "skew_regional":    round(params["skew_regional"], 4),
-            "weight_at_site":   params["weight_at_site"],
-            "weight_regional":  params["weight_regional"],
-            "skew_weighted":    round(params["skew"],          4),
+            **fit_rec,
             **{f"Q{rp}": q_design.get(rp) for rp in RETURN_PERIODS},
-            **gof,
         })
 
         try:
@@ -693,10 +728,19 @@ def main() -> None:
         except Exception as exc:
             log.warning("    Plot failed: %s", exc)
 
-    # Save updated flow stats
+    # Save updated flow stats, now carrying the fit parameters next to the
+    # quantiles.  Stations that were not fitted (regulated, short, no record)
+    # simply get NaN, so a stale parameter can never outlive its quantiles.
     flow_stats = flow_stats.reset_index()
+    pr = (pd.DataFrame.from_dict(param_by_site, orient="index")
+            .rename_axis("site_no").reset_index())
+    if not pr.empty:
+        dupes = [c for c in pr.columns if c != "site_no" and c in flow_stats.columns]
+        flow_stats = flow_stats.drop(columns=dupes).merge(pr, on="site_no", how="left")
     write_parquet_to_s3(flow_stats, bucket,
                         f"{prefix}flow_stats/per_gauge_flow_stats.parquet")
+    log.info("Per-gauge flow stats now carry %d fit-parameter columns",
+             len(pr.columns) - 1 if not pr.empty else 0)
 
     # Save summary
     summary_df = pd.DataFrame(summary_rows)

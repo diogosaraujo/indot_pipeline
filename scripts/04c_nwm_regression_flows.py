@@ -220,6 +220,10 @@ def _blank_row(site_no, comid, dist, source, n_years=0, wy_start=None, wy_end=No
     }
     for col in b04b.ALL_Q_COLS.values():
         row[col] = np.nan
+    # Keep the fit-parameter columns present (as NaN) on unfitted stations too,
+    # so the parquet schema is identical for every row.
+    for col in b04b.FIT_PARAM_COLS:
+        row[col] = np.nan
     return row
 
 
@@ -320,6 +324,8 @@ def main() -> None:
             row[b04b.ALL_Q_COLS[rp]] = q_t
             if rp in b04b.RETURN_PERIODS:
                 q_design[rp] = round(q_t, 1)
+        fit_rec = b04b.fit_param_record(params, gof)
+        row.update(fit_rec)                 # parameters next to the quantiles
         out_rows.append(row)
         counts["fit"] += 1
 
@@ -331,19 +337,8 @@ def main() -> None:
             "wy_start":        wy_start,
             "wy_end":          wy_end,
             "status":          "nwm_retro_lp3",
-            "fitting_method":  params.get("fitting_method", "MOM"),
-            "n_censored":      params.get("n_censored", 0),
-            "threshold_cfs":   (round(10 ** params["threshold_log"], 1)
-                                if params.get("threshold_log") is not None else None),
-            "mean_log":        round(params["mean_log"], 4),
-            "std_log":         round(params["std_log"], 4),
-            "skew_at_site":    round(params["skew_at_site"], 4),
-            "skew_regional":   round(params["skew_regional"], 4),
-            "weight_at_site":  params["weight_at_site"],
-            "weight_regional": params["weight_regional"],
-            "skew_weighted":   round(params["skew"], 4),
+            **fit_rec,
             **{f"Q{rp}": q_design.get(rp) for rp in b04b.RETURN_PERIODS},
-            **gof,
         })
 
         if not args.no_plots:
