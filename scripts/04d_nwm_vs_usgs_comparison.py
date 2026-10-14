@@ -85,6 +85,20 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s :: %(message)s")
 log = logging.getLogger("04d_nwm_vs_usgs")
 
+
+def _config() -> dict:
+    """Load config.yaml from the repo root, whatever the working directory is.
+
+    utils.load_config defaults to a cwd-relative "config.yaml", so running this
+    from scripts/ — the obvious place to run it from — fails with a bare
+    FileNotFoundError.  A cwd-local config still wins if one is present.
+    """
+    from pathlib import Path as _P
+    local = _P("config.yaml")
+    if local.exists():
+        return load_config()
+    return load_config(_P(__file__).resolve().parents[1] / "config.yaml")
+
 # ── Keys ─────────────────────────────────────────────────────────────────────
 PEAKS_KEY   = b04b.PEAKS_KEY
 COMID_KEY   = "nwm/comid_locations.parquet"
@@ -639,7 +653,7 @@ def main() -> None:
                     help="also save the figures to a local directory")
     args = ap.parse_args()
 
-    cfg = load_config()
+    cfg = _config()
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
 
