@@ -32,21 +32,36 @@ single V2.1 reach into many short segments carrying different `totdasqkm`
 mismatch legible ("crosses a 9 km2 creek, assigned a 320 mi2 river"), never
 what decides one.
 
-STATUS
-──────
-  CROSSES_NWM  HR reachcode == the assigned COMID's reachcode. Correct.
-  WRONG_COMID  HR reachcode is in V2.1 but belongs to a different COMID — the
-               bridge is on a routed stream, just assigned the wrong reach.
-               Recoverable by re-snapping.
-  NOT_ROUTED   HR reachcode has no V2.1 counterpart — the NWM has no reach for
-               this stream. No flow trigger is possible; re-snapping cannot help.
+Two classifications are produced, because the reachcode test alone is too
+strict: HR and V2.1 number reaches differently for the same watercourse, so it
+called 40.3% NOT_ROUTED where the truth is 13.7% — 4,384 of those bridges sit a
+median 11 m from a V2.1 reach. STATUS_RC keeps that result; STATUS is the
+geometric test below and is what the split uses.
+
+STATUS (geometric — asks each product SEPARATELY whether a stream is present,
+so nothing is ever compared across products)
+  CROSSES_NWM  the ASSIGNED V2.1 reach is within V2_TOL_M. Correct.
+  WRONG_COMID  some V2.1 reach is within V2_TOL_M but the assigned one is not —
+               on a routed stream, wrong reach. Recoverable by re-snapping.
+  NOT_ROUTED   no V2.1 reach within V2_TOL_M — the NWM has no reach for this
+               stream. No flow trigger is possible; re-snapping cannot help.
   NO_HR_NEAR   no HR flowline within MAX_SEARCH_M.
 
+Acceptance is "assigned reach within tolerance", NOT "assigned reach is the
+nearest". Two V2.1 reaches are often within metres of each other at confluences
+and on parallel channels, and 041-45-07617 (assigned 19.5 m, another at 16.6 m)
+showed strict-nearest flagging 92 bridges on a 3 m difference that means nothing.
+
 Outputs (results/)
-    bridges_crossing_nwm.shp       STATUS == CROSSES_NWM
-    bridges_not_crossing_nwm.shp   everything else
+    bridges_crossing_nwm.shp       on a routed stream: CROSSES_NWM + WRONG_COMID
+    bridges_not_crossing_nwm.shp   NOT_ROUTED (+ NO_HR_NEAR)
     bridge_stream_crossing.csv     every bridge, all fields
     bridge_stream_crossing.parquet
+
+WRONG_COMID is filed with the crossing set deliberately: 45-00248 B sits 2.2 m
+from COMID 13463811 while assigned one 4.6 km away — that is real NWM coverage
+with a wrong pointer, not a coverage gap, and filing it as "not crossing" would
+read as the latter. STATUS keeps the distinction for a one-query re-split.
 
 Usage
     python scripts/bridge_stream_crossing_check.py
@@ -202,13 +217,15 @@ def main() -> None:
     #   CROSSES_NWM a V2.1 reach is here AND it is the assigned COMID
     #   WRONG_COMID a V2.1 reach is here but a different COMID was assigned
     no_v2 = (d["v2_near_m"].isna() | (d["v2_near_m"] > V2_TOL_M)).to_numpy(dtype=bool)
-    # Comparing two nullable Int64 columns yields a masked boolean, which
-    # np.select rejects; NA means "no nearest COMID", i.e. not a match.
-    right = (~no_v2) & (d["v2_near_comid"].astype("Int64")
-                        .eq(d["comid"].astype("Int64"))
-                        .fillna(False).to_numpy(dtype=bool))
+    # Accept the ASSIGNED reach whenever it is itself within tolerance, rather
+    # than demanding it be the single nearest. Two V2.1 reaches are often within
+    # a few metres of each other at confluences and on parallel channels, and
+    # "nearest" is then arbitrary: 041-45-07617 has its assigned reach at 19.5 m
+    # and another at 16.6 m, a 2.9 m difference that says nothing. Requiring
+    # strict nearest flagged 92 such bridges as misassigned.
+    assigned_ok = (d["v2_dist_m"].notna() & (d["v2_dist_m"] <= V2_TOL_M)).to_numpy(dtype=bool)
     d["status"] = np.select(
-        [hr_rc.isna().to_numpy(dtype=bool), no_v2, right],
+        [hr_rc.isna().to_numpy(dtype=bool), no_v2, assigned_ok],
         ["NO_HR_NEAR", "NOT_ROUTED", "CROSSES_NWM"],
         default="WRONG_COMID")
 
@@ -227,10 +244,13 @@ def main() -> None:
                  s, a, 100.0 * a / n, k, 100.0 * k / n, sc)
     log.info("  (the split and the shapefiles use the GEOMETRIC test; STATUS_RC "
              "carries the reachcode result)")
-    ok = d["status"] == "CROSSES_NWM"
+    on_routed = d["status"].isin(["CROSSES_NWM", "WRONG_COMID"])
     log.info("")
-    log.info("  covered by NWM     : %6d  (%.1f%%)", int(ok.sum()), 100.0 * ok.mean())
-    log.info("  NOT covered        : %6d  (%.1f%%)", int((~ok).sum()), 100.0 * (~ok).mean())
+    log.info("  ON a stream the NWM routes : %6d  (%.1f%%)   <- bridges_crossing_nwm.shp",
+             int(on_routed.sum()), 100.0 * on_routed.mean())
+    log.info("     ...of which assigned the WRONG reach: %6d", int((d["status"] == "WRONG_COMID").sum()))
+    log.info("  NOT on a routed stream     : %6d  (%.1f%%)   <- bridges_not_crossing_nwm.shp",
+             int((~on_routed).sum()), 100.0 * (~on_routed).mean())
     log.info("")
     log.info("  perpendicular distance to the HR stream the bridge is on:")
     for s in ("CROSSES_NWM", "WRONG_COMID", "NOT_ROUTED"):
@@ -263,8 +283,14 @@ def main() -> None:
         out["SCOUR"] = out["SCOUR"].astype(bool).astype(int)
     out["HR_ID"] = out["HR_ID"].astype("Float64").astype(str)   # 14-digit, keep exact
 
-    a = out[out["STATUS"] == "CROSSES_NWM"]
-    b = out[out["STATUS"] != "CROSSES_NWM"]
+    # The split answers "is this bridge on a stream the NWM routes?", so a
+    # WRONG_COMID bridge belongs with the crossing set: it IS on a routed reach,
+    # just assigned a different one. 45-00248 B sits 2.2 m from COMID 13463811
+    # while assigned one 4.6 km away — real coverage, wrong pointer. Filing it
+    # as "not crossing" would read as no coverage at all. STATUS keeps the
+    # distinction, so re-splitting on it is one attribute query.
+    a = out[out["STATUS"].isin(["CROSSES_NWM", "WRONG_COMID"])]
+    b = out[~out["STATUS"].isin(["CROSSES_NWM", "WRONG_COMID"])]
     a.to_file(out_dir / "bridges_crossing_nwm.shp")
     b.to_file(out_dir / "bridges_not_crossing_nwm.shp")
     out.drop(columns="geometry").to_csv(out_dir / "bridge_stream_crossing.csv", index=False)
