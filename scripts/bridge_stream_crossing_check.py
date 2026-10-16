@@ -15,34 +15,50 @@ cannot give thresholds, but it can say which stream a bridge is actually on.
 
 The test
 ────────
-  1. nearest HR flowline to the bridge, by TRUE PERPENDICULAR distance
-     (point-to-segment). NOT a nearest-vertex snap: vertex snapping picks the
-     wrong reach wherever vertices are sparse, which is how this class of error
-     was introduced in the first place.
-  2. compare that flowline's `reachcode` with the REACHCODE of the bridge's
-     assigned V2.1 COMID.
+  step 1  nearest V2.1 reach is within V2_TOL_M (200 ft)         -> CROSSING
+  step 2  else, ReachCode(nearest V2.1) == ReachCode(nearest HR) -> CROSSING
+  step 2b else, GNIS name(nearest V2.1) == GNIS name(nearest HR) -> CROSSING
+  step 3  everything else                                        -> NOT_CROSSING
 
-ReachCode is the ONLY key the two product lines share. HR has no COMID and V2.1
-has no NHDPlusID, so there is no other join.
+Each step catches what the one before it misses.
 
-Deliberately NOT used for matching: geometry and drainage area. HR breaks a
-single V2.1 reach into many short segments carrying different `totdasqkm`
-(COMID 18476443 -> 10 HR segments), so neither is comparable across products.
-`totdasqkm` is carried into the output as CONTEXT ONLY — it is what makes a
-mismatch legible ("crosses a 9 km2 creek, assigned a 320 mi2 river"), never
-what decides one.
+Step 1 alone misses a bridge whose V2.1 line is drawn beyond the tolerance from
+the real channel — V2.1 is 1:100k generalised, and 149-64-04025 C sits 93.9 m
+from a V2.1 line that is the same stream.
 
-STATUS (binary)
-  CROSSING      the two ReachCodes are equal — the NWM network contains the
-                stream this bridge is nearest to.
-  NOT_CROSSING  they differ (or either is missing).
+Step 2 alone misses a bridge sitting right on a V2.1 line that the two products
+number differently — 45-00248 B is 2.2 m away, but V2.1 calls it 07120003000021
+and HR calls it 04040001002021 (different HUC4 prefixes, at the Little Calumet
+subcontinental divide).
 
-Nothing else enters the decision. There is no distance tolerance, the assigned
-COMID is not consulted, and no geometry or drainage area is compared. Distance
-is used only to pick which reach is nearest within each product — the nearest
-search is unbounded — and is never tested against a threshold. V2_NEAR_M,
-HR_DIST_M, V2_DIST_M and HR_DA_KM2 are carried into the output for context and
-are not inputs to STATUS.
+Step 2b catches the same watercourse carrying unrelated ReachCodes while both
+products still name it — 067-55-05251 ANB is 61.0 m from a V2.1 reach, 4 cm over
+the step-1 cut, and both call it Sycamore Creek under codes 05120201000329 and
+05120201125131. Match is exact after trimming and upper-casing; BOTH sides must
+be named, so two unnamed reaches never match each other.
+
+ReachCode is the only identifier the two product lines share — HR has no COMID
+and V2.1 has no NHDPlusID — with GNIS name as the second shared attribute.
+
+Step 1 uses the NEAREST V2.1 reach, not the assigned COMID: the question is
+whether the NWM network contains this stream, not whether the existing
+assignment points at the right reach.
+
+Nearest is by TRUE PERPENDICULAR distance (point-to-segment), not a
+nearest-vertex snap: vertex snapping picks the wrong reach wherever vertices are
+sparse, which is how this class of error was introduced in the first place. The
+nearest search is unbounded; distance enters the decision only as step 1's
+tolerance.
+
+Deliberately NOT used: geometry and drainage area. HR breaks a single V2.1 reach
+into many short segments carrying different `totdasqkm` (COMID 18476443 -> 10 HR
+segments), so neither is comparable across products. `totdasqkm` is carried into
+the output as CONTEXT ONLY — it is what makes a mismatch legible ("crosses a
+9 km2 creek, assigned a 320 mi2 river"), never what decides one. V2_DIST_M (the
+assigned reach's distance) is likewise reported, not used.
+
+STATUS   CROSSING / NOT_CROSSING
+RULE     which step decided it: STEP1_DIST / STEP2_RC / STEP2B_NAME / NEITHER
 
 Outputs (results/)
     bridges_crossing_nwm.shp       STATUS == CROSSING
@@ -86,6 +102,16 @@ V2_TOL_M = 61.0
 # A bridge does not cross a buried line, so Pipeline (428) and Underground
 # Conduit (420) are not candidates for "the stream this bridge crosses".
 HR_FTYPE_KEEP = {460, 558, 336, 334}   # StreamRiver, ArtificialPath, CanalDitch, Connector
+
+
+def _norm_name(s: pd.Series) -> pd.Series:
+    """Trim + upper-case a GNIS name; blanks and placeholders become NA.
+
+    NA on either side must never count as a match, so an unnamed reach can
+    never be equal to an unnamed flowline.
+    """
+    out = s.astype(str).str.strip().str.upper()
+    return out.replace({"": pd.NA, "NONE": pd.NA, "NAN": pd.NA, "<NA>": pd.NA})
 
 
 def load_bridges() -> gpd.GeoDataFrame:
@@ -169,7 +195,8 @@ def main() -> None:
     d = br.merge(j, on="bridge_id", how="left")
 
     # ── nearest V2.1 reach (unbounded), plus its ReachCode ───────────────────
-    v2g = gpd.read_file(V2_SHP, columns=["COMID", "REACHCODE"]).to_crs(WORK_CRS)
+    v2g = gpd.read_file(V2_SHP,
+                        columns=["COMID", "REACHCODE", "GNIS_NAME"]).to_crs(WORK_CRS)
     v2g["COMID"] = pd.to_numeric(v2g["COMID"], errors="coerce").astype("Int64")
     v2g["REACHCODE"] = v2g["REACHCODE"].astype(str).str.zfill(14)
     geom_by_comid = dict(zip(v2g["COMID"], v2g.geometry))
@@ -180,9 +207,10 @@ def main() -> None:
     jv = gpd.sjoin_nearest(brp[["bridge_id", "geometry"]], v2g,
                            how="left", distance_col="v2_near_m")
     jv = (jv.sort_values("v2_near_m").drop_duplicates("bridge_id")
-            [["bridge_id", "COMID", "REACHCODE", "v2_near_m"]]
+            [["bridge_id", "COMID", "REACHCODE", "GNIS_NAME", "v2_near_m"]]
             .rename(columns={"COMID": "v2_near_comid",
-                             "REACHCODE": "v2_near_reach"}))
+                             "REACHCODE": "v2_near_reach",
+                             "GNIS_NAME": "v2_near_name"}))
     d = d.merge(jv, on="bridge_id", how="left")
 
     # ── THE TEST ─────────────────────────────────────────────────────────────
@@ -209,9 +237,17 @@ def main() -> None:
                & (hr_rc == v2_rc)).to_numpy(dtype=bool)
     step2 = (~step1) & rc_same
 
-    d["status"] = np.where(step1 | step2, "CROSSING", "NOT_CROSSING")
+    # step 2b — GNIS name fallback. Only for bridges that failed BOTH the
+    # distance test and the ReachCode test. Exact match after trimming and
+    # upper-casing; both sides must actually be named, so blanks never match.
+    nm_v2, nm_hr = _norm_name(d["v2_near_name"]), _norm_name(d["gnis_name"])
+    name_same = (nm_v2.notna() & nm_hr.notna() & (nm_v2 == nm_hr)).to_numpy(dtype=bool)
+    step2b = (~step1) & (~step2) & name_same
+
+    d["status"] = np.where(step1 | step2 | step2b, "CROSSING", "NOT_CROSSING")
     # which step decided it — reporting only, does not affect STATUS
-    d["rule"] = np.select([step1, step2], ["STEP1_DIST", "STEP2_RC"],
+    d["rule"] = np.select([step1, step2, step2b],
+                          ["STEP1_DIST", "STEP2_RC", "STEP2B_NAME"],
                           default="NEITHER")
 
     # ── summary ──────────────────────────────────────────────────────────────
@@ -221,6 +257,7 @@ def main() -> None:
     log.info("=" * 70)
     log.info("  step 1  nearest V2.1 reach within %.0f m                     -> CROSSING", V2_TOL_M)
     log.info("  step 2  else ReachCode(nearest V2.1) == ReachCode(nearest HR) -> CROSSING")
+    log.info("  step 2b else GNIS name(nearest V2.1) == GNIS name(nearest HR) -> CROSSING")
     log.info("  step 3  everything else                                       -> NOT_CROSSING")
     log.info("")
     for st in ("CROSSING", "NOT_CROSSING"):
@@ -231,6 +268,7 @@ def main() -> None:
     log.info("")
     for rl, lab in (("STEP1_DIST", "step 1 (within %.0f m)" % V2_TOL_M),
                     ("STEP2_RC", "step 2 (ReachCode match)"),
+                    ("STEP2B_NAME", "step 2b (GNIS name match)"),
                     ("NEITHER", "step 3 (neither)")):
         k = int((d["rule"] == rl).sum())
         log.info("    decided by %-26s %6d  (%5.1f%%)", lab, k, 100.0 * k / n)
@@ -257,6 +295,7 @@ def main() -> None:
             "streamorde": "HR_ORDER",
             "v2_near_comid": "V2_NEAR_ID", "v2_near_m": "V2_NEAR_M",
             "v2_near_reach": "V2_NEAR_RC", "hr_near_reach": "HR_NEAR_RC",
+            "v2_near_name": "V2_NEAR_NM",
             "status": "STATUS", "rule": "RULE",
             "scour_critical": "SCOUR", "Q50_cfs": "Q50_CFS", "lat": "LAT", "lon": "LON"}
     keep = [c for c in cols if c in d.columns]
