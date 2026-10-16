@@ -80,6 +80,9 @@ OUT_DIR = REPO / "results"
 CONFIG_KEY = "monitor/bridge_monitor_config.parquet"
 WORK_CRS = 26916          # UTM 16N — metres, the CRS used elsewhere in the repo
 
+# Step 1 tolerance: 200 ft, the pipeline's own documented snapping rule.
+V2_TOL_M = 61.0
+
 # A bridge does not cross a buried line, so Pipeline (428) and Underground
 # Conduit (420) are not candidates for "the stream this bridge crosses".
 HR_FTYPE_KEEP = {460, 558, 336, 334}   # StreamRiver, ArtificialPath, CanalDitch, Connector
@@ -183,31 +186,54 @@ def main() -> None:
     d = d.merge(jv, on="bridge_id", how="left")
 
     # ── THE TEST ─────────────────────────────────────────────────────────────
-    # ReachCode of the nearest V2.1 reach vs ReachCode of the nearest HR
-    # flowline. Equal -> the NWM network contains the stream the bridge is on.
-    # Nothing else enters this: no distance threshold, no assigned COMID, no
-    # geometry or drainage-area comparison. Distance is used only to pick which
-    # reach is nearest in each product, never tested against a tolerance.
+    # Three steps, in order:
+    #   1  the nearest V2.1 reach is within V2_TOL_M        -> CROSSING
+    #   2  else, ReachCode(nearest V2.1) == ReachCode(nearest HR) -> CROSSING
+    #   3  everything else                                  -> NOT_CROSSING
+    #
+    # The two steps rescue each other's failures. Step 1 alone misses a bridge
+    # whose V2.1 line is drawn beyond the tolerance from the real channel
+    # (149-64-04025 C: 93.9 m off, same stream). Step 2 alone misses a bridge
+    # sitting on a V2.1 line that the two products number differently
+    # (45-00248 B: 2.2 m away, but V2.1 says 0712... and HR says 0404...).
+    #
+    # Step 1 uses the NEAREST V2.1 reach, not the assigned COMID: the question
+    # is whether the NWM network contains this stream, not whether the existing
+    # assignment points at the right reach.
     hr_rc = d["reachcode"].astype(str).str.zfill(14)
     v2_rc = d["v2_near_reach"].astype(str).str.zfill(14)
     d["hr_near_reach"] = hr_rc
-    same = (d["reachcode"].notna() & d["v2_near_reach"].notna()
-            & (hr_rc == v2_rc)).to_numpy(dtype=bool)
-    d["status"] = np.where(same, "CROSSING", "NOT_CROSSING")
+
+    step1 = (d["v2_near_m"].notna() & (d["v2_near_m"] <= V2_TOL_M)).to_numpy(dtype=bool)
+    rc_same = (d["reachcode"].notna() & d["v2_near_reach"].notna()
+               & (hr_rc == v2_rc)).to_numpy(dtype=bool)
+    step2 = (~step1) & rc_same
+
+    d["status"] = np.where(step1 | step2, "CROSSING", "NOT_CROSSING")
+    # which step decided it — reporting only, does not affect STATUS
+    d["rule"] = np.select([step1, step2], ["STEP1_DIST", "STEP2_RC"],
+                          default="NEITHER")
 
     # ── summary ──────────────────────────────────────────────────────────────
     n = len(d)
     log.info("=" * 70)
     log.info("IS THE BRIDGE ON A STREAM THE NWM NETWORK CONTAINS?")
     log.info("=" * 70)
-    log.info("  test: ReachCode(nearest V2.1 reach) == ReachCode(nearest HR flowline)")
-    log.info("  no distance threshold, no assigned COMID, no geometry comparison")
+    log.info("  step 1  nearest V2.1 reach within %.0f m                     -> CROSSING", V2_TOL_M)
+    log.info("  step 2  else ReachCode(nearest V2.1) == ReachCode(nearest HR) -> CROSSING")
+    log.info("  step 3  everything else                                       -> NOT_CROSSING")
     log.info("")
     for st in ("CROSSING", "NOT_CROSSING"):
         k = int((d["status"] == st).sum())
         sc = int(d.loc[d["status"] == st, "scour_critical"].astype(bool).sum()) \
             if "scour_critical" in d.columns else 0
         log.info("  %-13s %6d  (%5.1f%%)   scour-critical %4d", st, k, 100.0 * k / n, sc)
+    log.info("")
+    for rl, lab in (("STEP1_DIST", "step 1 (within %.0f m)" % V2_TOL_M),
+                    ("STEP2_RC", "step 2 (ReachCode match)"),
+                    ("NEITHER", "step 3 (neither)")):
+        k = int((d["rule"] == rl).sum())
+        log.info("    decided by %-26s %6d  (%5.1f%%)", lab, k, 100.0 * k / n)
 
     nc = d[d["status"] == "NOT_CROSSING"]
     if len(nc):
@@ -231,7 +257,7 @@ def main() -> None:
             "streamorde": "HR_ORDER",
             "v2_near_comid": "V2_NEAR_ID", "v2_near_m": "V2_NEAR_M",
             "v2_near_reach": "V2_NEAR_RC", "hr_near_reach": "HR_NEAR_RC",
-            "status": "STATUS",
+            "status": "STATUS", "rule": "RULE",
             "scour_critical": "SCOUR", "Q50_cfs": "Q50_CFS", "lat": "LAT", "lon": "LON"}
     keep = [c for c in cols if c in d.columns]
     out = gpd.GeoDataFrame(d[keep].rename(columns=cols),
