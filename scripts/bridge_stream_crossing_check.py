@@ -32,36 +32,23 @@ single V2.1 reach into many short segments carrying different `totdasqkm`
 mismatch legible ("crosses a 9 km2 creek, assigned a 320 mi2 river"), never
 what decides one.
 
-Two classifications are produced, because the reachcode test alone is too
-strict: HR and V2.1 number reaches differently for the same watercourse, so it
-called 40.3% NOT_ROUTED where the truth is 13.7% — 4,384 of those bridges sit a
-median 11 m from a V2.1 reach. STATUS_RC keeps that result; STATUS is the
-geometric test below and is what the split uses.
+STATUS (binary)
+  CROSSING      the two ReachCodes are equal — the NWM network contains the
+                stream this bridge is nearest to.
+  NOT_CROSSING  they differ (or either is missing).
 
-STATUS (geometric — asks each product SEPARATELY whether a stream is present,
-so nothing is ever compared across products)
-  CROSSES_NWM  the ASSIGNED V2.1 reach is within V2_TOL_M. Correct.
-  WRONG_COMID  some V2.1 reach is within V2_TOL_M but the assigned one is not —
-               on a routed stream, wrong reach. Recoverable by re-snapping.
-  NOT_ROUTED   no V2.1 reach within V2_TOL_M — the NWM has no reach for this
-               stream. No flow trigger is possible; re-snapping cannot help.
-  NO_HR_NEAR   no HR flowline within MAX_SEARCH_M.
-
-Acceptance is "assigned reach within tolerance", NOT "assigned reach is the
-nearest". Two V2.1 reaches are often within metres of each other at confluences
-and on parallel channels, and 041-45-07617 (assigned 19.5 m, another at 16.6 m)
-showed strict-nearest flagging 92 bridges on a 3 m difference that means nothing.
+Nothing else enters the decision. There is no distance tolerance, the assigned
+COMID is not consulted, and no geometry or drainage area is compared. Distance
+is used only to pick which reach is nearest within each product — the nearest
+search is unbounded — and is never tested against a threshold. V2_NEAR_M,
+HR_DIST_M, V2_DIST_M and HR_DA_KM2 are carried into the output for context and
+are not inputs to STATUS.
 
 Outputs (results/)
-    bridges_crossing_nwm.shp       on a routed stream: CROSSES_NWM + WRONG_COMID
-    bridges_not_crossing_nwm.shp   NOT_ROUTED (+ NO_HR_NEAR)
+    bridges_crossing_nwm.shp       STATUS == CROSSING
+    bridges_not_crossing_nwm.shp   STATUS == NOT_CROSSING
     bridge_stream_crossing.csv     every bridge, all fields
     bridge_stream_crossing.parquet
-
-WRONG_COMID is filed with the crossing set deliberately: 45-00248 B sits 2.2 m
-from COMID 13463811 while assigned one 4.6 km away — that is real NWM coverage
-with a wrong pointer, not a coverage gap, and filing it as "not crossing" would
-read as the latter. STATUS keeps the distinction for a one-query re-split.
 
 Usage
     python scripts/bridge_stream_crossing_check.py
@@ -92,12 +79,6 @@ OUT_DIR = REPO / "results"
 
 CONFIG_KEY = "monitor/bridge_monitor_config.parquet"
 WORK_CRS = 26916          # UTM 16N — metres, the CRS used elsewhere in the repo
-MAX_SEARCH_M = 5000.0
-# How close a bridge must be to a V2.1 reach to count as "on" it. V2.1 is
-# ~1:100k, so its geometry is generalised: bridges that genuinely sit on a
-# V2.1 reach measure p50 11 m / p90 30 m, against ~2 m for HR at 1:24k.
-# 61 m is the pipeline's own documented 200 ft rule.
-V2_TOL_M = 61.0
 
 # A bridge does not cross a buried line, so Pipeline (428) and Underground
 # Conduit (420) are not candidates for "the stream this bridge crosses".
@@ -172,100 +153,75 @@ def main() -> None:
     log.info("nearest HR flowline by perpendicular distance...")
     brp = br.to_crs(WORK_CRS)
     hrp = hr.to_crs(WORK_CRS)
+    # Nearest is UNBOUNDED: no max_distance. Distance is used only to decide
+    # which reach is nearest and is never compared against a threshold.
     # sjoin_nearest measures point-to-GEOMETRY distance, i.e. to the nearest
     # point ON the segment — the perpendicular foot, not the nearest vertex.
     j = gpd.sjoin_nearest(brp[["bridge_id", "geometry"]], hrp,
-                          how="left", max_distance=MAX_SEARCH_M,
-                          distance_col="hr_dist_m")
+                          how="left", distance_col="hr_dist_m")
     j = (j.sort_values("hr_dist_m")
            .drop_duplicates("bridge_id")                 # ties -> keep the closest
            [["bridge_id", "nhdplusid", "reachcode", "gnis_name", "ftype",
              "totdasqkm", "streamorde", "hr_dist_m"]])
     d = br.merge(j, on="bridge_id", how="left")
 
-    # ── classification 1: the reachcode test, as specified ───────────────────
-    hr_rc = d["reachcode"]
-    same = hr_rc.notna() & d["v2_reach"].notna() & (hr_rc == d["v2_reach"])
-    in_v2 = hr_rc.isin(v2_codes)
-    d["status_rc"] = np.select(
-        [hr_rc.isna(), same, in_v2],
-        ["NO_HR_NEAR", "CROSSES_NWM", "WRONG_COMID"],
-        default="NOT_ROUTED")
-
-    # ── nearest V2.1 reach, and distance to the ASSIGNED one ─────────────────
-    v2g = gpd.read_file(V2_SHP, columns=["COMID"]).to_crs(WORK_CRS)
+    # ── nearest V2.1 reach (unbounded), plus its ReachCode ───────────────────
+    v2g = gpd.read_file(V2_SHP, columns=["COMID", "REACHCODE"]).to_crs(WORK_CRS)
     v2g["COMID"] = pd.to_numeric(v2g["COMID"], errors="coerce").astype("Int64")
+    v2g["REACHCODE"] = v2g["REACHCODE"].astype(str).str.zfill(14)
     geom_by_comid = dict(zip(v2g["COMID"], v2g.geometry))
+    # distance to the ASSIGNED reach — reported only, not part of the test
     d["v2_dist_m"] = [
         (geom_by_comid[c].distance(p) if (pd.notna(c) and c in geom_by_comid) else np.nan)
         for c, p in zip(d["comid"], brp.geometry)]
     jv = gpd.sjoin_nearest(brp[["bridge_id", "geometry"]], v2g,
-                           how="left", max_distance=MAX_SEARCH_M,
-                           distance_col="v2_near_m")
+                           how="left", distance_col="v2_near_m")
     jv = (jv.sort_values("v2_near_m").drop_duplicates("bridge_id")
-            [["bridge_id", "COMID", "v2_near_m"]]
-            .rename(columns={"COMID": "v2_near_comid"}))
+            [["bridge_id", "COMID", "REACHCODE", "v2_near_m"]]
+            .rename(columns={"COMID": "v2_near_comid",
+                             "REACHCODE": "v2_near_reach"}))
     d = d.merge(jv, on="bridge_id", how="left")
 
-    # ── classification 2: geometric, per product — the defensible one ────────
-    # The reachcode test alone over-reports NOT_ROUTED: HR and V2.1 number
-    # reaches differently, so the same watercourse can carry unrelated codes in
-    # the two products. Asking each product separately "is there a stream here?"
-    # avoids any cross-product comparison, which is exactly the comparability
-    # problem that rules out geometry and drainage-area matching.
-    #   NOT_ROUTED  no V2.1 reach within V2_TOL_M -> the NWM has no reach here
-    #   CROSSES_NWM a V2.1 reach is here AND it is the assigned COMID
-    #   WRONG_COMID a V2.1 reach is here but a different COMID was assigned
-    no_v2 = (d["v2_near_m"].isna() | (d["v2_near_m"] > V2_TOL_M)).to_numpy(dtype=bool)
-    # Accept the ASSIGNED reach whenever it is itself within tolerance, rather
-    # than demanding it be the single nearest. Two V2.1 reaches are often within
-    # a few metres of each other at confluences and on parallel channels, and
-    # "nearest" is then arbitrary: 041-45-07617 has its assigned reach at 19.5 m
-    # and another at 16.6 m, a 2.9 m difference that says nothing. Requiring
-    # strict nearest flagged 92 such bridges as misassigned.
-    assigned_ok = (d["v2_dist_m"].notna() & (d["v2_dist_m"] <= V2_TOL_M)).to_numpy(dtype=bool)
-    d["status"] = np.select(
-        [hr_rc.isna().to_numpy(dtype=bool), no_v2, assigned_ok],
-        ["NO_HR_NEAR", "NOT_ROUTED", "CROSSES_NWM"],
-        default="WRONG_COMID")
+    # ── THE TEST ─────────────────────────────────────────────────────────────
+    # ReachCode of the nearest V2.1 reach vs ReachCode of the nearest HR
+    # flowline. Equal -> the NWM network contains the stream the bridge is on.
+    # Nothing else enters this: no distance threshold, no assigned COMID, no
+    # geometry or drainage-area comparison. Distance is used only to pick which
+    # reach is nearest in each product, never tested against a tolerance.
+    hr_rc = d["reachcode"].astype(str).str.zfill(14)
+    v2_rc = d["v2_near_reach"].astype(str).str.zfill(14)
+    d["hr_near_reach"] = hr_rc
+    same = (d["reachcode"].notna() & d["v2_near_reach"].notna()
+            & (hr_rc == v2_rc)).to_numpy(dtype=bool)
+    d["status"] = np.where(same, "CROSSING", "NOT_CROSSING")
 
     # ── summary ──────────────────────────────────────────────────────────────
     n = len(d)
     log.info("=" * 70)
-    log.info("DO BRIDGES CROSS THE NWM REACH THEY ARE ASSIGNED TO?")
+    log.info("IS THE BRIDGE ON A STREAM THE NWM NETWORK CONTAINS?")
     log.info("=" * 70)
-    log.info("  %-12s %17s   %17s   %s", "", "reachcode test", "geometric test", "scour")
-    for s in ("CROSSES_NWM", "WRONG_COMID", "NOT_ROUTED", "NO_HR_NEAR"):
-        a = int((d["status_rc"] == s).sum())
-        k = int((d["status"] == s).sum())
-        sc = int(d.loc[d["status"] == s, "scour_critical"].astype(bool).sum()) \
+    log.info("  test: ReachCode(nearest V2.1 reach) == ReachCode(nearest HR flowline)")
+    log.info("  no distance threshold, no assigned COMID, no geometry comparison")
+    log.info("")
+    for st in ("CROSSING", "NOT_CROSSING"):
+        k = int((d["status"] == st).sum())
+        sc = int(d.loc[d["status"] == st, "scour_critical"].astype(bool).sum()) \
             if "scour_critical" in d.columns else 0
-        log.info("  %-12s %7d (%5.1f%%)   %7d (%5.1f%%)   %5d",
-                 s, a, 100.0 * a / n, k, 100.0 * k / n, sc)
-    log.info("  (the split and the shapefiles use the GEOMETRIC test; STATUS_RC "
-             "carries the reachcode result)")
-    on_routed = d["status"].isin(["CROSSES_NWM", "WRONG_COMID"])
-    log.info("")
-    log.info("  ON a stream the NWM routes : %6d  (%.1f%%)   <- bridges_crossing_nwm.shp",
-             int(on_routed.sum()), 100.0 * on_routed.mean())
-    log.info("     ...of which assigned the WRONG reach: %6d", int((d["status"] == "WRONG_COMID").sum()))
-    log.info("  NOT on a routed stream     : %6d  (%.1f%%)   <- bridges_not_crossing_nwm.shp",
-             int((~on_routed).sum()), 100.0 * (~on_routed).mean())
-    log.info("")
-    log.info("  perpendicular distance to the HR stream the bridge is on:")
-    for s in ("CROSSES_NWM", "WRONG_COMID", "NOT_ROUTED"):
-        v = d.loc[d["status"] == s, "hr_dist_m"].dropna()
-        if len(v):
-            log.info("    %-12s p50 %6.1f m   p90 %7.1f m", s, v.median(), v.quantile(.9))
-    nr = d[d["status"] == "NOT_ROUTED"]
-    if len(nr):
+        log.info("  %-13s %6d  (%5.1f%%)   scour-critical %4d", st, k, 100.0 * k / n, sc)
+
+    nc = d[d["status"] == "NOT_CROSSING"]
+    if len(nc):
         log.info("")
-        log.info("  NOT_ROUTED: the streams these bridges are actually on")
-        named = nr["gnis_name"].fillna("(unnamed)").value_counts().head(8)
-        for k_, c_ in named.items():
+        log.info("  NOT_CROSSING: the streams these bridges are nearest to in HR")
+        for k_, c_ in nc["gnis_name"].fillna("(unnamed)").value_counts().head(8).items():
             log.info("    %-28s %4d bridges", k_, c_)
-        log.info("    median HR drainage area %.1f km2 vs assigned reach's NWM gate",
-                 nr["totdasqkm"].median())
+        log.info("    median HR drainage area %.1f km2", nc["totdasqkm"].median())
+        log.info("")
+        log.info("  context only, NOT used by the test:")
+        log.info("    distance to nearest V2.1 reach  p50 %7.1f m   p90 %9.1f m",
+                 nc["v2_near_m"].median(), nc["v2_near_m"].quantile(.9))
+        log.info("    distance to nearest HR flowline p50 %7.1f m   p90 %9.1f m",
+                 nc["hr_dist_m"].median(), nc["hr_dist_m"].quantile(.9))
 
     # ── write ────────────────────────────────────────────────────────────────
     cols = {"bridge_id": "BRIDGE_ID", "comid": "COMID", "v2_reach": "V2_REACH",
@@ -274,7 +230,8 @@ def main() -> None:
             "hr_dist_m": "HR_DIST_M", "totdasqkm": "HR_DA_KM2",
             "streamorde": "HR_ORDER",
             "v2_near_comid": "V2_NEAR_ID", "v2_near_m": "V2_NEAR_M",
-            "status": "STATUS", "status_rc": "STATUS_RC",
+            "v2_near_reach": "V2_NEAR_RC", "hr_near_reach": "HR_NEAR_RC",
+            "status": "STATUS",
             "scour_critical": "SCOUR", "Q50_cfs": "Q50_CFS", "lat": "LAT", "lon": "LON"}
     keep = [c for c in cols if c in d.columns]
     out = gpd.GeoDataFrame(d[keep].rename(columns=cols),
@@ -289,8 +246,8 @@ def main() -> None:
     # while assigned one 4.6 km away — real coverage, wrong pointer. Filing it
     # as "not crossing" would read as no coverage at all. STATUS keeps the
     # distinction, so re-splitting on it is one attribute query.
-    a = out[out["STATUS"].isin(["CROSSES_NWM", "WRONG_COMID"])]
-    b = out[~out["STATUS"].isin(["CROSSES_NWM", "WRONG_COMID"])]
+    a = out[out["STATUS"] == "CROSSING"]
+    b = out[out["STATUS"] == "NOT_CROSSING"]
     a.to_file(out_dir / "bridges_crossing_nwm.shp")
     b.to_file(out_dir / "bridges_not_crossing_nwm.shp")
     out.drop(columns="geometry").to_csv(out_dir / "bridge_stream_crossing.csv", index=False)
