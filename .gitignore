@@ -26,3 +26,5 @@ mrms_shards_watershed/
 results/*.zip
 results/indiana_nwm_comids.*
 results/bridge_reach_snapping_audit.*
+results/bridges_crossing_nwm.*
+results/bridges_not_crossing_nwm.*
