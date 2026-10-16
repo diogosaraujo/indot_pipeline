@@ -63,6 +63,7 @@ RULE     which step decided it: STEP1_DIST / STEP2_RC / STEP2B_NAME / NEITHER
 Outputs (results/)
     bridges_crossing_nwm.shp       STATUS == CROSSING
     bridges_not_crossing_nwm.shp   STATUS == NOT_CROSSING
+    bridges_step2b_name_match.shp  the step-2b subset alone, for review
     bridge_stream_crossing.csv     every bridge, all fields
     bridge_stream_crossing.parquet
 
@@ -315,11 +316,18 @@ def main() -> None:
     b = out[out["STATUS"] == "NOT_CROSSING"]
     a.to_file(out_dir / "bridges_crossing_nwm.shp")
     b.to_file(out_dir / "bridges_not_crossing_nwm.shp")
+    # The step-2b set on its own, for eyeballing: these are the bridges kept by
+    # a GNIS name match alone, so they are the ones leaning hardest on the name.
+    s2b = out[out["RULE"] == "STEP2B_NAME"].sort_values("V2_NEAR_M", ascending=False)
+    if len(s2b):
+        s2b.to_file(out_dir / "bridges_step2b_name_match.shp")
     out.drop(columns="geometry").to_csv(out_dir / "bridge_stream_crossing.csv", index=False)
     out.drop(columns="geometry").to_parquet(out_dir / "bridge_stream_crossing.parquet", index=False)
     log.info("")
-    log.info("wrote %s (%d) and %s (%d), plus the full table as .csv/.parquet",
-             "bridges_crossing_nwm.shp", len(a), "bridges_not_crossing_nwm.shp", len(b))
+    log.info("wrote %s (%d), %s (%d) and %s (%d), plus the full table as .csv/.parquet",
+             "bridges_crossing_nwm.shp", len(a),
+             "bridges_not_crossing_nwm.shp", len(b),
+             "bridges_step2b_name_match.shp", len(s2b))
 
 
 if __name__ == "__main__":
