@@ -32,3 +32,4 @@ results/bridges_step2b_name_match.*
 results/hazel_dell_collapse.*
 results/site_*.gpkg
 results/usgs_event_aug2026.parquet
+results/mrms_vs_watershed_*/
