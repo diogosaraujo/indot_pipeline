@@ -81,6 +81,20 @@ GATE_Q50 = 62_864.0
 HALF_W, HALF_H = 1250, 620        # true metres; ~2:1 to match the map axes
 BACKFLOW_STAGE_FT = 14.0
 
+# Breach of the abutment, after which water stops following the creek around the
+# pit and pours into it. ASSUMED at the hydrograph peak; no timestamped
+# observation of the failure is in hand.
+COLLAPSE_UTC = pd.Timestamp("2026-08-15 18:00", tz="UTC")
+POOL_FILL_HOURS = 14.0            # how long the pool takes to reach full extent
+
+# The DRY excavated pit, digitised by eye off the Esri imagery and expressed as
+# metres east/north of the bridge. NHD carries only the water-filled quarry
+# ponds, so there is no authoritative polygon for the working pit — this one is
+# schematic, and the pool drawn inside it is labelled illustrative like the
+# floodplain.
+PIT_OFFSETS_M = [(-150, -60), (-430, -85), (-700, -150), (-755, -380),
+                 (-480, -445), (-205, -400), (-150, -210)]
+
 INK, INK_2, MUTED = "#0b0b0b", "#52514e", "#898781"
 GRID, AXIS = "#e1e0d9", "#c3c2b7"
 WATER = "#2a78d6"
@@ -127,6 +141,10 @@ def main() -> None:
     ap.add_argument("--step", type=int, default=2)
     ap.add_argument("--zoom", type=int, default=16)
     ap.add_argument("--out", default=str(RES / "hazel_dell_collapse.gif"))
+    ap.add_argument("--still-at", default=None,
+                    help="UTC timestamp for the still, e.g. '2026-08-16 06:00'; "
+                         "default is the hydrograph peak")
+    ap.add_argument("--no-gif", action="store_true")
     args = ap.parse_args()
 
     fl, wb, ar = load_site()
@@ -164,8 +182,22 @@ def main() -> None:
     hw, hh = HALF_W * MERC, HALF_H * MERC
     xlim, ylim = (cx - hw, cx + hw), (cy - hh, cy + hh)
 
-    from shapely.geometry import box as _box
+    from shapely.geometry import Polygon as _Poly, box as _box
     view_m = _box(br_m.x - HALF_W, br_m.y - HALF_H, br_m.x + HALF_W, br_m.y + HALF_H)
+    pit_m = _Poly([(br_m.x + dx, br_m.y + dy) for dx, dy in PIT_OFFSETS_M])
+    pit = to_web(pit_m)
+    # the stretch of creek running alongside the pit: arrows originate here
+    creek_at_pit_m = bwc_all_m.intersection(pit_m.buffer(220))
+    if creek_at_pit_m.is_empty:
+        creek_at_pit_m = bwc_m
+    elif hasattr(creek_at_pit_m, "geoms"):
+        creek_at_pit_m = linemerge(creek_at_pit_m)
+        if hasattr(creek_at_pit_m, "geoms"):
+            creek_at_pit_m = max(creek_at_pit_m.geoms, key=lambda g: g.length)
+    # Water enters where the creek runs closest to the pit, and the pool spreads
+    # from there rather than filling the whole pit uniformly.
+    breach_m = bwc_all_m.interpolate(bwc_all_m.project(pit_m.centroid))
+    pit_reach_m = max(pit_m.exterior.distance(breach_m), 1.0) +         max(pit_m.bounds[2] - pit_m.bounds[0], pit_m.bounds[3] - pit_m.bounds[1])
     bwc_line, wr_line = to_web(bwc_m), to_web(wr_m)
     quarry, corridor = quarry_m.to_crs(WEB), corridor_m.to_crs(WEB)
     others = flm[~flm.gnis_name.isin(["White River", "Blue Woods Creek"])].to_crs(WEB)
@@ -187,6 +219,9 @@ def main() -> None:
         q, s = float(row.q_cfs), float(row.stage_ft)
         f = (s - smin) / (smax - smin)
         rev = s >= BACKFLOW_STAGE_FT
+        breached = t >= COLLAPSE_UTC
+        fill = (min((t - COLLAPSE_UTC).total_seconds() / 3600.0 / POOL_FILL_HOURS, 1.0)
+                if breached else 0.0)
 
         axm.clear()
         axm.imshow(img, extent=ext, origin="upper", zorder=0, interpolation="bilinear")
@@ -205,12 +240,39 @@ def main() -> None:
             corridor.plot(ax=axm, facecolor=WATER, ec="none", alpha=0.75, zorder=3)
         if len(quarry):
             quarry.plot(ax=axm, facecolor=FLOOD_2, ec="white", lw=0.7, alpha=0.55, zorder=3)
+        if breached:
+            # ls as a string: geopandas tries to broadcast a (0,(5,3)) dash
+            # tuple across geometries and raises on the ragged shape.
+            gpd.GeoSeries([pit], crs=WEB).plot(ax=axm, facecolor="none", ec=HOT,
+                                               lw=1.3, ls="--", alpha=0.85,
+                                               zorder=5)
+            pool_m = breach_m.buffer(pit_reach_m * fill ** 0.65).intersection(pit_m)
+            if not pool_m.is_empty:
+                gpd.GeoSeries([pool_m], crs=METRIC).to_crs(WEB).plot(
+                    ax=axm, facecolor=FLOOD_2, ec="white", lw=0.8,
+                    alpha=0.62, zorder=6)
         others.plot(ax=axm, color="#cfe4fb", lw=0.7, alpha=0.5, zorder=3)
         gpd.GeoSeries([bwc_line], crs=WEB).plot(ax=axm, color="#bfe0ff",
                                                 lw=1.4 + 2.0 * f, alpha=0.9, zorder=4)
 
         arrows(axm, wr_line, 7, False, "#ffffff", 0.75 + 0.9 * f)
-        arrows(axm, bwc_line, 5, rev, HOT if rev else "#ffffff", 0.85 + 0.7 * f)
+        if breached:
+            # flow leaves the channel and pours into the pit
+            arrows(axm, bwc_line, 3, True, HOT, 0.85 + 0.7 * f)
+            pc_m = pit_m.centroid
+            for frac in (0.3, 0.5, 0.7):
+                src = creek_at_pit_m.interpolate(frac, normalized=True)
+                tgt_m = Point(src.x + (pc_m.x - src.x) * 0.55,
+                              src.y + (pc_m.y - src.y) * 0.55)
+                a, b = to_web(src), to_web(tgt_m)
+                axm.annotate("", xy=(b.x, b.y), xytext=(a.x, a.y), zorder=10,
+                             arrowprops=dict(arrowstyle="-|>", color=HOT, lw=2.0,
+                                             mutation_scale=18, alpha=0.95,
+                                             path_effects=[pe.withStroke(
+                                                 linewidth=3.0, foreground="#101010",
+                                                 alpha=0.6)]))
+        else:
+            arrows(axm, bwc_line, 5, rev, HOT if rev else "#ffffff", 0.85 + 0.7 * f)
 
         axm.plot([cx], [cy], marker="o", ms=12, mfc=CRITICAL, mec="white",
                  mew=2.0, zorder=12)
@@ -226,12 +288,14 @@ def main() -> None:
             qc = quarry.geometry.union_all().centroid
             axm.annotate("quarry", (qc.x, qc.y), fontsize=9.5, color="white",
                          ha="center", zorder=11, path_effects=HALO)
-        if rev:
-            axm.annotate("BACKFLOW — creek reverses toward the quarry",
-                         (0.5, 0.045), xycoords="axes fraction", ha="center",
-                         fontsize=11.5, color="white", weight="bold", zorder=13,
-                         bbox=dict(fc=CRITICAL, ec="white", lw=1.1,
-                                   boxstyle="round,pad=0.42", alpha=0.95))
+        banner = ("BRIDGE FAILS — flow pours into the quarry pit" if breached
+                  else "BACKFLOW — creek reverses toward the quarry" if rev else None)
+        if banner:
+            # lifted clear of the attribution line along the bottom edge
+            axm.annotate(banner, (0.5, 0.125), xycoords="axes fraction",
+                         ha="center", fontsize=11.5, color="white", weight="bold",
+                         zorder=13, bbox=dict(fc=CRITICAL, ec="white", lw=1.1,
+                                              boxstyle="round,pad=0.42", alpha=0.95))
         axm.annotate(f"{t:%d %b %Y  %H:%M} UTC", (0.013, 0.962),
                      xycoords="axes fraction", fontsize=13, color="white",
                      weight="bold", va="top", zorder=13, path_effects=HALO)
@@ -279,12 +343,16 @@ def main() -> None:
                      fontsize=13, color=INK, y=0.958)
 
     out = pathlib.Path(args.out)
-    draw(int(np.argmax(hyd.q_cfs.values)))          # still first; see git history
+    k = (int(hyd.index.get_indexer([pd.Timestamp(args.still_at, tz="UTC")],
+                                   method="nearest")[0])
+         if args.still_at else int(np.argmax(hyd.q_cfs.values)))
+    draw(k)                                          # still first; see git history
     fig.savefig(out.with_suffix(".png"), dpi=200, facecolor="#fcfcfb")
-    log.info("wrote %s", out.with_suffix(".png"))
-    FuncAnimation(fig, draw, frames=len(hyd), interval=1000 / args.fps).save(
-        out, writer=PillowWriter(fps=args.fps))
-    log.info("wrote %s  (%d frames, 13 x 6 in)", out, len(hyd))
+    log.info("wrote %s  (frame at %s)", out.with_suffix(".png"), hyd.index[k])
+    if not args.no_gif:
+        FuncAnimation(fig, draw, frames=len(hyd), interval=1000 / args.fps).save(
+            out, writer=PillowWriter(fps=args.fps))
+        log.info("wrote %s  (%d frames, 13 x 6 in)", out, len(hyd))
 
 
 if __name__ == "__main__":
