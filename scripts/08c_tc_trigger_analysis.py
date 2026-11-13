@@ -37,6 +37,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import logging
 from pathlib import Path
@@ -44,7 +45,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from utils import load_config, write_parquet_to_s3
+from utils import assert_atlas14_relabelled, load_config, write_parquet_to_s3
 
 # Import the digit-prefixed module 08_trigger_analysis.py and reuse its loaders
 # and event-overlap helpers (group_wet_events, classify_overlap, window logic …).
@@ -162,6 +163,13 @@ def analyse_station_tc(
 # ---------- Main ----------
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fresh", action="store_true",
+                    help="ignore the existing output (no resume) and recompute every gauge; "
+                         "required after the Atlas-14 relabel (07d), since resume would "
+                         "otherwise keep every old row")
+    args = ap.parse_args()
+
     cfg = load_config()
     bucket = cfg["aws"]["output_bucket"]
     prefix = cfg["aws"]["output_prefix"]
@@ -169,6 +177,7 @@ def main() -> None:
 
     log.info("Loading inputs...")
     atlas14    = m.load_atlas14(bucket, prefix)
+    assert_atlas14_relabelled(atlas14, "atlas14/precipitation_frequency.parquet")
     flow_stats = m.load_flow_stats(bucket, prefix)
     streamflow = m.load_streamflow(bucket, prefix)
     tc_by_site = load_tc(bucket, prefix)
@@ -220,8 +229,12 @@ def main() -> None:
     sites_win = [s for s in stations_all if s in window_by_site]
     log.info("Gauges with a valid flow∩MRMS window: %d / %d", len(sites_win), len(stations_all))
 
-    existing, complete_keys, stored_end = m.load_existing(
-        bucket, prefix, OUTPUT_KEY, TC_COMBINATIONS)
+    if args.fresh:
+        log.info("--fresh: ignoring any existing %s", OUTPUT_KEY)
+        existing, complete_keys, stored_end = None, set(), {}
+    else:
+        existing, complete_keys, stored_end = m.load_existing(
+            bucket, prefix, OUTPUT_KEY, TC_COMBINATIONS)
     all_records: list[dict] = []
 
     def _resume_skip(site_no: str, source: str, we: pd.Timestamp) -> bool:

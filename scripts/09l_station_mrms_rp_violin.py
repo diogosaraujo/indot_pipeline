@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 
-from utils import load_config, s3_client, write_bytes_to_s3
+from utils import assert_atlas14_relabelled, load_config, s3_client, write_bytes_to_s3
 
 
 def _load(name, filename):
@@ -119,6 +119,8 @@ def main() -> None:
     atlas14 = m.load_atlas14(bucket, prefix)                          # streamgage climatology (MRMS)
     atlas14_st = m._read_parquet_s3(bucket, f"{prefix}atlas14/precipitation_frequency_stations.parquet")
     atlas14_st["station_id"] = atlas14_st["station_id"].astype(str)   # station climatology (gauge trigger)
+    assert_atlas14_relabelled(atlas14, "atlas14/precipitation_frequency.parquet")
+    assert_atlas14_relabelled(atlas14_st, "atlas14/precipitation_frequency_stations.parquet")
     tc_by_site = m08c.load_tc(bucket, prefix)
     mrms = m.load_mrms_nearest(bucket, prefix, product_key)
     mrms_start = mrms.groupby("site_no")["datetime_utc"].min()

@@ -22,13 +22,14 @@ Output: analysis/event_confusion_matrix_tc_station.parquet  (08c schema + dist_m
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import logging
 from pathlib import Path
 
 import pandas as pd
 
-from utils import load_config, write_parquet_to_s3
+from utils import assert_atlas14_relabelled, load_config, write_parquet_to_s3
 
 # Reuse 08c (Tc analyzer + base-08 loaders via c.m) and 08d (station pairing).
 def _load(name):
@@ -53,6 +54,12 @@ UNIVERSE_KEY = "analysis/event_confusion_matrix_tc.parquet"   # 08c's retained 1
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fresh", action="store_true",
+                    help="ignore the existing output (no resume) and recompute every gauge; "
+                         "required after the Atlas-14 relabel (07d)")
+    args = ap.parse_args()
+
     cfg = load_config()
     bucket, prefix = cfg["aws"]["output_bucket"], cfg["aws"]["output_prefix"]
 
@@ -61,6 +68,7 @@ def main() -> None:
     # its OWN climatology, not the streamgage's (climatology-mismatch fix).
     atlas14_st = m._read_parquet_s3(bucket, f"{prefix}atlas14/precipitation_frequency_stations.parquet")
     atlas14_st["station_id"] = atlas14_st["station_id"].astype(str)
+    assert_atlas14_relabelled(atlas14_st, "atlas14/precipitation_frequency_stations.parquet")
     flow_stats = m.load_flow_stats(bucket, prefix)
     streamflow = m.load_streamflow(bucket, prefix)
     tc_by_site = c.load_tc(bucket, prefix)
@@ -90,8 +98,12 @@ def main() -> None:
     log.info("Loading + qualifying precip stations (ISD + GHCNh)...")
     qual, hourly_by_sid = d.load_and_qualify(bucket, prefix)
 
-    existing, complete_keys, stored_end = m.load_existing(
-        bucket, prefix, OUTPUT_KEY, c.TC_COMBINATIONS)
+    if args.fresh:
+        log.info("--fresh: ignoring any existing %s", OUTPUT_KEY)
+        existing, complete_keys, stored_end = None, set(), {}
+    else:
+        existing, complete_keys, stored_end = m.load_existing(
+            bucket, prefix, OUTPUT_KEY, c.TC_COMBINATIONS)
     all_records: list[dict] = []
 
     def _resume_skip(site_no, source, we):

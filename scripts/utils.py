@@ -33,6 +33,56 @@ def load_config(path: str | os.PathLike = "config.yaml") -> dict:
     return cfg
 
 
+ATLAS14_BUG_FINGERPRINT_HR = 120   # Volume 2 publishes no 5-day; only the mislabelled parse has it
+
+
+def assert_atlas14_relabelled(df, what: str = "Atlas 14 table") -> None:
+    """Abort if an Atlas-14 table still carries the 07 duration-label bug.
+
+    The old parser shifted every 1-120 h label one duration too long, leaving a
+    `duration_hr == 120` row that a correct Volume 2 parse cannot produce. Running
+    a threshold analysis on such a table silently mislabels every ARI (~0.55x), so
+    refuse instead. Fix: python scripts/07d_relabel_atlas14_durations.py
+    """
+    if (df["duration_hr"] == ATLAS14_BUG_FINGERPRINT_HR).any():
+        raise SystemExit(
+            f"{what} still has the duration-label bug (duration_hr == 120 present). "
+            "Run `python scripts/07d_relabel_atlas14_durations.py` first.")
+
+
+ATLAS14_TABLE_KEYS = ("atlas14/precipitation_frequency.parquet",
+                      "atlas14/precipitation_frequency_stations.parquet")
+
+
+def atlas14_label_state(bucket: str, prefix: str, output_keys) -> str:
+    """How trustworthy are the ARI labels in outputs derived from Atlas 14?
+
+    "buggy"  — the Atlas-14 tables still carry the 07 duration-label bug, so the
+               outputs' ARI labels are nominal (true ARI ~0.55x the label).
+    "fixed"  — the tables were relabelled (07d) AND every output was written after
+               them, so the outputs' ARI labels are true.
+    Raises SystemExit if the tables are fixed but an output predates them (it was
+    computed on the buggy table and must be re-run before it can be labelled).
+    """
+    import pandas as pd
+    cli = s3_client()
+    t_tables, buggy = [], False
+    for k in ATLAS14_TABLE_KEYS:
+        obj = cli.get_object(Bucket=bucket, Key=f"{prefix}{k}")
+        t_tables.append(obj["LastModified"])
+        dur = pd.read_parquet(io.BytesIO(obj["Body"].read()), columns=["duration_hr"])
+        buggy |= bool((dur["duration_hr"] == ATLAS14_BUG_FINGERPRINT_HR).any())
+    if buggy:
+        return "buggy"
+    for k in output_keys:
+        t_out = cli.head_object(Bucket=bucket, Key=f"{prefix}{k}")["LastModified"]
+        if t_out < max(t_tables):
+            raise SystemExit(
+                f"{k} ({t_out:%Y-%m-%d %H:%M}) predates the relabelled Atlas-14 tables "
+                f"({max(t_tables):%Y-%m-%d %H:%M}); re-run the script that writes it first.")
+    return "fixed"
+
+
 def s3_client(region: str = "us-east-1"):
     return boto3.client("s3", region_name=region)
 

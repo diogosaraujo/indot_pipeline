@@ -61,7 +61,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from utils import load_config, s3_client, write_bytes_to_s3
+from utils import assert_atlas14_relabelled, load_config, s3_client, write_bytes_to_s3
 
 # Reuse 08d (precip station loader) and validate_precip_frequency (event functions).
 def _load(name: str, filename: str):
@@ -101,6 +101,7 @@ def atlas14_at_stations(stations: pd.DataFrame, bucket: str, prefix: str) -> dic
     against its own climatology)."""
     a14 = _read_parquet(bucket, f"{prefix}{STATION_A14_KEY}")
     a14["station_id"] = a14["station_id"].astype(str)
+    assert_atlas14_relabelled(a14, STATION_A14_KEY)
     a14 = a14[a14["duration_hr"].isin(PRECIP_DURATIONS_HR)
               & a14["return_period_yr"].isin(RETURN_PERIODS)]
     ids = set(stations["station_id"].astype(str))
@@ -159,10 +160,11 @@ def count_station_events(active: pd.DataFrame, hourly_by_sid: dict, a14_map: dic
 
 # ── MRMS storm-object counts ──────────────────────────────────────────────────
 
-def mrms_storm_counts(bucket: str, prefix: str, start: pd.Timestamp,
-                      end: pd.Timestamp) -> tuple[dict[int, int], float] | tuple[None, None]:
+def mrms_storm_counts(bucket: str, prefix: str, start: pd.Timestamp, end: pd.Timestamp,
+                      storms_key: str = STORMS_KEY) -> tuple[dict[int, int], float] | tuple[None, None]:
     try:
-        storms = _read_parquet(bucket, f"{prefix}{STORMS_KEY}")
+        storms = _read_parquet(bucket, f"{prefix}{storms_key}")
+        log.info("MRMS storms from %s", storms_key)
     except Exception as e:                                     # noqa: BLE001
         log.warning("Could not read MRMS storm_events.parquet (%s) — run validate_storm_events.py "
                     "first; comparison panel will be skipped.", e)
@@ -237,6 +239,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--start", default="2020-01-01", help="analysis window start (matches validate_storm_events)")
     ap.add_argument("--end",   default="2026-12-31", help="analysis window end")
+    ap.add_argument("--storms-key", default=STORMS_KEY,
+                    help="MRMS storm_events.parquet under the prefix (default %(default)s); "
+                         "after the 07d relabel use the folder validate_storm_events.py "
+                         "--out-dir wrote, e.g. analysis/storm_events_a14fix/storm_events.parquet")
     args = ap.parse_args()
     start = pd.Timestamp(args.start, tz="UTC"); end = pd.Timestamp(args.end, tz="UTC")
 
@@ -263,7 +269,7 @@ def main() -> None:
     n_years_window = (end - start).days / 365.25
     n_stations = len(per_station)
 
-    mrms_counts, mrms_years = mrms_storm_counts(bucket, prefix, start, end)
+    mrms_counts, mrms_years = mrms_storm_counts(bucket, prefix, start, end, args.storms_key)
     has_mrms = mrms_counts is not None
 
     rows = []

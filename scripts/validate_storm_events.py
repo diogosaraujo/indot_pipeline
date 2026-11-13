@@ -178,6 +178,9 @@ def build_atlas14_grids(
         raise RuntimeError("Atlas 14 parquet not found in pipeline bucket.")
     a14 = pd.read_parquet(io.BytesIO(raw))
     a14["site_no"] = a14["site_no"].astype(str)
+    if (a14["duration_hr"] == 120).any():      # 07 duration-label bug fingerprint (see 07d)
+        raise SystemExit("atlas14/precipitation_frequency.parquet still has the duration-label "
+                         "bug (duration_hr == 120). Run scripts/07d_relabel_atlas14_durations.py first.")
 
     # Need station coordinates — merge with station inventory
     inv_raw = _get_bytes("v1/stations/indiana_streamflow_sites.parquet")
@@ -669,7 +672,19 @@ def main() -> None:
     parser.add_argument("--end",            default=DEFAULT_END)
     parser.add_argument("--aggregate-only", action="store_true")
     parser.add_argument("--reprocess-date", default=None)
+    parser.add_argument("--out-dir", default="v1/analysis/storm_events/",
+                        help="S3 folder for checkpoints + events (default %(default)s). Use a NEW "
+                             "folder for a from-scratch run: day checkpoints there make a re-run "
+                             "into the old folder a no-op, and event_ids restart at 1, so mixing "
+                             "runs in one folder would collide. After the 07d Atlas-14 relabel: "
+                             "v1/analysis/storm_events_a14fix/")
     args = parser.parse_args()
+
+    global S3_OUT, S3_CHECKPOINT, S3_EVENTS_KEY
+    S3_OUT        = args.out_dir.rstrip("/") + "/"
+    S3_CHECKPOINT = S3_OUT + "checkpoints/"
+    S3_EVENTS_KEY = S3_OUT + "storm_events.parquet"
+    log.info("Output folder: s3://%s/%s", PIPELINE_BUCKET, S3_OUT)
 
     start = date.fromisoformat(args.start)
     end   = date.fromisoformat(args.end)
