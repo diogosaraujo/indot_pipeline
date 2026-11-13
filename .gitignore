@@ -29,7 +29,11 @@ results/bridge_reach_snapping_audit.*
 results/bridges_crossing_nwm.*
 results/bridges_not_crossing_nwm.*
 results/bridges_step2b_name_match.*
+results/bridges_xw_changed.*
 results/hazel_dell_collapse.*
 results/site_*.gpkg
 results/usgs_event_aug2026.parquet
 results/mrms_vs_watershed_*/
+results/bridges_xw_rescue_review.*
+results/bridge_stream_crossing.*
+results/bridge_stream_crossing_xw.*
